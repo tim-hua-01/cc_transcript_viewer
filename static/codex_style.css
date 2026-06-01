@@ -67,3 +67,18 @@ body.show-tokens .token-event {
 .tool-image-frame .tool-image {
   margin-bottom: 4px;
 }
+
+/* apply_patch diff rendering */
+pre.payload.diff { padding: 0; }
+.diff-line {
+  display: block;
+  padding: 0 10px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  min-height: 1.2em;
+}
+.diff-add { background: rgba(31,122,69,.12); color: #1a7f37; }
+.diff-del { background: rgba(207,34,46,.12); color: #cf222e; }
+.diff-hunk { color: var(--accent); background: rgba(31,111,235,.07); }
+.diff-file { color: var(--muted); font-weight: 600; background: var(--bg-elev); }
+.diff-ctx { color: var(--text); }

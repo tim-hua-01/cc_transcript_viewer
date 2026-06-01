@@ -250,15 +250,37 @@ def _summary_text(summary) -> str:
     return ""
 
 
+def _patch_text(args) -> str:
+    """Codex sends apply_patch bodies as a raw patch string (not JSON)."""
+    if isinstance(args, str):
+        return args
+    if isinstance(args, dict):
+        for key in ("input", "patch", "raw"):
+            val = args.get(key)
+            if isinstance(val, str):
+                return val
+    return ""
+
+
+def _patch_files(text: str) -> list[str]:
+    files = []
+    for line in (text or "").splitlines():
+        for marker in ("*** Add File: ", "*** Update File: ", "*** Delete File: ", "*** Move to: "):
+            if line.startswith(marker):
+                files.append(line[len(marker):].strip())
+    return files
+
+
 def _tool_summary(name: str, args) -> str:
+    if name == "apply_patch":
+        files = _patch_files(_patch_text(args))
+        return ", ".join(files)[:200] if files else "patch"
     if not isinstance(args, dict):
         return str(args)[:200]
     if name in {"exec_command", "shell"}:
         return str(args.get("cmd") or "")[:200]
     if name == "write_stdin":
         return str(args.get("session_id") or "")[:80]
-    if name == "apply_patch":
-        return "patch"
     if name == "parallel":
         uses = args.get("tool_uses") or []
         return f"{len(uses)} tool calls"
@@ -417,10 +439,16 @@ def parse_session(path: Path) -> dict:
                     name=call.get("name", ""),
                     args=call.get("input"),
                 )
+                # A patch_apply_end event may have already recorded the richer
+                # diff (changes); don't let the terse call output clobber it.
+                existing = tool_outputs.get(call_id)
+                raw = normalized["raw"]
+                if raw is None and existing and existing.get("raw"):
+                    raw = existing["raw"]
                 tool_outputs[call_id] = {
-                    "output": normalized["text"],
+                    "output": normalized["text"] or (existing or {}).get("output", ""),
                     "images": normalized["images"],
-                    "raw": normalized["raw"],
+                    "raw": raw,
                     "is_error": bool(payload.get("is_error")),
                 }
         elif rec.get("type") == "event_msg" and payload.get("type") == "patch_apply_end":
@@ -611,6 +639,8 @@ def parse_session(path: Path) -> dict:
         elif pt in {"function_call", "custom_tool_call"}:
             name = payload.get("name") or "tool"
             args = _parse_json_string(payload.get("arguments") if pt == "function_call" else payload.get("input"))
+            if name == "apply_patch":
+                args = _patch_text(args) or args
             call_id = payload.get("call_id")
             result = tool_outputs.get(call_id)
             events.append(

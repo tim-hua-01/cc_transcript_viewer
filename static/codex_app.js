@@ -383,7 +383,8 @@ function renderTool(ev) {
       bodyKids.push(renderImagePayload(img));
     }
     if (ev.result.raw) {
-      bodyKids.push(preFrom(JSON.stringify(ev.result.raw, null, 2), "payload truncatable"));
+      if (ev.result.raw.changes) bodyKids.push(renderChanges(ev.result.raw.changes));
+      else bodyKids.push(preFrom(JSON.stringify(ev.result.raw, null, 2), "payload truncatable"));
     }
     if (!ev.result.output && !(ev.result.images || []).length && !ev.result.raw) {
       bodyKids.push(preFrom("(no output)", "payload truncatable"));
@@ -442,9 +443,40 @@ function preFrom(text, cls = "payload truncatable") {
   return el("pre", { class: cls }, text == null ? "" : String(text));
 }
 
+function diffLine(line) {
+  let cls = "diff-ctx";
+  if (line.startsWith("*** ")) cls = "diff-file";
+  else if (line.startsWith("@@")) cls = "diff-hunk";
+  else if (line.startsWith("+")) cls = "diff-add";
+  else if (line.startsWith("-")) cls = "diff-del";
+  return el("span", { class: "diff-line " + cls }, line === "" ? "​" : line);
+}
+
+function renderPatch(text) {
+  const block = el("pre", { class: "payload diff" });
+  for (const line of String(text || "").split("\n")) block.append(diffLine(line));
+  return block;
+}
+
+function renderChanges(changes) {
+  const wrap = el("div", {});
+  for (const [path, info] of Object.entries(changes || {})) {
+    const verb = info && info.type ? info.type : "change";
+    wrap.append(el("div", { class: "tool-section-label" }, verb + ": " + path));
+    const diffText = info && (info.unified_diff || info.content);
+    if (diffText) wrap.append(renderPatch(diffText));
+    else wrap.append(preFrom(JSON.stringify(info, null, 2), "payload truncatable"));
+  }
+  return wrap;
+}
+
 function formatToolInput(name, input) {
   const n = (name || "").toLowerCase();
   const value = input || {};
+  if (n === "apply_patch") {
+    const text = typeof value === "string" ? value : (value.raw || value.input || value.patch || JSON.stringify(value, null, 2));
+    return renderPatch(text);
+  }
   if (n === "exec_command" && typeof value === "object") {
     return el("div", {},
       value.workdir ? el("div", { class: "attach-meta", style: "margin-bottom:6px" }, "cwd: " + value.workdir) : null,
@@ -453,9 +485,15 @@ function formatToolInput(name, input) {
     );
   }
   if (n === "write_stdin" && typeof value === "object") {
+    const chars = value.chars || "";
+    const meta = ["session: " + (value.session_id ?? "")];
+    if (value.yield_time_ms) meta.push("wait: " + value.yield_time_ms + "ms");
+    if (value.max_output_tokens) meta.push("max tokens: " + value.max_output_tokens);
     return el("div", {},
-      el("div", { class: "attach-meta", style: "margin-bottom:6px" }, "session: " + (value.session_id || "")),
-      preFrom(value.chars || "", "payload")
+      el("div", { class: "attach-meta", style: "margin-bottom:6px" }, meta.join("  ·  ")),
+      chars
+        ? preFrom(chars, "payload")
+        : el("div", { class: "attach-meta", style: "font-style:italic" }, "(no input — polling process for more output)")
     );
   }
   if (n === "parallel" && Array.isArray(value.tool_uses)) {
