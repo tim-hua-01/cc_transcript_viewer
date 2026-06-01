@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Claude Code Transcript Browser</title>
+  <link rel="stylesheet" href="/style.css" />
+  <!-- markdown + sanitization, loaded from CDN; falls back to plain text if offline -->
+  <script src="https://cdn.jsdelivr.net/npm/marked@12/marked.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/dompurify@3/dist/purify.min.js"></script>
+</head>
+<body>
+  <div id="app">
+    <aside id="sidebar">
+      <div id="sidebar-header">
+        <div class="brand">
+          <span class="brand-mark">◆</span>
+          <span>CC Transcripts</span>
+          <button id="refresh" class="btn" title="Rescan ~/.claude/projects for new sessions">↻ Refresh</button>
+        </div>
+        <input id="search" type="search" placeholder="Search sessions or id…" autocomplete="off" />
+        <div id="sidebar-stats" class="muted"></div>
+      </div>
+      <div id="session-list"></div>
+    </aside>
+
+    <main id="main">
+      <div id="welcome" class="welcome">
+        <h1>Claude Code Transcript Browser</h1>
+        <p class="muted">Select a session from the left to view the full conversation —
+          every prompt, response, thought, and tool call.</p>
+        <ul class="legend">
+          <li><span class="dot dot-user"></span> User prompt</li>
+          <li><span class="dot dot-assistant"></span> Assistant reply</li>
+          <li><span class="dot dot-thinking"></span> Thinking</li>
+          <li><span class="dot dot-tool"></span> Tool call</li>
+        </ul>
+      </div>
+      <div id="transcript" hidden></div>
+    </main>
+  </div>
+  <script src="/app.js"></script>
+</body>
+</html>
