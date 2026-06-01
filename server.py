@@ -74,8 +74,14 @@ def _first_user_text(records: list[dict]) -> str:
         text = re.sub(r"<[^>]+>", " ", text)
         text = " ".join(text.split())
         if text:
-            return text[:200]
+            return _short_title(text)
     return ""
+
+
+def _short_title(text: str, n: int = 100) -> str:
+    """First ~n characters of a message, single-spaced, with an ellipsis if cut."""
+    text = " ".join((text or "").split())
+    return text[:n] + ("…" if len(text) > n else "")
 
 
 def cc_session_summary(path: Path) -> dict:
@@ -124,7 +130,7 @@ def cc_session_summary(path: Path) -> dict:
         "agent": "claude",
         "id": path.stem,
         "file": str(path),
-        "title": title or _first_user_text(records) or "(untitled session)",
+        "title": _first_user_text(records) or title or "(untitled session)",
         "cwd": cwd or decode_project_name(path.parent.name),
         "git_branch": git_branch,
         "version": version,
@@ -326,7 +332,7 @@ def parse_cc_session(path: Path) -> dict:
     return {
         "agent": "claude",
         "id": path.stem,
-        "title": title,
+        "title": _first_user_text(records) or title or "(untitled session)",
         "meta": meta,
         "events": events,
     }

@@ -87,7 +87,8 @@ def _first_user_message(records: list[dict]) -> str:
             continue
         payload = rec.get("payload") or {}
         if payload.get("type") == "user_message" and payload.get("message"):
-            return " ".join(str(payload["message"]).split())[:200]
+            text = " ".join(str(payload["message"]).split())
+            return text[:100] + ("…" if len(text) > 100 else "")
     return ""
 
 
@@ -175,7 +176,7 @@ def session_summary(path: Path, thread_row: dict | None = None) -> dict:
 
     st = _safe_stat(path)
     row = thread_row or {}
-    title = row.get("title") or row.get("preview") or _first_user_message(records) or "(untitled session)"
+    title = _first_user_message(records) or row.get("title") or row.get("preview") or "(untitled session)"
     cwd = row.get("cwd") or meta.get("cwd") or ""
     updated_ms = row.get("updated_at_ms") or (row.get("updated_at") * 1000 if row.get("updated_at") else None)
     created_ms = row.get("created_at_ms") or (row.get("created_at") * 1000 if row.get("created_at") else None)
@@ -681,8 +682,7 @@ def parse_session(path: Path) -> dict:
                 )
             )
 
-    if not title:
-        title = _first_user_message(records)
+    title = _first_user_message(records) or title
 
     return {
         "id": meta.get("id") or _thread_id_from_path(path),
