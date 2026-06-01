@@ -1,33 +1,40 @@
 #!/usr/bin/env python3
-"""Codex transcript browser.
+"""Codex transcript parsing library.
 
-A zero-dependency local web app for browsing Codex session transcripts stored
-under ~/.codex/sessions. Run it and open the printed URL.
+Reads Codex session transcripts stored under ~/.codex/sessions. This module is
+imported by server.py (the unified Claude Code + Codex transcript browser); it
+exposes list_sessions() / parse_session() and the helpers they need.
 
-Usage:
-    python codex_server.py [--port 3133] [--codex-home PATH]
+Call configure(codex_home) once at startup to point it at a Codex home other
+than the default ~/.codex.
 """
 
 from __future__ import annotations
 
-import argparse
 import json
 import mimetypes
 import sqlite3
 from datetime import datetime, timezone
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, quote, urlparse
+from urllib.parse import quote
 
-STATIC_DIR = Path(__file__).parent / "static"
 DEFAULT_CODEX_HOME = Path.home() / ".codex"
 
-# Set by main() so handlers can reach it.
+# Defaults; override via configure().
 CODEX_HOME = DEFAULT_CODEX_HOME
 SESSIONS_DIR = DEFAULT_CODEX_HOME / "sessions"
 ARCHIVED_SESSIONS_DIR = DEFAULT_CODEX_HOME / "archived_sessions"
 STATE_DB = DEFAULT_CODEX_HOME / "state_5.sqlite"
 MAX_INLINE_IMAGE_CHARS = 2_000_000
+
+
+def configure(codex_home: Path) -> None:
+    """Point the module at a Codex home directory."""
+    global CODEX_HOME, SESSIONS_DIR, ARCHIVED_SESSIONS_DIR, STATE_DB
+    CODEX_HOME = Path(codex_home).expanduser()
+    SESSIONS_DIR = CODEX_HOME / "sessions"
+    ARCHIVED_SESSIONS_DIR = CODEX_HOME / "archived_sessions"
+    STATE_DB = CODEX_HOME / "state_5.sqlite"
 
 
 def _iter_records(path: Path):
@@ -684,126 +691,3 @@ def parse_session(path: Path) -> dict:
         "events": events,
         "n_records": len(records),
     }
-
-
-class Handler(BaseHTTPRequestHandler):
-    def log_message(self, *args):  # quieter logs
-        pass
-
-    def _send_json(self, obj, status=200):
-        body = json.dumps(obj).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    def _send_file(self, path: Path, content_type: str):
-        try:
-            body = path.read_bytes()
-        except OSError:
-            self.send_error(404)
-            return
-        self.send_response(200)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    def do_GET(self):
-        parsed = urlparse(self.path)
-        route = parsed.path
-
-        if route == "/" or route == "/index.html":
-            self._send_file(STATIC_DIR / "codex_index.html", "text/html; charset=utf-8")
-            return
-        if route == "/codex_app.js":
-            self._send_file(STATIC_DIR / "codex_app.js", "application/javascript; charset=utf-8")
-            return
-        if route == "/codex_style.css":
-            self._send_file(STATIC_DIR / "codex_style.css", "text/css; charset=utf-8")
-            return
-        if route == "/style.css":
-            self._send_file(STATIC_DIR / "style.css", "text/css; charset=utf-8")
-            return
-
-        if route == "/api/local-image":
-            qs = parse_qs(parsed.query)
-            path_arg = qs.get("path", [""])[0]
-            if not path_arg:
-                self._send_json({"error": "missing path param"}, status=400)
-                return
-            target = Path(path_arg).expanduser().resolve()
-            content_type = mimetypes.guess_type(str(target))[0] or ""
-            if not content_type.startswith("image/"):
-                self._send_json({"error": "not an image"}, status=400)
-                return
-            self._send_file(target, content_type)
-            return
-
-        if route == "/api/sessions":
-            try:
-                self._send_json({"projects": list_sessions()})
-            except Exception as e:  # noqa: BLE001
-                self._send_json({"error": str(e)}, status=500)
-            return
-
-        if route == "/api/session":
-            qs = parse_qs(parsed.query)
-            file_arg = qs.get("file", [""])[0]
-            if not file_arg:
-                self._send_json({"error": "missing file param"}, status=400)
-                return
-            target = Path(file_arg).expanduser().resolve()
-            sessions_root = SESSIONS_DIR.resolve()
-            archived_root = ARCHIVED_SESSIONS_DIR.resolve()
-            in_sessions = target == sessions_root or sessions_root in target.parents
-            in_archived = (
-                ARCHIVED_SESSIONS_DIR.exists()
-                and (target == archived_root or archived_root in target.parents)
-            )
-            # Security: only allow files under Codex transcript roots.
-            if not in_sessions and not in_archived:
-                self._send_json({"error": "forbidden"}, status=403)
-                return
-            if not target.exists():
-                self._send_json({"error": "not found"}, status=404)
-                return
-            try:
-                self._send_json(parse_session(target))
-            except Exception as e:  # noqa: BLE001
-                self._send_json({"error": str(e)}, status=500)
-            return
-
-        self.send_error(404)
-
-
-def main():
-    global CODEX_HOME, SESSIONS_DIR, ARCHIVED_SESSIONS_DIR, STATE_DB
-    ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--port", type=int, default=3133)
-    ap.add_argument("--host", default="127.0.0.1")
-    ap.add_argument("--codex-home", type=Path, default=DEFAULT_CODEX_HOME)
-    args = ap.parse_args()
-
-    CODEX_HOME = args.codex_home.expanduser()
-    SESSIONS_DIR = CODEX_HOME / "sessions"
-    ARCHIVED_SESSIONS_DIR = CODEX_HOME / "archived_sessions"
-    STATE_DB = CODEX_HOME / "state_5.sqlite"
-
-    server = ThreadingHTTPServer((args.host, args.port), Handler)
-    url = f"http://{args.host}:{args.port}/"
-    print("Codex transcript browser")
-    print(f"  codex home:   {CODEX_HOME}")
-    print(f"  sessions dir: {SESSIONS_DIR}")
-    print(f"  archived dir: {ARCHIVED_SESSIONS_DIR}")
-    print(f"  serving at:   {url}")
-    print("  (Ctrl-C to stop)")
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        print("\nbye")
-
-
-if __name__ == "__main__":
-    main()

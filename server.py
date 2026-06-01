@@ -1,22 +1,26 @@
 #!/usr/bin/env python3
-"""Claude Code transcript browser.
+"""Unified Claude Code + Codex transcript browser.
 
-A zero-dependency local web app for browsing Claude Code session transcripts
-stored under ~/.claude/projects. Run it and open the printed URL.
+A zero-dependency local web app for browsing both Claude Code session
+transcripts (under ~/.claude/projects) and Codex session transcripts (under
+~/.codex/sessions) in a single, time-sorted sidebar. Run it and open the
+printed URL.
 
 Usage:
-    python server.py [--port 8765] [--projects-dir PATH]
+    python server.py [--port 3132] [--projects-dir PATH] [--codex-home PATH]
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import mimetypes
 import re
-from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
+
+import codex_server as codex
 
 STATIC_DIR = Path(__file__).parent / "static"
 DEFAULT_PROJECTS_DIR = Path.home() / ".claude" / "projects"
@@ -25,13 +29,15 @@ DEFAULT_PROJECTS_DIR = Path.home() / ".claude" / "projects"
 PROJECTS_DIR = DEFAULT_PROJECTS_DIR
 
 
+# ---------------------------------------------------------------------------
+# Claude Code parsing
+# ---------------------------------------------------------------------------
 def decode_project_name(dirname: str) -> str:
     """Claude Code encodes the project cwd by replacing '/' with '-'.
 
     The original path isn't perfectly recoverable (dashes in real names are
     ambiguous), but we can produce a readable best-effort path.
     """
-    # Leading dash means absolute path.
     if dirname.startswith("-"):
         return "/" + dirname[1:].replace("-", "/")
     return dirname.replace("-", "/")
@@ -63,18 +69,17 @@ def _first_user_text(records: list[dict]) -> str:
             text = "\n".join(p for p in parts if p)
         if not text:
             continue
-        # Skip slash-command / local-command meta blocks.
         if text.lstrip().startswith("<") and ("command-name" in text or "local-command" in text):
             continue
-        text = re.sub(r"<[^>]+>", " ", text)  # strip stray tags
+        text = re.sub(r"<[^>]+>", " ", text)
         text = " ".join(text.split())
         if text:
             return text[:200]
     return ""
 
 
-def session_summary(path: Path) -> dict:
-    """Lightweight metadata for the session list (cheap scan)."""
+def cc_session_summary(path: Path) -> dict:
+    """Lightweight metadata for a Claude Code session (cheap scan)."""
     records = list(_iter_records(path))
     title = ""
     cwd = ""
@@ -101,7 +106,6 @@ def session_summary(path: Path) -> dict:
             last_ts = ts
         if t == "user" and not rec.get("isSidechain"):
             content = rec.get("message", {}).get("content")
-            # only count "real" user turns (those with text), not tool results
             if isinstance(content, str) or (
                 isinstance(content, list)
                 and any(isinstance(b, dict) and b.get("type") == "text" for b in content)
@@ -117,6 +121,7 @@ def session_summary(path: Path) -> dict:
             n_assistant += 1
 
     return {
+        "agent": "claude",
         "id": path.stem,
         "file": str(path),
         "title": title or _first_user_text(records) or "(untitled session)",
@@ -128,38 +133,12 @@ def session_summary(path: Path) -> dict:
         "n_user": n_user,
         "n_assistant": n_assistant,
         "n_tool": n_tool,
+        "n_web": 0,
         "n_records": len(records),
+        "model": sorted(models)[0] if models else "",
         "models": sorted(models),
         "mtime": path.stat().st_mtime,
     }
-
-
-def list_sessions() -> list[dict]:
-    projects = []
-    if not PROJECTS_DIR.exists():
-        return projects
-    for proj_dir in sorted(PROJECTS_DIR.iterdir()):
-        if not proj_dir.is_dir():
-            continue
-        sessions = []
-        for f in proj_dir.glob("*.jsonl"):
-            try:
-                sessions.append(session_summary(f))
-            except (OSError, ValueError):
-                continue
-        if not sessions:
-            continue
-        sessions.sort(key=lambda s: s["mtime"], reverse=True)
-        projects.append(
-            {
-                "dir": proj_dir.name,
-                "path": decode_project_name(proj_dir.name),
-                "sessions": sessions,
-                "last_mtime": max(s["mtime"] for s in sessions),
-            }
-        )
-    projects.sort(key=lambda p: p["last_mtime"], reverse=True)
-    return projects
 
 
 def _normalize_tool_result_content(content) -> dict:
@@ -194,16 +173,10 @@ def _normalize_tool_result_content(content) -> dict:
     return out
 
 
-def parse_session(path: Path) -> dict:
-    """Full structured parse of one session, ready for rendering.
-
-    Produces a flat list of 'events' in chronological order. Tool results are
-    attached to their originating tool_use via tool_use_id so the frontend can
-    render them inline together.
-    """
+def parse_cc_session(path: Path) -> dict:
+    """Full structured parse of one Claude Code session, ready for rendering."""
     records = list(_iter_records(path))
 
-    # Index tool results (and structured toolUseResult) by tool_use_id.
     results_by_id: dict[str, dict] = {}
     for rec in records:
         if rec.get("type") != "user":
@@ -294,8 +267,6 @@ def parse_session(path: Path) -> dict:
                             data_uri = f"data:{src.get('media_type','image/png')};base64,{src.get('data','')}"
                         blocks.append({"type": "image", "data_uri": data_uri})
                         has_text = True
-                    # tool_result blocks handled separately (attached to tool_use)
-            # Skip user records that are purely tool results (no human text).
             if not has_text:
                 continue
             events.append(
@@ -353,6 +324,7 @@ def parse_session(path: Path) -> dict:
             continue
 
     return {
+        "agent": "claude",
         "id": path.stem,
         "title": title,
         "meta": meta,
@@ -360,6 +332,62 @@ def parse_session(path: Path) -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# Unified session list / dispatch
+# ---------------------------------------------------------------------------
+def list_sessions() -> list[dict]:
+    """Flat list of every Claude Code and Codex session, newest first."""
+    out: list[dict] = []
+
+    if PROJECTS_DIR.exists():
+        for proj_dir in sorted(PROJECTS_DIR.iterdir()):
+            if not proj_dir.is_dir():
+                continue
+            for f in proj_dir.glob("*.jsonl"):
+                try:
+                    out.append(cc_session_summary(f))
+                except (OSError, ValueError):
+                    continue
+
+    try:
+        for group in codex.list_sessions():
+            for s in group.get("sessions", []):
+                s["agent"] = "codex"
+                out.append(s)
+    except Exception:  # noqa: BLE001 — never let Codex errors hide CC sessions
+        pass
+
+    out.sort(key=lambda s: s.get("mtime") or 0, reverse=True)
+    return out
+
+
+def _under(target: Path, root: Path) -> bool:
+    try:
+        root = root.resolve()
+    except OSError:
+        return False
+    return target == root or root in target.parents
+
+
+def parse_session(target: Path) -> dict | None:
+    """Dispatch to the right parser based on which transcript root owns the file.
+
+    Returns None if the file is outside every allowed root.
+    """
+    if _under(target, PROJECTS_DIR):
+        return parse_cc_session(target)
+    if _under(target, codex.SESSIONS_DIR) or (
+        codex.ARCHIVED_SESSIONS_DIR.exists() and _under(target, codex.ARCHIVED_SESSIONS_DIR)
+    ):
+        data = codex.parse_session(target)
+        data["agent"] = "codex"
+        return data
+    return None
+
+
+# ---------------------------------------------------------------------------
+# HTTP server
+# ---------------------------------------------------------------------------
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args):  # quieter logs
         pass
@@ -398,9 +426,23 @@ class Handler(BaseHTTPRequestHandler):
             self._send_file(STATIC_DIR / "style.css", "text/css; charset=utf-8")
             return
 
+        if route == "/api/local-image":
+            qs = parse_qs(parsed.query)
+            path_arg = qs.get("path", [""])[0]
+            if not path_arg:
+                self._send_json({"error": "missing path param"}, status=400)
+                return
+            t = Path(path_arg).expanduser().resolve()
+            content_type = mimetypes.guess_type(str(t))[0] or ""
+            if not content_type.startswith("image/"):
+                self._send_json({"error": "not an image"}, status=400)
+                return
+            self._send_file(t, content_type)
+            return
+
         if route == "/api/sessions":
             try:
-                self._send_json({"projects": list_sessions()})
+                self._send_json({"sessions": list_sessions()})
             except Exception as e:  # noqa: BLE001
                 self._send_json({"error": str(e)}, status=500)
             return
@@ -411,18 +453,19 @@ class Handler(BaseHTTPRequestHandler):
             if not file_arg:
                 self._send_json({"error": "missing file param"}, status=400)
                 return
-            target = Path(file_arg).resolve()
-            # Security: only allow files under PROJECTS_DIR.
-            if PROJECTS_DIR.resolve() not in target.parents:
-                self._send_json({"error": "forbidden"}, status=403)
-                return
+            target = Path(file_arg).expanduser().resolve()
             if not target.exists():
                 self._send_json({"error": "not found"}, status=404)
                 return
             try:
-                self._send_json(parse_session(target))
+                data = parse_session(target)
             except Exception as e:  # noqa: BLE001
                 self._send_json({"error": str(e)}, status=500)
+                return
+            if data is None:
+                self._send_json({"error": "forbidden"}, status=403)
+                return
+            self._send_json(data)
             return
 
         self.send_error(404)
@@ -434,14 +477,18 @@ def main():
     ap.add_argument("--port", type=int, default=3132)
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--projects-dir", type=Path, default=DEFAULT_PROJECTS_DIR)
+    ap.add_argument("--codex-home", type=Path, default=codex.DEFAULT_CODEX_HOME)
     args = ap.parse_args()
 
-    PROJECTS_DIR = args.projects_dir
+    PROJECTS_DIR = args.projects_dir.expanduser()
+    codex.configure(args.codex_home)
+
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     url = f"http://{args.host}:{args.port}/"
-    print(f"Claude Code transcript browser")
-    print(f"  projects dir: {PROJECTS_DIR}")
-    print(f"  serving at:   {url}")
+    print("Claude Code + Codex transcript browser")
+    print(f"  claude projects: {PROJECTS_DIR}")
+    print(f"  codex sessions:  {codex.SESSIONS_DIR}")
+    print(f"  serving at:      {url}")
     print("  (Ctrl-C to stop)")
     try:
         server.serve_forever()

@@ -19,16 +19,12 @@ function el(tag, attrs = {}, ...kids) {
 }
 const esc = (s) => (s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 
-// ---------- markdown ----------
+// ---------- markdown (with KaTeX math) ----------
 // Pulls $…$, $$…$$, \(…\), \[…\] out of `text` before markdown sees them,
 // so things like $\bm h_\perp$ don't get mangled by italic/asterisk parsing.
-// Returns { stripped, math } — math entries get rendered with KaTeX later.
 function extractMath(text) {
   const math = [];
-  // Inline-HTML placeholder survives paragraph / table-cell trimming that a
-  // plain "MATH0" token wouldn't.
   const tok = (i) => `<span data-katex-i="${i}"></span>`;
-  // Protect fenced code (```…```) and inline code (`…`) first.
   const codes = [];
   let s = text.replace(/```[\s\S]*?```/g, (m) => { codes.push(m); return `<!--CODE${codes.length - 1}-->`; });
   s = s.replace(/`[^`\n]*`/g, (m) => { codes.push(m); return `<!--CODE${codes.length - 1}-->`; });
@@ -36,8 +32,6 @@ function extractMath(text) {
   s = s.replace(/\$\$([\s\S]+?)\$\$/g, (_, expr) => { math.push({ expr, display: true }); return tok(math.length - 1); });
   s = s.replace(/\\\[([\s\S]+?)\\\]/g, (_, expr) => { math.push({ expr, display: true }); return tok(math.length - 1); });
   s = s.replace(/\\\(([\s\S]+?)\\\)/g, (_, expr) => { math.push({ expr, display: false }); return tok(math.length - 1); });
-  // $…$ — require non-space immediately inside, and the closing $ not followed
-  // by a digit, so "$5" / "$10" don't get eaten.
   s = s.replace(/(^|[^\\$])\$(?!\s)([^$\n]+?)(?<!\s)\$(?!\d)/g, (_, pre, expr) => {
     math.push({ expr, display: false });
     return pre + tok(math.length - 1);
@@ -99,21 +93,34 @@ function relDays(ts) {
 }
 function shortModel(m) {
   if (!m) return "";
-  return m.replace(/^claude-/, "").replace(/-\d{8}$/, "").replace(/\[1m\]$/, " (1M)");
+  return String(m)
+    .replace(/^claude-/, "")
+    .replace(/-\d{8}$/, "")
+    .replace(/\[1m\]$/, " (1M)")
+    .replace(/-codex$/, "");
+}
+function shortPath(p) {
+  const parts = (p || "").split("/").filter(Boolean);
+  if (parts.length <= 2) return p || "";
+  return ".../" + parts.slice(-2).join("/");
+}
+function fmtDuration(ms) {
+  if (ms == null) return "";
+  if (ms < 1000) return ms + "ms";
+  return (ms / 1000).toFixed(ms < 10000 ? 1 : 0) + "s";
 }
 
 // ---------- state ----------
-let PROJECTS = [];
+let SESSIONS = [];
 let CURRENT_FILE = null;
+let AGENT_FILTER = "all";
 
 // ---------- sidebar ----------
 async function loadSessions() {
   const res = await fetch("/api/sessions");
   const data = await res.json();
-  PROJECTS = data.projects || [];
-  const total = PROJECTS.reduce((a, p) => a + p.sessions.length, 0);
-  $("#sidebar-stats").textContent = `${total} sessions across ${PROJECTS.length} projects`;
-  renderSidebar("");
+  SESSIONS = data.sessions || [];
+  renderSidebar($("#search").value || "");
 }
 
 function renderSidebar(query) {
@@ -121,67 +128,60 @@ function renderSidebar(query) {
   list.innerHTML = "";
   const q = query.trim().toLowerCase();
 
-  for (const proj of PROJECTS) {
-    const matches = proj.sessions.filter((s) => {
-      if (!q) return true;
-      return (s.title + " " + s.cwd + " " + s.id).toLowerCase().includes(q);
-    });
-    if (!matches.length) continue;
+  const matches = SESSIONS.filter((s) => {
+    if (AGENT_FILTER !== "all" && s.agent !== AGENT_FILTER) return false;
+    if (!q) return true;
+    return (s.title + " " + (s.cwd || "") + " " + s.id + " " + s.agent).toLowerCase().includes(q);
+  });
 
-    const group = el("div", { class: "project-group" });
-    const header = el(
+  const nClaude = matches.filter((s) => s.agent === "claude").length;
+  const nCodex = matches.filter((s) => s.agent === "codex").length;
+  $("#sidebar-stats").textContent = `${matches.length} sessions · ${nClaude} Claude · ${nCodex} Codex`;
+
+  for (const s of matches) {
+    const tsForRel = s.last_ts || (s.mtime ? new Date(s.mtime * 1000).toISOString() : null);
+    const item = el(
       "div",
-      { class: "project-header", title: proj.path },
-      el("span", { class: "chev" }, "▼"),
-      el("span", { class: "project-path" }, shortPath(proj.path)),
-      el("span", { class: "project-count" }, matches.length)
-    );
-    header.addEventListener("click", () => group.classList.toggle("collapsed"));
-    group.append(header);
-
-    for (const s of matches) {
-      const item = el(
+      { class: "session-item", "data-file": s.file },
+      el(
         "div",
-        { class: "session-item", "data-file": s.file },
-        el("div", { class: "session-title" }, s.title),
-        el(
-          "div",
-          { class: "session-meta" },
-          el("span", {}, relDays(s.last_ts || new Date(s.mtime * 1000).toISOString())),
-          el("span", { class: "badge" }, `${s.n_user}💬`),
-          el("span", { class: "badge" }, `${s.n_tool}🔧`),
-          s.models && s.models[0] ? el("span", { class: "badge" }, shortModel(s.models[0])) : null
-        ),
-        el(
-          "div",
-          { class: "session-id", title: "Click to copy full id: " + s.id, onclick: (e) => copyId(e, s.id) },
-          s.id
-        )
-      );
-      item.addEventListener("click", () => openSession(s.file, item));
-      group.append(item);
-    }
-    list.append(group);
+        { class: "session-toprow" },
+        el("span", { class: "agent-tag agent-" + s.agent }, s.agent === "codex" ? "Codex" : "Claude"),
+        el("span", { class: "session-title" }, s.title)
+      ),
+      s.cwd ? el("div", { class: "session-cwd", title: s.cwd }, shortPath(s.cwd)) : null,
+      el(
+        "div",
+        { class: "session-meta" },
+        el("span", {}, relDays(tsForRel)),
+        el("span", { class: "badge" }, `${s.n_user || 0}💬`),
+        el("span", { class: "badge" }, `${s.n_tool || 0}🔧`),
+        s.n_web ? el("span", { class: "badge" }, `${s.n_web}🌐`) : null,
+        s.model ? el("span", { class: "badge" }, shortModel(s.model)) : null
+      ),
+      el(
+        "div",
+        { class: "session-id", title: "Click to copy full id: " + s.id, onclick: (e) => copyId(e, s.id) },
+        s.id
+      )
+    );
+    item.addEventListener("click", () => openSession(s.file, item));
+    list.append(item);
   }
+
   if (!list.children.length) {
     list.append(el("div", { class: "empty-note" }, q ? "No matching sessions." : "No transcripts found."));
   }
 }
 
 function copyId(e, id) {
-  e.stopPropagation(); // don't trigger opening the session
-  const el = e.currentTarget;
-  const restore = el.textContent;
+  e.stopPropagation();
+  const node = e.currentTarget;
+  const restore = node.textContent;
   navigator.clipboard?.writeText(id).then(
-    () => { el.textContent = "copied ✓"; setTimeout(() => (el.textContent = restore), 900); },
+    () => { node.textContent = "copied ✓"; setTimeout(() => (node.textContent = restore), 900); },
     () => {}
   );
-}
-
-function shortPath(p) {
-  const parts = p.split("/").filter(Boolean);
-  if (parts.length <= 2) return p;
-  return ".../" + parts.slice(-2).join("/");
 }
 
 // ---------- session view ----------
@@ -213,17 +213,26 @@ async function openSession(file, itemEl) {
 function renderTranscript(data) {
   const t = $("#transcript");
   t.innerHTML = "";
+  const isCodex = data.agent === "codex";
 
   const meta = data.meta || {};
   const header = el(
     "div",
     { class: "t-header" },
-    el("h1", { class: "t-title" }, data.title || "(untitled session)"),
+    el(
+      "h1",
+      { class: "t-title" },
+      el("span", { class: "agent-tag agent-" + data.agent }, isCodex ? "Codex" : "Claude"),
+      data.title || "(untitled session)"
+    ),
     el(
       "div",
       { class: "t-meta" },
       meta.cwd ? el("span", {}, "📁 " + meta.cwd) : null,
       meta.git_branch ? el("span", {}, "⎇ " + meta.git_branch) : null,
+      meta.model ? el("span", {}, shortModel(meta.model)) : null,
+      meta.reasoning_effort ? el("span", {}, "effort: " + meta.reasoning_effort) : null,
+      meta.source ? el("span", {}, "source: " + meta.source) : null,
       meta.version ? el("span", {}, "v" + meta.version) : null,
       el("span", {}, data.events.length + " events"),
       el("span", { class: "session-id", style: "margin:0", title: "Click to copy", onclick: (e) => copyId(e, data.id) }, "id: " + data.id)
@@ -234,7 +243,10 @@ function renderTranscript(data) {
       el("button", { class: "btn", onclick: () => setAll(".thinking-block", true) }, "Collapse thinking"),
       el("button", { class: "btn", onclick: () => setAll(".thinking-block", false) }, "Expand thinking"),
       el("button", { class: "btn", onclick: () => setAll(".tool-block", true) }, "Collapse tools"),
-      el("button", { class: "btn", onclick: () => setAll(".tool-block", false) }, "Expand tools")
+      el("button", { class: "btn", onclick: () => setAll(".tool-block", false) }, "Expand tools"),
+      isCodex ? el("button", { class: "btn", onclick: () => setAll(".status-block", true) }, "Collapse status") : null,
+      isCodex ? el("button", { class: "btn", onclick: () => setAll(".status-block", false) }, "Expand status") : null,
+      isCodex ? el("button", { class: "btn", onclick: () => document.body.classList.toggle("show-tokens") }, "Toggle tokens") : null
     )
   );
   t.append(header);
@@ -250,12 +262,21 @@ function setAll(sel, collapsed) {
   $$(sel).forEach((n) => n.classList.toggle("collapsed", collapsed));
 }
 
+// ---------- event dispatch (handles both Claude Code and Codex shapes) ----------
 function renderEvent(ev) {
   switch (ev.kind) {
     case "user": return renderUser(ev);
     case "assistant": return renderAssistant(ev);
     case "system": return renderSystem(ev);
     case "attachment": return renderAttachment(ev);
+    case "reasoning": return turnShell("reasoning", "Reasoning", ev, [renderReasoning(ev)]);
+    case "tool": return turnShell("tool", "Tool · " + (ev.name || "tool"), ev, [renderCodexTool(ev)]);
+    case "web_search":
+    case "web_call": return turnShell("web_call", "Web search", ev, [renderWebSearch(ev)]);
+    case "status": return renderStatus(ev);
+    case "context": return renderContext(ev);
+    case "tokens": return renderTokens(ev);
+    case "raw": return turnShell("raw", "Raw · " + ev.record_type, ev, [preFrom(JSON.stringify(ev.payload, null, 2))]);
     default: return null;
   }
 }
@@ -266,6 +287,8 @@ function turnShell(kind, label, ev, bodyNodes) {
     { class: "turn-head" },
     el("span", {}, label),
     ev.is_sidechain ? el("span", { class: "sidechain-tag" }, "sub-agent") : null,
+    ev.phase ? el("span", { class: "phase-tag" }, ev.phase) : null,
+    ev.status ? el("span", { class: "status-tag" }, ev.status) : null,
     ev.model ? el("span", { class: "muted", style: "font-weight:400" }, shortModel(ev.model)) : null,
     el("span", { class: "turn-time" }, fmtTime(ev.ts))
   );
@@ -279,21 +302,34 @@ function turnShell(kind, label, ev, bodyNodes) {
 
 function renderUser(ev) {
   const body = [];
-  for (const b of ev.blocks) {
-    if (b.type === "text") body.push(el("div", { class: "md", html: md(b.text) }));
-    else if (b.type === "image" && b.data_uri) body.push(el("img", { src: b.data_uri, style: "max-width:100%;border-radius:8px" }));
+  if (ev.blocks) {
+    // Claude Code shape
+    for (const b of ev.blocks) {
+      if (b.type === "text") body.push(el("div", { class: "md", html: md(b.text) }));
+      else if (b.type === "image" && b.data_uri) body.push(el("img", { src: b.data_uri, style: "max-width:100%;border-radius:8px" }));
+    }
+  } else {
+    // Codex shape
+    if (ev.text) body.push(el("div", { class: "md", html: md(ev.text) }));
+    for (const img of ev.images || []) body.push(renderImagePayload(img));
+    for (const img of ev.local_images || []) body.push(el("div", { class: "attach-meta" }, "local image: " + img));
   }
   return turnShell("user", "User", ev, body);
 }
 
 function renderAssistant(ev) {
-  const body = [];
-  for (const b of ev.blocks) {
-    if (b.type === "text") body.push(el("div", { class: "md", html: md(b.text) }));
-    else if (b.type === "thinking") body.push(renderThinking(b));
-    else if (b.type === "tool_use") body.push(renderTool(b));
+  if (ev.blocks) {
+    // Claude Code shape
+    const body = [];
+    for (const b of ev.blocks) {
+      if (b.type === "text") body.push(el("div", { class: "md", html: md(b.text) }));
+      else if (b.type === "thinking") body.push(renderThinking(b));
+      else if (b.type === "tool_use") body.push(renderTool(b));
+    }
+    return turnShell("assistant", "Claude", ev, body);
   }
-  return turnShell("assistant", "Claude", ev, body);
+  // Codex shape (flat text; reasoning/tools are separate events)
+  return turnShell("assistant", "Codex", ev, [el("div", { class: "md", html: md(ev.text || "") })]);
 }
 
 function renderThinking(b) {
@@ -317,6 +353,29 @@ function renderThinking(b) {
   return block;
 }
 
+function renderReasoning(ev) {
+  const hasText = ev.text && ev.text.trim();
+  const block = el("div", { class: "thinking-block collapsed" + (hasText ? "" : " empty") });
+  const head = el(
+    "div",
+    { class: "thinking-head" },
+    el("span", { class: "chev" }, "▼"),
+    el("span", {}, hasText ? "💭 Reasoning summary" : "💭 Reasoning not readable")
+  );
+  head.addEventListener("click", () => block.classList.toggle("collapsed"));
+  const body = hasText
+    ? el("div", { class: "thinking-body md", html: md(ev.text) })
+    : el(
+        "div",
+        { class: "thinking-body thinking-empty" },
+        ev.has_encrypted
+          ? "Codex saved encrypted reasoning content for continuation, not readable reasoning text."
+          : "No reasoning text was recorded."
+      );
+  block.append(head, body);
+  return block;
+}
+
 function renderSystem(ev) {
   return turnShell("system", "System · " + (ev.subtype || ""), ev, [
     el("div", { class: "md", html: md(ev.text || "") }),
@@ -334,7 +393,130 @@ function renderAttachment(ev) {
   return turnShell("attachment", label || "Attachment", ev, body);
 }
 
+// ---------- Codex status / context / tokens ----------
+function collapsibleBlock(cls, label, bodyNodes) {
+  const block = el("div", { class: cls });
+  const head = el(
+    "div",
+    { class: "tool-head" },
+    el("span", { class: "chev" }, "▼"),
+    el("span", { class: "tool-name" }, label)
+  );
+  head.addEventListener("click", () => block.classList.toggle("collapsed"));
+  block.append(head, el("div", { class: "tool-body" }, ...bodyNodes));
+  return block;
+}
+
+function renderStatus(ev) {
+  const facts = [
+    ev.turn_id ? "turn: " + ev.turn_id : "",
+    ev.reason ? "reason: " + ev.reason : "",
+    ev.duration_ms != null ? "duration: " + fmtDuration(ev.duration_ms) : "",
+    ev.time_to_first_token_ms != null ? "first token: " + fmtDuration(ev.time_to_first_token_ms) : "",
+    ev.context_window ? "context: " + ev.context_window.toLocaleString() : "",
+    ev.collaboration_mode ? "mode: " + ev.collaboration_mode : "",
+  ].filter(Boolean).join("\n");
+  const block = collapsibleBlock("status-block collapsed", "Status details", [preFrom(facts || JSON.stringify(ev, null, 2))]);
+  return turnShell("status", "Task", ev, [block]);
+}
+
+function renderContext(ev) {
+  const payload = {
+    turn_id: ev.turn_id,
+    cwd: ev.cwd,
+    model: ev.model,
+    effort: ev.effort,
+    approval_policy: ev.approval_policy,
+    sandbox_policy: ev.sandbox_policy,
+    summary: ev.summary,
+  };
+  const block = collapsibleBlock("status-block collapsed", "Turn context", [preFrom(JSON.stringify(payload, null, 2))]);
+  return turnShell("context", "Context", ev, [block]);
+}
+
+function renderTokens(ev) {
+  const usage = ev.usage || {};
+  const body = el(
+    "div",
+    { class: "token-grid" },
+    ...Object.entries(usage).map(([k, v]) => el("div", {}, el("strong", {}, k.replace(/_/g, " ")), el("br"), String(v)))
+  );
+  const extra = ev.context_window ? el("div", { class: "attach-meta", style: "margin-top:8px" }, "context window: " + ev.context_window.toLocaleString()) : null;
+  const block = collapsibleBlock("status-block collapsed", "Token usage", [body, extra]);
+  const node = turnShell("tokens", "Usage", ev, [block]);
+  node.classList.add("token-event");
+  return node;
+}
+
+// ---------- images (Codex) ----------
+function imageObjectSrc(obj) {
+  if (!obj || typeof obj !== "object") return "";
+  if (obj.src) return obj.src;
+  if (obj.url) return obj.url;
+  if (obj.data) {
+    const mime = obj.media_type || obj.mime_type || "image/png";
+    return String(obj.data).startsWith("data:") ? obj.data : `data:${mime};base64,${obj.data}`;
+  }
+  if (obj.source && obj.source.data) {
+    const mime = obj.source.media_type || "image/png";
+    return `data:${mime};base64,${obj.source.data}`;
+  }
+  return "";
+}
+
+function renderImagePayload(img) {
+  if (img.kind === "local" && img.src) {
+    return el("figure", { class: "tool-image-frame" },
+      el("img", { src: img.src, class: "tool-image", loading: "lazy" }),
+      img.path ? el("figcaption", { class: "attach-meta" }, img.path) : null
+    );
+  }
+  if (img.kind === "inline" && img.src) {
+    return el("img", { src: img.src, class: "tool-image", loading: "lazy" });
+  }
+  if (img.kind === "object" && img.value) {
+    const src = imageObjectSrc(img.value);
+    if (src) return el("img", { src, class: "tool-image", loading: "lazy" });
+    return preFrom(JSON.stringify(img.value, null, 2), "payload truncatable");
+  }
+  return el("div", { class: "attach-meta" }, `image omitted (${img.bytes || "unknown"} chars): ${img.reason || img.kind}`);
+}
+
+function renderWebSearch(ev) {
+  const action = ev.action || {};
+  // Codex fires one search call but often with several sub-queries; collect them all.
+  const queries = (Array.isArray(action.queries) && action.queries.length)
+    ? action.queries
+    : [ev.query || action.query].filter(Boolean);
+  const block = el("div", { class: "tool-block collapsed" });
+  const head = el(
+    "div",
+    { class: "tool-head" },
+    el("span", { class: "chev" }, "▼"),
+    el("span", { class: "tool-icon" }, "🌐"),
+    el("span", { class: "tool-name" }, "web_search"),
+    queries.length > 1 ? el("span", { class: "status-tag" }, queries.length + " queries") : null,
+    el("span", { class: "tool-summary", title: queries.join("  •  ") }, queries[0] || "(no query recorded)")
+  );
+  head.addEventListener("click", () => block.classList.toggle("collapsed"));
+
+  const ul = el("ul", { class: "query-list" });
+  for (const q of queries) ul.append(el("li", {}, q));
+
+  block.append(
+    head,
+    el("div", { class: "tool-body" },
+      el("div", { class: "tool-section-label" }, queries.length > 1 ? "Queries" : "Query"),
+      queries.length ? ul : preFrom("(no query recorded)", "payload"),
+      el("div", { class: "attach-meta", style: "margin-top:8px;font-style:italic" },
+        "Codex records only the search queries, not the results returned.")
+    )
+  );
+  return block;
+}
+
 // ---------- tool rendering ----------
+// Claude Code tool (input formatted client-side; result attached on the block).
 function renderTool(b) {
   const name = b.name || "tool";
   const fmt = formatToolInput(name, b.input || {});
@@ -353,17 +535,53 @@ function renderTool(b) {
   head.addEventListener("click", () => block.classList.toggle("collapsed"));
 
   const bodyKids = [];
-  // input
   bodyKids.push(el("div", { class: "tool-section-label" }, "Input"));
   bodyKids.push(fmt.inputNode);
-  // result
   if (b.result) {
     const imgs = b.result.images || [];
     const txt = b.result.text || (imgs.length ? "" : "(no output)");
     bodyKids.push(el("div", { class: "tool-section-label" }, isErr ? "Error" : "Result"));
     if (txt) bodyKids.push(el("pre", { class: "payload truncatable" + (isErr ? " result-error" : "") }, txt));
-    for (const uri of imgs) {
-      bodyKids.push(el("img", { src: uri, class: "tool-image", loading: "lazy" }));
+    for (const uri of imgs) bodyKids.push(el("img", { src: uri, class: "tool-image", loading: "lazy" }));
+  } else {
+    bodyKids.push(el("div", { class: "tool-section-label muted" }, "No result recorded"));
+  }
+
+  block.append(head, el("div", { class: "tool-body" }, ...bodyKids));
+  return block;
+}
+
+// Codex tool (top-level event; summary precomputed server-side, result is a dict).
+function renderCodexTool(ev) {
+  const name = ev.name || "tool";
+  const isErr = ev.result && ev.result.is_error;
+  const block = el("div", { class: "tool-block collapsed" + (isErr ? " error" : "") });
+  const head = el(
+    "div",
+    { class: "tool-head" },
+    el("span", { class: "chev" }, "▼"),
+    el("span", { class: "tool-icon" }, isErr ? "✗" : "🔧"),
+    el("span", { class: "tool-name" }, name),
+    ev.status ? el("span", { class: "status-tag" }, ev.status) : null,
+    el("span", { class: "tool-summary", title: ev.summary || "" }, ev.summary || "")
+  );
+  head.addEventListener("click", () => block.classList.toggle("collapsed"));
+
+  const bodyKids = [];
+  bodyKids.push(el("div", { class: "tool-section-label" }, "Input"));
+  bodyKids.push(formatToolInput(name, ev.input).inputNode);
+  if (ev.result) {
+    bodyKids.push(el("div", { class: "tool-section-label" }, isErr ? "Error" : "Result"));
+    if (ev.result.output) {
+      bodyKids.push(preFrom(ev.result.output, "payload truncatable" + (isErr ? " result-error" : "")));
+    }
+    for (const img of ev.result.images || []) bodyKids.push(renderImagePayload(img));
+    if (ev.result.raw) {
+      if (ev.result.raw.changes) bodyKids.push(renderChanges(ev.result.raw.changes));
+      else bodyKids.push(preFrom(JSON.stringify(ev.result.raw, null, 2), "payload truncatable"));
+    }
+    if (!ev.result.output && !(ev.result.images || []).length && !ev.result.raw) {
+      bodyKids.push(preFrom("(no output)", "payload truncatable"));
     }
   } else {
     bodyKids.push(el("div", { class: "tool-section-label muted" }, "No result recorded"));
@@ -374,67 +592,120 @@ function renderTool(b) {
 }
 
 function preFrom(text, cls = "payload truncatable") {
-  return el("pre", { class: cls }, text);
+  return el("pre", { class: cls }, text == null ? "" : String(text));
 }
 
-// Build a readable diff view for Edit / Write.
+// Build a readable diff view for Edit / Write (old/new strings).
 function diffNode(oldStr, newStr) {
   const wrap = el("pre", { class: "payload" });
-  const add = (line, cls) => {
-    const span = el("span", { class: cls }, line + "\n");
-    wrap.append(span);
-  };
+  const add = (line, cls) => wrap.append(el("span", { class: cls }, line + "\n"));
   if (oldStr != null) (oldStr.split("\n")).forEach((l) => add("- " + l, "diff-del"));
   if (newStr != null) (newStr.split("\n")).forEach((l) => add("+ " + l, "diff-add"));
   return wrap;
 }
 
-// Per-tool formatting: returns {summary, inputNode}
+// Render a Codex apply_patch body (a raw unified-ish patch string) as a diff.
+function diffLine(line) {
+  let cls = "diff-ctx";
+  if (line.startsWith("*** ")) cls = "diff-file";
+  else if (line.startsWith("@@")) cls = "diff-hunk";
+  else if (line.startsWith("+")) cls = "diff-add";
+  else if (line.startsWith("-")) cls = "diff-del";
+  return el("span", { class: "diff-line " + cls }, line === "" ? "​" : line);
+}
+
+function renderPatch(text) {
+  const block = el("pre", { class: "payload diff" });
+  for (const line of String(text || "").split("\n")) block.append(diffLine(line));
+  return block;
+}
+
+function renderChanges(changes) {
+  const wrap = el("div", {});
+  for (const [path, info] of Object.entries(changes || {})) {
+    const verb = info && info.type ? info.type : "change";
+    wrap.append(el("div", { class: "tool-section-label" }, verb + ": " + path));
+    const diffText = info && (info.unified_diff || info.content);
+    if (diffText) wrap.append(renderPatch(diffText));
+    else wrap.append(preFrom(JSON.stringify(info, null, 2), "payload truncatable"));
+  }
+  return wrap;
+}
+
+// Per-tool formatting for both Claude Code and Codex. Returns {summary, inputNode}.
 function formatToolInput(name, input) {
   const n = (name || "").toLowerCase();
+  const value = input == null ? {} : input;
 
-  // Bash
-  if (n === "bash") {
-    const cmd = input.command || "";
+  // ----- Codex tools -----
+  if (n === "apply_patch") {
+    const text = typeof value === "string" ? value : (value.raw || value.input || value.patch || JSON.stringify(value, null, 2));
+    return { summary: "patch", inputNode: renderPatch(text) };
+  }
+  if ((n === "exec_command" || n === "shell") && typeof value === "object") {
     const node = el("div", {},
-      input.description ? el("div", { class: "muted", style: "margin-bottom:4px" }, input.description) : null,
+      value.workdir ? el("div", { class: "attach-meta", style: "margin-bottom:6px" }, "cwd: " + value.workdir) : null,
+      preFrom(value.cmd || (Array.isArray(value.command) ? value.command.join(" ") : value.command) || "", "payload"),
+      value.yield_time_ms ? el("div", { class: "attach-meta", style: "margin-top:6px" }, "yield: " + value.yield_time_ms + "ms") : null
+    );
+    return { summary: firstLine(value.cmd || ""), inputNode: node };
+  }
+  if (n === "write_stdin" && typeof value === "object") {
+    const chars = value.chars || "";
+    const meta = ["session: " + (value.session_id ?? "")];
+    if (value.yield_time_ms) meta.push("wait: " + value.yield_time_ms + "ms");
+    if (value.max_output_tokens) meta.push("max tokens: " + value.max_output_tokens);
+    const node = el("div", {},
+      el("div", { class: "attach-meta", style: "margin-bottom:6px" }, meta.join("  ·  ")),
+      chars
+        ? preFrom(chars, "payload")
+        : el("div", { class: "attach-meta", style: "font-style:italic" }, "(no input — polling process for more output)")
+    );
+    return { summary: "session " + (value.session_id ?? ""), inputNode: node };
+  }
+  if (n === "parallel" && Array.isArray(value.tool_uses)) {
+    const wrap = el("div", {});
+    value.tool_uses.forEach((use, i) => {
+      wrap.append(el("div", { class: "tool-section-label" }, "call " + (i + 1) + " · " + (use.recipient_name || "")));
+      wrap.append(preFrom(JSON.stringify(use.parameters || {}, null, 2), "payload truncatable"));
+    });
+    return { summary: value.tool_uses.length + " tool calls", inputNode: wrap };
+  }
+
+  // ----- Claude Code tools -----
+  if (n === "bash") {
+    const cmd = value.command || "";
+    const node = el("div", {},
+      value.description ? el("div", { class: "muted", style: "margin-bottom:4px" }, value.description) : null,
       preFrom(cmd, "payload"),
-      input.run_in_background ? el("div", { class: "muted", style: "margin-top:4px" }, "(background)") : null
+      value.run_in_background ? el("div", { class: "muted", style: "margin-top:4px" }, "(background)") : null
     );
     return { summary: firstLine(cmd), inputNode: node };
   }
-
-  // Read
   if (n === "read") {
-    const fp = input.file_path || "";
-    const extra = [input.offset ? "offset " + input.offset : "", input.limit ? "limit " + input.limit : "", input.pages ? "pages " + input.pages : ""].filter(Boolean).join(", ");
+    const fp = value.file_path || "";
+    const extra = [value.offset ? "offset " + value.offset : "", value.limit ? "limit " + value.limit : "", value.pages ? "pages " + value.pages : ""].filter(Boolean).join(", ");
     return { summary: fp + (extra ? "  (" + extra + ")" : ""), inputNode: el("div", { class: "attach-meta" }, fp + (extra ? "  " + extra : "")) };
   }
-
-  // Edit
   if (n === "edit") {
-    const fp = input.file_path || "";
+    const fp = value.file_path || "";
     const node = el("div", {},
-      el("div", { class: "attach-meta", style: "margin-bottom:6px" }, fp + (input.replace_all ? "  (replace all)" : "")),
-      diffNode(input.old_string, input.new_string)
+      el("div", { class: "attach-meta", style: "margin-bottom:6px" }, fp + (value.replace_all ? "  (replace all)" : "")),
+      diffNode(value.old_string, value.new_string)
     );
     return { summary: fp, inputNode: node };
   }
-
-  // Write
   if (n === "write") {
-    const fp = input.file_path || "";
+    const fp = value.file_path || "";
     const node = el("div", {},
       el("div", { class: "attach-meta", style: "margin-bottom:6px" }, fp),
-      preFrom(input.content || "", "payload truncatable")
+      preFrom(value.content || "", "payload truncatable")
     );
     return { summary: fp, inputNode: node };
   }
-
-  // MultiEdit
   if (n === "multiedit") {
-    const fp = input.file_path || "";
-    const edits = input.edits || [];
+    const fp = value.file_path || "";
+    const edits = value.edits || [];
     const node = el("div", {}, el("div", { class: "attach-meta", style: "margin-bottom:6px" }, fp + `  (${edits.length} edits)`));
     edits.forEach((e, i) => {
       node.append(el("div", { class: "tool-section-label" }, "edit " + (i + 1)));
@@ -442,42 +713,34 @@ function formatToolInput(name, input) {
     });
     return { summary: fp + `  (${edits.length} edits)`, inputNode: node };
   }
-
-  // Grep / Glob
   if (n === "grep" || n === "glob") {
-    const pat = input.pattern || input.query || "";
-    const where = input.path || input.glob || "";
-    const meta = [where ? "in " + where : "", input.output_mode ? input.output_mode : "", input["-i"] ? "case-insensitive" : ""].filter(Boolean).join(", ");
+    const pat = value.pattern || value.query || "";
+    const where = value.path || value.glob || "";
+    const meta = [where ? "in " + where : "", value.output_mode ? value.output_mode : "", value["-i"] ? "case-insensitive" : ""].filter(Boolean).join(", ");
     return { summary: pat + (where ? "  in " + where : ""), inputNode: el("div", { class: "attach-meta" }, "pattern: " + pat + (meta ? "\n" + meta : "")) };
   }
-
-  // Task / Agent
   if (n === "task" || n === "agent") {
-    const desc = input.description || "";
-    const sub = input.subagent_type || input.agentType || "";
+    const desc = value.description || "";
+    const sub = value.subagent_type || value.agentType || "";
     const node = el("div", {},
       el("div", { class: "muted", style: "margin-bottom:4px" }, (sub ? "[" + sub + "] " : "") + desc),
-      preFrom(input.prompt || "", "payload truncatable")
+      preFrom(value.prompt || "", "payload truncatable")
     );
     return { summary: (sub ? sub + ": " : "") + desc, inputNode: node };
   }
-
-  // TodoWrite
   if (n === "todowrite") {
-    const todos = input.todos || [];
+    const todos = value.todos || [];
     const node = el("ul", { style: "margin:0;padding-left:18px" });
     const mark = { completed: "✅", in_progress: "🔄", pending: "⬜" };
     todos.forEach((td) => node.append(el("li", {}, (mark[td.status] || "•") + " " + (td.content || td.activeForm || ""))));
     return { summary: todos.length + " items", inputNode: node };
   }
+  if (n === "webfetch") return { summary: value.url || "", inputNode: el("div", { class: "attach-meta" }, (value.url || "") + (value.prompt ? "\n\n" + value.prompt : "")) };
+  if (n === "websearch") return { summary: value.query || "", inputNode: el("div", { class: "attach-meta" }, value.query || "") };
 
-  // WebFetch / WebSearch
-  if (n === "webfetch") return { summary: input.url || "", inputNode: el("div", { class: "attach-meta" }, (input.url || "") + (input.prompt ? "\n\n" + input.prompt : "")) };
-  if (n === "websearch") return { summary: input.query || "", inputNode: el("div", { class: "attach-meta" }, input.query || "") };
-
-  // Fallback: pretty JSON
-  const json = JSON.stringify(input, null, 2);
-  return { summary: oneLineJson(input), inputNode: preFrom(json, "payload truncatable") };
+  // Fallback: pretty JSON (or raw string)
+  const text = typeof value === "string" ? value : JSON.stringify(value, null, 2);
+  return { summary: typeof value === "string" ? firstLine(value) : oneLineJson(value), inputNode: preFrom(text, "payload truncatable") };
 }
 
 function firstLine(s) { return (s || "").split("\n")[0].slice(0, 200); }
@@ -491,7 +754,7 @@ function oneLineJson(obj) {
   return `${k}: ${String(v).slice(0, 120)}`;
 }
 
-// ---------- search wiring ----------
+// ---------- search / filter wiring ----------
 let searchTimer;
 $("#search").addEventListener("input", (e) => {
   clearTimeout(searchTimer);
@@ -499,12 +762,18 @@ $("#search").addEventListener("input", (e) => {
   searchTimer = setTimeout(() => renderSidebar(v), 120);
 });
 
-// refresh: re-scan the projects dir, keep the current search + open session
+$$("#filter-row .filter-chip").forEach((chip) => {
+  chip.addEventListener("click", () => {
+    AGENT_FILTER = chip.dataset.agent;
+    $$("#filter-row .filter-chip").forEach((c) => c.classList.toggle("on", c === chip));
+    renderSidebar($("#search").value);
+  });
+});
+
 $("#refresh").addEventListener("click", async () => {
   const btn = $("#refresh");
   btn.textContent = "↻ …";
   await loadSessions();
-  renderSidebar($("#search").value);
   if (CURRENT_FILE) {
     const item = $(`.session-item[data-file="${cssEscape(CURRENT_FILE)}"]`);
     if (item) item.classList.add("active");
@@ -512,7 +781,6 @@ $("#refresh").addEventListener("click", async () => {
   btn.textContent = "↻ Refresh";
 });
 
-// keyboard: '/' to focus search
 document.addEventListener("keydown", (e) => {
   if (e.key === "/" && document.activeElement !== $("#search")) {
     e.preventDefault();
