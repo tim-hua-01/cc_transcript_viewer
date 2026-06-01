@@ -116,13 +116,128 @@ let CURRENT_FILE = null;
 let AGENT_FILTER = "all";
 // file -> snippet for the active content search, or null when no search is active
 let CONTENT_MATCHES = null;
+// Selected values for the dropdown filters; empty set = no constraint (all).
+const SELECTED_MODELS = new Set();
+const SELECTED_DIRS = new Set();
 
 // ---------- sidebar ----------
 async function loadSessions() {
   const res = await fetch("/api/sessions");
   const data = await res.json();
   SESSIONS = data.sessions || [];
+  buildFilters();
   renderSidebar($("#search").value || "");
+}
+
+// ---------- dropdown filters (model / directory) ----------
+function modelFamily(m) {
+  const s = String(m || "").toLowerCase();
+  if (s.startsWith("claude")) return "Claude";
+  if (s.startsWith("gpt") || s.includes("codex") || s.startsWith("o1") || s.startsWith("o3")) return "GPT";
+  return "Other";
+}
+
+// Generic multi-select dropdown.
+//   groups: [{ label, items: [{value, label}] }]  (no group header if label is "")
+//   selected: a Set the dropdown reads from and writes to
+//   onChange: called after any change
+function makeDropdown(title, groups, selected, onChange) {
+  const wrap = el("div", { class: "dropdown" });
+  const count = el("span", { class: "dropdown-count" });
+  const btn = el("button", { class: "dropdown-btn" }, title, count, el("span", { class: "chev" }, "▾"));
+  const panel = el("div", { class: "dropdown-panel hidden" });
+
+  const updateCount = () => { count.textContent = selected.size ? ` (${selected.size})` : ""; };
+
+  const itemBoxes = [];
+  for (const g of groups) {
+    const groupBoxes = [];
+    let groupCb = null;
+    if (g.label) {
+      groupCb = el("input", { type: "checkbox" });
+      const groupRow = el("label", { class: "dd-group" }, groupCb, g.label);
+      groupCb.addEventListener("change", () => {
+        for (const { cb, value } of groupBoxes) {
+          cb.checked = groupCb.checked;
+          if (groupCb.checked) selected.add(value); else selected.delete(value);
+        }
+        groupCb.indeterminate = false;
+        updateCount(); onChange();
+      });
+      panel.append(groupRow);
+    }
+    const syncGroup = () => {
+      if (!groupCb) return;
+      const on = groupBoxes.filter((b) => b.cb.checked).length;
+      groupCb.checked = on === groupBoxes.length && on > 0;
+      groupCb.indeterminate = on > 0 && on < groupBoxes.length;
+    };
+    for (const it of g.items) {
+      const cb = el("input", { type: "checkbox", value: it.value });
+      cb.checked = selected.has(it.value);
+      cb.addEventListener("change", () => {
+        if (cb.checked) selected.add(it.value); else selected.delete(it.value);
+        syncGroup(); updateCount(); onChange();
+      });
+      panel.append(el("label", { class: "dd-item" + (g.label ? " nested" : "") }, cb, it.label));
+      groupBoxes.push({ cb, value: it.value });
+      itemBoxes.push(cb);
+    }
+    syncGroup();
+  }
+
+  const clear = el("button", { class: "dd-clear" }, "Clear");
+  clear.addEventListener("click", () => {
+    selected.clear();
+    itemBoxes.forEach((cb) => (cb.checked = false));
+    $$(".dd-group input", panel).forEach((cb) => { cb.checked = false; cb.indeterminate = false; });
+    updateCount(); onChange();
+  });
+  panel.append(clear);
+
+  btn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    const open = !panel.classList.contains("hidden");
+    $$(".dropdown-panel").forEach((p) => p.classList.add("hidden"));
+    panel.classList.toggle("hidden", open);
+  });
+  panel.addEventListener("click", (e) => e.stopPropagation());
+
+  updateCount();
+  wrap.append(btn, panel);
+  return wrap;
+}
+
+function buildFilters() {
+  const host = $("#filter-dropdowns");
+  host.innerHTML = "";
+
+  // ----- models, grouped by family -----
+  const families = { Claude: new Map(), GPT: new Map(), Other: new Map() };
+  for (const s of SESSIONS) {
+    if (!s.model) continue;
+    families[modelFamily(s.model)].set(s.model, shortModel(s.model));
+  }
+  const modelGroups = [];
+  for (const fam of ["Claude", "GPT", "Other"]) {
+    const m = families[fam];
+    if (!m.size) continue;
+    const items = [...m.entries()].sort((a, b) => a[1].localeCompare(b[1])).map(([value, label]) => ({ value, label }));
+    modelGroups.push({ label: fam, items });
+  }
+  // prune selections that no longer exist
+  for (const v of [...SELECTED_MODELS]) if (!SESSIONS.some((s) => s.model === v)) SELECTED_MODELS.delete(v);
+  if (modelGroups.length) {
+    host.append(makeDropdown("Model", modelGroups, SELECTED_MODELS, () => renderSidebar($("#search").value)));
+  }
+
+  // ----- directories (flat) -----
+  const dirs = [...new Set(SESSIONS.map((s) => s.cwd).filter(Boolean))].sort();
+  for (const v of [...SELECTED_DIRS]) if (!dirs.includes(v)) SELECTED_DIRS.delete(v);
+  if (dirs.length) {
+    const items = dirs.map((d) => ({ value: d, label: shortPath(d) }));
+    host.append(makeDropdown("Directory", [{ label: "", items }], SELECTED_DIRS, () => renderSidebar($("#search").value)));
+  }
 }
 
 function renderSidebar(query) {
@@ -132,6 +247,8 @@ function renderSidebar(query) {
 
   const matches = SESSIONS.filter((s) => {
     if (AGENT_FILTER !== "all" && s.agent !== AGENT_FILTER) return false;
+    if (SELECTED_MODELS.size && !SELECTED_MODELS.has(s.model || "")) return false;
+    if (SELECTED_DIRS.size && !SELECTED_DIRS.has(s.cwd || "")) return false;
     if (!q) return true;
     const metaHit = (s.title + " " + (s.cwd || "") + " " + s.id + " " + s.agent).toLowerCase().includes(q);
     const contentHit = CONTENT_MATCHES && CONTENT_MATCHES.has(s.file);
@@ -819,6 +936,12 @@ document.addEventListener("keydown", (e) => {
     e.preventDefault();
     $("#search").focus();
   }
+  if (e.key === "Escape") $$(".dropdown-panel").forEach((p) => p.classList.add("hidden"));
+});
+
+// click anywhere outside an open dropdown closes it
+document.addEventListener("click", () => {
+  $$(".dropdown-panel").forEach((p) => p.classList.add("hidden"));
 });
 
 function cssEscape(s) {
