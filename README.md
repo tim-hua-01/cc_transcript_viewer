@@ -1,38 +1,16 @@
 # Claude Code and Codex Transcript Viewer
 
-A tiny, **zero-dependency** local web app for browsing local coding-agent transcripts.
+A tiny, **zero-dependency** local web app for browsing your local coding-agent transcripts —
+**Claude Code and Codex together** in one time-sorted view.
 
-It has two separate viewers for now:
+It reads:
 
 - Claude Code transcripts from `~/.claude/projects/`
 - Codex transcripts from `~/.codex/sessions/` and `~/.codex/archived_sessions/`
 
-Nothing is uploaded anywhere; both viewers are read-only local web apps.
+Nothing is uploaded anywhere; it's a read-only local web app.
 
-## Claude Code Viewer
-
-The Claude Code viewer reads the JSONL session files Claude Code already writes to
-`~/.claude/projects/`.
-
-### Features
-
-- **Sidebar**: sessions grouped by project, with AI-generated titles, recency, message/tool counts,
-  model, and the full session **id** (click to copy). Type to filter (or press `/`); hit **↻ Refresh**
-  to rescan for new sessions.
-- **Transcript view**: a chronological, color-coded conversation —
-  - User prompts and Claude replies (rendered as Markdown)
-  - Thinking blocks (collapsed by default)
-  - Tool calls, each with **tool-specific formatting** and the result paired inline:
-    - `Bash` → command + description + output
-    - `Edit` / `Write` / `MultiEdit` → colorized diffs
-    - `Read` / `Grep` / `Glob` → file path + options
-    - `Task` / `Agent` → sub-agent prompt (sub-agent turns are flagged)
-    - `TodoWrite` → checklist; everything else → pretty-printed JSON
-  - **Inline images** — both pasted images and images returned by tools (e.g. screenshots) render
-    directly.
-- Deep-linkable: the open session is stored in the URL hash, so you can bookmark/share a link.
-
-### Serve Claude Code Transcripts
+## Run it
 
 ```bash
 python3 server.py
@@ -45,78 +23,66 @@ Options:
 ```bash
 python3 server.py --port 8080            # use a different port
 python3 server.py --host 0.0.0.0         # listen on all interfaces (LAN access)
-python3 server.py --projects-dir PATH    # point at a different projects directory
+python3 server.py --projects-dir PATH    # different Claude Code projects directory
+python3 server.py --codex-home PATH      # different Codex home (default ~/.codex)
 ```
 
-The server re-scans `~/.claude/projects/` on every request, so new sessions show up as soon as you
-hit **Refresh** or reload the page.
+The server re-scans both transcript locations on every request, so new sessions show up as soon as
+you hit **↻ Refresh** or reload the page.
 
-## Codex Viewer
+## Features
 
-The Codex viewer reads the JSONL rollout files Codex writes under:
+- **One sidebar, sorted by time.** Every Claude Code and Codex session in a single flat list, newest
+  (most recently modified) first — no per-project grouping. Each entry shows an **agent tag**
+  (Claude / Codex), the project path, recency, message/tool/web counts, model, and the full session
+  **id** (click to copy).
+- **Titles from the first message.** Each session is titled with the first ~100 characters of its
+  first user message, so the list reads like your prompts.
+- **Search across everything.** The search box (press `/` to focus) matches session **content** —
+  prompts, replies, reasoning, tool commands/paths/queries/outputs — in addition to titles and
+  directories, and shows a snippet of the match. Powered by `/api/search` with an mtime-keyed cache.
+- **Filters that compose.**
+  - **All / Claude / Codex** chips.
+  - A **Model** dropdown grouped by family (Claude / GPT / Other): tick a family to select all its
+    models, or pick individual ones (e.g. only Sonnet). The family box shows an indeterminate state
+    on partial selection.
+  - A **Directory** dropdown to narrow to specific project paths.
+- **Transcript view** — a chronological, color-coded conversation that renders both agents' formats:
+  - User prompts and assistant replies as Markdown, **with LaTeX math** (KaTeX) and inline images.
+  - **Thinking / reasoning** blocks (collapsed by default).
+  - **Tool calls** with tool-specific formatting and results paired inline:
+    - Claude Code: `Bash`, `Read`, `Edit`/`Write`/`MultiEdit` (colorized diffs), `Grep`/`Glob`,
+      `Task`/`Agent` (sub-agent turns flagged), `TodoWrite`, and pretty-printed JSON for the rest.
+    - Codex: `function_call`, `custom_tool_call`, `apply_patch` (rendered as a colored diff),
+      `exec_command`/`shell`, `write_stdin`, `view_image`, web search, plus fallback JSON.
+  - Codex status/context and token-usage events (tokens hidden by default — **Toggle tokens**).
+- **Deep-linkable:** the open session is stored in the URL hash, so you can bookmark/share a link.
 
-```text
-~/.codex/sessions/YYYY/MM/DD/rollout-<timestamp>-<thread-id>.jsonl
-~/.codex/archived_sessions/...
-```
+## Notes on Codex transcripts
 
-It also reads `~/.codex/state_5.sqlite` for thread titles, cwd, model metadata, and archive state
-when available.
+- **Reasoning summaries.** Codex doesn't save raw chain-of-thought in readable form for OpenAI
+  models, but it can save readable summaries when configured. To request them for future sessions,
+  add to `~/.codex/config.toml`:
 
-### Serve Codex Transcripts
+  ```toml
+  model_reasoning_summary = "detailed"
+  ```
 
-```bash
-python3 codex_server.py
-```
-
-Then open the printed URL (default **http://127.0.0.1:3133/**).
-
-Options:
-
-```bash
-python3 codex_server.py --port 8081          # use a different port
-python3 codex_server.py --host 0.0.0.0       # listen on all interfaces (LAN access)
-python3 codex_server.py --codex-home PATH    # point at a different Codex home
-```
-
-### Codex Features
-
-- Sidebar grouped by cwd, with title, recency, counts, model/source badges, and copyable thread id.
-- User and assistant messages rendered as Markdown.
-- Tool calls paired with outputs for `function_call`, `custom_tool_call`, `apply_patch`,
-  `exec_command`, `write_stdin`, `view_image`, and fallback JSON rendering for unknown tools.
-- Readable reasoning summaries when Codex records them.
-- Duplicate reasoning summaries are deduped when Codex writes the same text both as
-  `event_msg/agent_reasoning` and `response_item/reasoning.summary`.
-- Token usage events are hidden by default and can be shown with **Toggle tokens**.
-- `view_image` prefers serving the local file path via `/api/local-image`; if the file is gone, it
-  falls back to embedded image payloads stored in the JSONL.
-
-### Codex Reasoning Summaries
-
-Codex does not save raw chain-of-thought in readable form for OpenAI models. It may save readable
-reasoning summaries when configured and supported by the model. To request summaries for future
-sessions, add this to `~/.codex/config.toml`:
-
-```toml
-model_reasoning_summary = "detailed"
-```
-
-This does not backfill old transcripts. Existing records with only encrypted reasoning content will
-still show as not readable.
-
-### Codex Image Notes
-
-Codex `view_image` tool results can include large base64 data URLs inside the JSONL. The viewer
-avoids pushing those huge strings through the session API when it can serve the original local image
-file instead. This keeps transcript JSON smaller and lets the browser load the image normally. If the
-local path no longer exists, the viewer renders the embedded payload.
+  This doesn't backfill old transcripts; records with only encrypted reasoning still show as not
+  readable. Duplicate summaries (written as both `event_msg/agent_reasoning` and
+  `response_item/reasoning.summary`) are deduped.
+- **Web search results aren't stored.** Codex records only the search *queries* it issued (the viewer
+  lists all of them); the fetched pages are sent to the model but never written to the rollout. The
+  findings survive only as the assistant's prose, with citation links.
+- **Images.** `view_image` prefers serving the original local file via `/api/local-image`; if the file
+  is gone it falls back to the (often large) base64 payload embedded in the JSONL. It also reads
+  `~/.codex/state_5.sqlite` for thread metadata (cwd, model) when available.
 
 ## Requirements
 
 - **Python 3.9+** (standard library only — no `pip install` needed).
-- Markdown rendering uses `marked.js` + `DOMPurify` from a CDN; if you're offline it falls back to
-  plain text.
+- Markdown / math rendering uses `marked.js`, `DOMPurify`, and `KaTeX` from a CDN; offline, it falls
+  back to plain text.
 
 ## Install
 
@@ -152,10 +118,9 @@ Restart Claude Code (or run `/config` once) for the change to take effect. Note 
 
 | File | Role |
 |------|------|
-| `server.py` | stdlib HTTP server. Parses the JSONL into a clean event stream (pairing each tool result back to its call) and serves a JSON API (`/api/sessions`, `/api/session?file=...`) plus the static frontend. Includes a path-traversal guard so only files under the projects dir are served. |
-| `static/index.html`, `static/style.css`, `static/app.js` | The frontend (vanilla JS, no build step). |
-| `codex_server.py` | stdlib HTTP server for Codex transcripts. Parses rollout JSONL files, reads `state_5.sqlite` metadata, pairs tool calls with outputs, serves local images, and exposes the same `/api/sessions` and `/api/session?file=...` style API. |
-| `static/codex_index.html`, `static/codex_style.css`, `static/codex_app.js` | Separate Codex frontend files. |
+| `server.py` | The unified stdlib HTTP server. Scans both transcript roots into one time-sorted list, parses each Claude Code session into a clean event stream (pairing tool results to calls), dispatches `/api/session` to the right parser by transcript root, and serves the JSON API (`/api/sessions`, `/api/session?file=...`, `/api/search?q=...`, `/api/local-image`) plus the static frontend. Only files under the allowed roots are served. |
+| `codex_server.py` | Codex parsing library (imported by `server.py`): parses rollout JSONL, reads `state_5.sqlite` metadata, pairs tool calls with outputs, and renders `apply_patch` diffs. Call `configure(codex_home)` to point it elsewhere. |
+| `static/index.html`, `static/style.css`, `static/app.js` | The single frontend (vanilla JS, no build step). `app.js` dispatches on event kind and renders both Claude Code (block-based) and Codex (flat) shapes. |
 
 ### Transcript format notes
 
@@ -165,8 +130,13 @@ Claude Code stores each session as a JSONL file at
 - `user` / `assistant` messages, whose `message.content` is a list of typed blocks
   (`text`, `thinking`, `tool_use` on the assistant side; `text`, `tool_result`, `image` on the user
   side — tool results are paired to calls by `tool_use_id`).
-- Metadata lines: `ai-title` (the session title), `system`, `attachment` (hook output), and a few
-  others the viewer ignores.
+- Metadata lines: `ai-title`, `system`, `attachment` (hook output), and a few others the viewer
+  ignores.
+
+Codex stores each session as a rollout JSONL file at
+`~/.codex/sessions/YYYY/MM/DD/rollout-<timestamp>-<thread-id>.jsonl` (and under
+`~/.codex/archived_sessions/`), with `session_meta`, `turn_context`, `response_item`, and `event_msg`
+records.
 
 ## License
 
