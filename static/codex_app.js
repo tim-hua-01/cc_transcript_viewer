@@ -218,7 +218,7 @@ function renderEvent(ev) {
     case "user": return renderUser(ev);
     case "assistant": return renderAssistant(ev);
     case "reasoning": return turnShell("reasoning", "Reasoning", ev, [renderReasoning(ev)]);
-    case "tool": return turnShell("tool", "Tool", ev, [renderTool(ev)]);
+    case "tool": return turnShell("tool", "Tool - " + (ev.name || "tool"), ev, [renderTool(ev)]);
     case "web_search": return turnShell("web_search", "Web search", ev, [renderWebSearch(ev)]);
     case "web_call": return turnShell("web_call", "Web search", ev, [renderWebSearch(ev)]);
     case "status": return renderStatus(ev);
@@ -250,17 +250,7 @@ function turnShell(kind, label, ev, bodyNodes) {
 function renderUser(ev) {
   const body = [];
   if (ev.text) body.push(el("div", { class: "md", html: md(ev.text) }));
-  for (const img of ev.images || []) {
-    if (img.kind === "inline" && img.src) {
-      body.push(el("img", { src: img.src, style: "max-width:100%;border-radius:8px" }));
-    } else if (img.kind === "object" && img.value) {
-      const src = imageObjectSrc(img.value);
-      if (src) body.push(el("img", { src, style: "max-width:100%;border-radius:8px" }));
-      else body.push(el("pre", { class: "payload truncatable" }, JSON.stringify(img.value, null, 2)));
-    } else {
-      body.push(el("div", { class: "attach-meta" }, `image omitted (${img.bytes || "unknown"} chars): ${img.reason || img.kind}`));
-    }
-  }
+  for (const img of ev.images || []) body.push(renderImagePayload(img));
   for (const img of ev.local_images || []) {
     body.push(el("div", { class: "attach-meta" }, "local image: " + img));
   }
@@ -376,6 +366,7 @@ function renderTool(ev) {
     el("span", { class: "chev" }, "v"),
     el("span", { class: "tool-icon" }, isErr ? "x" : "tool"),
     el("span", { class: "tool-name" }, name),
+    ev.status ? el("span", { class: "status-tag" }, ev.status) : null,
     el("span", { class: "tool-summary", title: ev.summary || "" }, ev.summary || "")
   );
   head.addEventListener("click", () => block.classList.toggle("collapsed"));
@@ -406,6 +397,12 @@ function renderTool(ev) {
 }
 
 function renderImagePayload(img) {
+  if (img.kind === "local" && img.src) {
+    return el("figure", { class: "tool-image-frame" },
+      el("img", { src: img.src, class: "tool-image", loading: "lazy" }),
+      img.path ? el("figcaption", { class: "attach-meta" }, img.path) : null
+    );
+  }
   if (img.kind === "inline" && img.src) {
     return el("img", { src: img.src, class: "tool-image", loading: "lazy" });
   }

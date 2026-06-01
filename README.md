@@ -1,12 +1,20 @@
-# Claude Code Transcript Viewer
+# Claude Code and Codex Transcript Viewer
 
-A tiny, **zero-dependency** local web app for browsing your [Claude Code](https://claude.com/claude-code)
-session transcripts — every prompt, response, thinking block, and tool call, rendered to be easy to read.
+A tiny, **zero-dependency** local web app for browsing local coding-agent transcripts.
 
-It reads the JSONL session files Claude Code already writes to `~/.claude/projects/`. Nothing is
-uploaded anywhere; it's a read-only local viewer.
+It has two separate viewers for now:
 
-## Features
+- Claude Code transcripts from `~/.claude/projects/`
+- Codex transcripts from `~/.codex/sessions/` and `~/.codex/archived_sessions/`
+
+Nothing is uploaded anywhere; both viewers are read-only local web apps.
+
+## Claude Code Viewer
+
+The Claude Code viewer reads the JSONL session files Claude Code already writes to
+`~/.claude/projects/`.
+
+### Features
 
 - **Sidebar**: sessions grouped by project, with AI-generated titles, recency, message/tool counts,
   model, and the full session **id** (click to copy). Type to filter (or press `/`); hit **↻ Refresh**
@@ -24,23 +32,15 @@ uploaded anywhere; it's a read-only local viewer.
     directly.
 - Deep-linkable: the open session is stored in the URL hash, so you can bookmark/share a link.
 
-## Requirements
-
-- **Python 3.9+** (standard library only — no `pip install` needed).
-- Markdown rendering uses `marked.js` + `DOMPurify` from a CDN; if you're offline it falls back to
-  plain text.
-
-## Serve it
+### Serve Claude Code Transcripts
 
 ```bash
-git clone https://github.com/tim-hua-01/cc_transcript_viewer.git
-cd cc_transcript_viewer
 python3 server.py
 ```
 
 Then open the printed URL (default **http://127.0.0.1:3132/**).
 
-### Options
+Options:
 
 ```bash
 python3 server.py --port 8080            # use a different port
@@ -49,7 +49,81 @@ python3 server.py --projects-dir PATH    # point at a different projects directo
 ```
 
 The server re-scans `~/.claude/projects/` on every request, so new sessions show up as soon as you
-hit **↻ Refresh** (or reload the page).
+hit **Refresh** or reload the page.
+
+## Codex Viewer
+
+The Codex viewer reads the JSONL rollout files Codex writes under:
+
+```text
+~/.codex/sessions/YYYY/MM/DD/rollout-<timestamp>-<thread-id>.jsonl
+~/.codex/archived_sessions/...
+```
+
+It also reads `~/.codex/state_5.sqlite` for thread titles, cwd, model metadata, and archive state
+when available.
+
+### Serve Codex Transcripts
+
+```bash
+python3 codex_server.py
+```
+
+Then open the printed URL (default **http://127.0.0.1:3133/**).
+
+Options:
+
+```bash
+python3 codex_server.py --port 8081          # use a different port
+python3 codex_server.py --host 0.0.0.0       # listen on all interfaces (LAN access)
+python3 codex_server.py --codex-home PATH    # point at a different Codex home
+```
+
+### Codex Features
+
+- Sidebar grouped by cwd, with title, recency, counts, model/source badges, and copyable thread id.
+- User and assistant messages rendered as Markdown.
+- Tool calls paired with outputs for `function_call`, `custom_tool_call`, `apply_patch`,
+  `exec_command`, `write_stdin`, `view_image`, and fallback JSON rendering for unknown tools.
+- Readable reasoning summaries when Codex records them.
+- Duplicate reasoning summaries are deduped when Codex writes the same text both as
+  `event_msg/agent_reasoning` and `response_item/reasoning.summary`.
+- Token usage events are hidden by default and can be shown with **Toggle tokens**.
+- `view_image` prefers serving the local file path via `/api/local-image`; if the file is gone, it
+  falls back to embedded image payloads stored in the JSONL.
+
+### Codex Reasoning Summaries
+
+Codex does not save raw chain-of-thought in readable form for OpenAI models. It may save readable
+reasoning summaries when configured and supported by the model. To request summaries for future
+sessions, add this to `~/.codex/config.toml`:
+
+```toml
+model_reasoning_summary = "detailed"
+```
+
+This does not backfill old transcripts. Existing records with only encrypted reasoning content will
+still show as not readable.
+
+### Codex Image Notes
+
+Codex `view_image` tool results can include large base64 data URLs inside the JSONL. The viewer
+avoids pushing those huge strings through the session API when it can serve the original local image
+file instead. This keeps transcript JSON smaller and lets the browser load the image normally. If the
+local path no longer exists, the viewer renders the embedded payload.
+
+## Requirements
+
+- **Python 3.9+** (standard library only — no `pip install` needed).
+- Markdown rendering uses `marked.js` + `DOMPurify` from a CDN; if you're offline it falls back to
+  plain text.
+
+## Install
+
+```bash
+git clone https://github.com/tim-hua-01/cc_transcript_viewer.git
+cd cc_transcript_viewer
+```
 
 ## Important: keep your transcripts around
 
@@ -80,6 +154,8 @@ Restart Claude Code (or run `/config` once) for the change to take effect. Note 
 |------|------|
 | `server.py` | stdlib HTTP server. Parses the JSONL into a clean event stream (pairing each tool result back to its call) and serves a JSON API (`/api/sessions`, `/api/session?file=...`) plus the static frontend. Includes a path-traversal guard so only files under the projects dir are served. |
 | `static/index.html`, `static/style.css`, `static/app.js` | The frontend (vanilla JS, no build step). |
+| `codex_server.py` | stdlib HTTP server for Codex transcripts. Parses rollout JSONL files, reads `state_5.sqlite` metadata, pairs tool calls with outputs, serves local images, and exposes the same `/api/sessions` and `/api/session?file=...` style API. |
+| `static/codex_index.html`, `static/codex_style.css`, `static/codex_app.js` | Separate Codex frontend files. |
 
 ### Transcript format notes
 

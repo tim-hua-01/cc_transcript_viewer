@@ -12,11 +12,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import mimetypes
 import sqlite3
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
 STATIC_DIR = Path(__file__).parent / "static"
 DEFAULT_CODEX_HOME = Path.home() / ".codex"
@@ -152,11 +153,13 @@ def session_summary(path: Path, thread_row: dict | None = None) -> dict:
                 n_user += 1
             elif pt == "agent_message":
                 n_assistant += 1
+            elif pt == "agent_reasoning":
+                n_reasoning += 1
             elif pt == "web_search_end":
                 n_web += 1
         elif typ == "response_item":
             pt = payload.get("type")
-            if pt == "function_call":
+            if pt in {"function_call", "custom_tool_call"}:
                 n_tool += 1
             elif pt == "reasoning":
                 n_reasoning += 1
@@ -265,6 +268,8 @@ def _tool_summary(name: str, args) -> str:
         return str(args["path"])[:200]
     if "file" in args:
         return str(args["file"])[:200]
+    if "session_id" in args:
+        return "session: " + str(args["session_id"])[:80]
     if args:
         key = next(iter(args))
         return f"{key}: {str(args[key]).splitlines()[0][:160]}"
@@ -277,19 +282,19 @@ def _event_payload(kind: str, ts: str | None, payload: dict) -> dict:
     return out
 
 
-def _safe_images(images) -> list[dict]:
+def _safe_images(images, allow_large: bool = False) -> list[dict]:
     out = []
     if not isinstance(images, list):
         return out
     for item in images:
         if isinstance(item, str):
-            if len(item) <= MAX_INLINE_IMAGE_CHARS:
+            if allow_large or len(item) <= MAX_INLINE_IMAGE_CHARS:
                 out.append({"kind": "inline", "src": item, "bytes": len(item)})
             else:
                 out.append({"kind": "omitted", "bytes": len(item), "reason": "inline image too large"})
         elif isinstance(item, dict):
             text = json.dumps(item)
-            if len(text) <= MAX_INLINE_IMAGE_CHARS:
+            if allow_large or len(text) <= MAX_INLINE_IMAGE_CHARS:
                 out.append({"kind": "object", "value": item, "bytes": len(text)})
             else:
                 out.append({"kind": "omitted", "bytes": len(text), "reason": "image object too large"})
@@ -298,8 +303,38 @@ def _safe_images(images) -> list[dict]:
     return out
 
 
-def _normalize_tool_output(output) -> dict:
+def _local_image_payload(path_value) -> dict | None:
+    if not isinstance(path_value, str) or not path_value:
+        return None
+    path = Path(path_value).expanduser()
+    try:
+        resolved = path.resolve()
+    except OSError:
+        return None
+    if not resolved.exists() or not resolved.is_file():
+        return None
+    content_type = mimetypes.guess_type(str(resolved))[0] or ""
+    if not content_type.startswith("image/"):
+        return None
+    st = _safe_stat(resolved)
+    return {
+        "kind": "local",
+        "src": "/api/local-image?path=" + quote(str(resolved), safe=""),
+        "path": str(resolved),
+        "bytes": st.st_size if st else 0,
+        "content_type": content_type,
+    }
+
+
+def _normalize_tool_output(output, name: str = "", args=None) -> dict:
     normalized = {"text": "", "images": [], "raw": None}
+    args = args if isinstance(args, dict) else {}
+    local_image = None
+    if name == "view_image":
+        local_image = _local_image_payload(args.get("path"))
+        if local_image:
+            normalized["images"].append(local_image)
+
     if output is None:
         return normalized
     if isinstance(output, str):
@@ -307,7 +342,7 @@ def _normalize_tool_output(output) -> dict:
         return normalized
     if isinstance(output, list):
         texts = []
-        images = []
+        images = list(normalized["images"])
         raw_remainder = []
         for item in output:
             if isinstance(item, str):
@@ -319,7 +354,10 @@ def _normalize_tool_output(output) -> dict:
             item_type = item.get("type")
             image_url = item.get("image_url") or item.get("url")
             if item_type in {"input_image", "image"} and image_url:
-                images.extend(_safe_images([image_url]))
+                # Prefer the local file for view_image. If it is unavailable, fall back to
+                # the embedded payload even when it is large.
+                if not local_image:
+                    images.extend(_safe_images([image_url], allow_large=True))
             elif item_type in {"text", "output_text", "input_text"}:
                 texts.append(item.get("text") or "")
             else:
@@ -332,7 +370,8 @@ def _normalize_tool_output(output) -> dict:
     if isinstance(output, dict):
         image_url = output.get("image_url") or output.get("url")
         if output.get("type") in {"input_image", "image"} and image_url:
-            normalized["images"] = _safe_images([image_url])
+            if not local_image:
+                normalized["images"] = _safe_images([image_url], allow_large=True)
         elif output.get("text"):
             normalized["text"] = output["text"]
         else:
@@ -347,6 +386,7 @@ def parse_session(path: Path) -> dict:
     meta = {}
     title = ""
     turn_contexts: dict[str, dict] = {}
+    tool_calls: dict[str, dict] = {}
     tool_outputs: dict[str, dict] = {}
     web_searches: dict[str, dict] = {}
 
@@ -358,15 +398,41 @@ def parse_session(path: Path) -> dict:
             turn_id = payload.get("turn_id")
             if turn_id:
                 turn_contexts[turn_id] = payload
-        elif rec.get("type") == "response_item" and payload.get("type") == "function_call_output":
+        elif rec.get("type") == "response_item" and payload.get("type") in {"function_call", "custom_tool_call"}:
             call_id = payload.get("call_id")
             if call_id:
-                normalized = _normalize_tool_output(payload.get("output"))
+                raw_args = payload.get("arguments") if payload.get("type") == "function_call" else payload.get("input")
+                tool_calls[call_id] = {
+                    "name": payload.get("name") or "tool",
+                    "input": _parse_json_string(raw_args),
+                    "status": payload.get("status"),
+                    "type": payload.get("type"),
+                }
+        elif rec.get("type") == "response_item" and payload.get("type") in {"function_call_output", "custom_tool_call_output"}:
+            call_id = payload.get("call_id")
+            if call_id:
+                call = tool_calls.get(call_id, {})
+                normalized = _normalize_tool_output(
+                    payload.get("output"),
+                    name=call.get("name", ""),
+                    args=call.get("input"),
+                )
                 tool_outputs[call_id] = {
                     "output": normalized["text"],
                     "images": normalized["images"],
                     "raw": normalized["raw"],
                     "is_error": bool(payload.get("is_error")),
+                }
+        elif rec.get("type") == "event_msg" and payload.get("type") == "patch_apply_end":
+            call_id = payload.get("call_id")
+            if call_id:
+                changes = payload.get("changes")
+                raw = {"changes": changes} if changes else None
+                tool_outputs[call_id] = {
+                    "output": "\n".join(x for x in [payload.get("stdout"), payload.get("stderr")] if x),
+                    "images": [],
+                    "raw": raw,
+                    "is_error": not bool(payload.get("success", True)),
                 }
         elif rec.get("type") == "event_msg" and payload.get("type") == "web_search_end":
             call_id = payload.get("call_id")
@@ -389,6 +455,26 @@ def parse_session(path: Path) -> dict:
         )
 
     events = []
+    recent_reasoning: list[tuple[str, str]] = []
+
+    def append_reasoning(ts: str | None, text: str, has_encrypted: bool) -> None:
+        normalized = " ".join((text or "").split())
+        if normalized:
+            for prev_ts, prev_text in recent_reasoning[-8:]:
+                if prev_text == normalized:
+                    return
+            recent_reasoning.append((ts or "", normalized))
+        events.append(
+            _event_payload(
+                "reasoning",
+                ts,
+                {
+                    "text": text,
+                    "has_encrypted": has_encrypted,
+                },
+            )
+        )
+
     for rec in records:
         typ = rec.get("type")
         ts = rec.get("timestamp")
@@ -442,6 +528,8 @@ def parse_session(path: Path) -> dict:
                         },
                     )
                 )
+            elif pt == "agent_reasoning":
+                append_reasoning(ts, payload.get("text") or "", False)
             elif pt == "task_started":
                 ctx = turn_contexts.get(payload.get("turn_id"), {})
                 events.append(
@@ -519,19 +607,10 @@ def parse_session(path: Path) -> dict:
         pt = payload.get("type")
         if pt == "reasoning":
             text = _extract_text_content(payload.get("content")) or _summary_text(payload.get("summary"))
-            events.append(
-                _event_payload(
-                    "reasoning",
-                    ts,
-                    {
-                        "text": text,
-                        "has_encrypted": bool(payload.get("encrypted_content")),
-                    },
-                )
-            )
-        elif pt == "function_call":
+            append_reasoning(ts, text, bool(payload.get("encrypted_content")))
+        elif pt in {"function_call", "custom_tool_call"}:
             name = payload.get("name") or "tool"
-            args = _parse_json_string(payload.get("arguments"))
+            args = _parse_json_string(payload.get("arguments") if pt == "function_call" else payload.get("input"))
             call_id = payload.get("call_id")
             result = tool_outputs.get(call_id)
             events.append(
@@ -544,6 +623,8 @@ def parse_session(path: Path) -> dict:
                         "input": args,
                         "summary": _tool_summary(name, args),
                         "result": result,
+                        "status": payload.get("status"),
+                        "tool_record_type": pt,
                     },
                 )
             )
@@ -614,6 +695,20 @@ class Handler(BaseHTTPRequestHandler):
             return
         if route == "/style.css":
             self._send_file(STATIC_DIR / "style.css", "text/css; charset=utf-8")
+            return
+
+        if route == "/api/local-image":
+            qs = parse_qs(parsed.query)
+            path_arg = qs.get("path", [""])[0]
+            if not path_arg:
+                self._send_json({"error": "missing path param"}, status=400)
+                return
+            target = Path(path_arg).expanduser().resolve()
+            content_type = mimetypes.guess_type(str(target))[0] or ""
+            if not content_type.startswith("image/"):
+                self._send_json({"error": "not an image"}, status=400)
+                return
+            self._send_file(target, content_type)
             return
 
         if route == "/api/sessions":

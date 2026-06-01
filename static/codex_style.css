@@ -59,3 +59,11 @@ body.show-tokens .token-event {
   background: var(--bg-alt);
   padding: 6px 8px;
 }
+
+.tool-image-frame {
+  margin: 8px 0;
+}
+
+.tool-image-frame .tool-image {
+  margin-bottom: 4px;
+}
