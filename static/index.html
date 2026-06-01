@@ -8,6 +8,9 @@
   <!-- markdown + sanitization, loaded from CDN; falls back to plain text if offline -->
   <script src="https://cdn.jsdelivr.net/npm/marked@12/marked.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/dompurify@3/dist/purify.min.js"></script>
+  <!-- KaTeX for inline / display math; falls back to raw $…$ if offline -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css" />
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
 </head>
 <body>
   <div id="app">

@@ -20,12 +20,56 @@ function el(tag, attrs = {}, ...kids) {
 const esc = (s) => (s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 
 // ---------- markdown ----------
+// Pulls $…$, $$…$$, \(…\), \[…\] out of `text` before markdown sees them,
+// so things like $\bm h_\perp$ don't get mangled by italic/asterisk parsing.
+// Returns { stripped, math } — math entries get rendered with KaTeX later.
+function extractMath(text) {
+  const math = [];
+  // Inline-HTML placeholder survives paragraph / table-cell trimming that a
+  // plain "MATH0" token wouldn't.
+  const tok = (i) => `<span data-katex-i="${i}"></span>`;
+  // Protect fenced code (```…```) and inline code (`…`) first.
+  const codes = [];
+  let s = text.replace(/```[\s\S]*?```/g, (m) => { codes.push(m); return `<!--CODE${codes.length - 1}-->`; });
+  s = s.replace(/`[^`\n]*`/g, (m) => { codes.push(m); return `<!--CODE${codes.length - 1}-->`; });
+
+  s = s.replace(/\$\$([\s\S]+?)\$\$/g, (_, expr) => { math.push({ expr, display: true }); return tok(math.length - 1); });
+  s = s.replace(/\\\[([\s\S]+?)\\\]/g, (_, expr) => { math.push({ expr, display: true }); return tok(math.length - 1); });
+  s = s.replace(/\\\(([\s\S]+?)\\\)/g, (_, expr) => { math.push({ expr, display: false }); return tok(math.length - 1); });
+  // $…$ — require non-space immediately inside, and the closing $ not followed
+  // by a digit, so "$5" / "$10" don't get eaten.
+  s = s.replace(/(^|[^\\$])\$(?!\s)([^$\n]+?)(?<!\s)\$(?!\d)/g, (_, pre, expr) => {
+    math.push({ expr, display: false });
+    return pre + tok(math.length - 1);
+  });
+
+  s = s.replace(/<!--CODE(\d+)-->/g, (_, i) => codes[Number(i)]);
+  return { stripped: s, math };
+}
+
 function md(text) {
   if (!text) return "";
   try {
     if (window.marked && window.DOMPurify) {
-      const raw = window.marked.parse(text, { breaks: true, gfm: true });
-      return window.DOMPurify.sanitize(raw);
+      const { stripped, math } = extractMath(text);
+      const raw = window.marked.parse(stripped, { breaks: true, gfm: true });
+      let clean = window.DOMPurify.sanitize(raw, { ADD_ATTR: ["data-katex-i"] });
+      if (math.length) {
+        clean = clean.replace(/<span data-katex-i="(\d+)"><\/span>/g, (_, i) => {
+          const m = math[Number(i)];
+          if (!m) return "";
+          if (window.katex) {
+            try {
+              return window.katex.renderToString(m.expr, {
+                displayMode: m.display, throwOnError: false, output: "html",
+              });
+            } catch (e) { /* fall through */ }
+          }
+          const d = m.display ? "$$" : "$";
+          return esc(d + m.expr + d);
+        });
+      }
+      return clean;
     }
   } catch (e) { /* fall through */ }
   return `<p>${esc(text).replace(/\n/g, "<br>")}</p>`;
