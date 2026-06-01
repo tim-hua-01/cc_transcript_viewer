@@ -114,6 +114,8 @@ function fmtDuration(ms) {
 let SESSIONS = [];
 let CURRENT_FILE = null;
 let AGENT_FILTER = "all";
+// file -> snippet for the active content search, or null when no search is active
+let CONTENT_MATCHES = null;
 
 // ---------- sidebar ----------
 async function loadSessions() {
@@ -131,7 +133,9 @@ function renderSidebar(query) {
   const matches = SESSIONS.filter((s) => {
     if (AGENT_FILTER !== "all" && s.agent !== AGENT_FILTER) return false;
     if (!q) return true;
-    return (s.title + " " + (s.cwd || "") + " " + s.id + " " + s.agent).toLowerCase().includes(q);
+    const metaHit = (s.title + " " + (s.cwd || "") + " " + s.id + " " + s.agent).toLowerCase().includes(q);
+    const contentHit = CONTENT_MATCHES && CONTENT_MATCHES.has(s.file);
+    return metaHit || contentHit;
   });
 
   const nClaude = matches.filter((s) => s.agent === "claude").length;
@@ -159,6 +163,9 @@ function renderSidebar(query) {
         s.n_web ? el("span", { class: "badge" }, `${s.n_web}🌐`) : null,
         s.model ? el("span", { class: "badge" }, shortModel(s.model)) : null
       ),
+      CONTENT_MATCHES && CONTENT_MATCHES.has(s.file)
+        ? el("div", { class: "session-snippet" }, CONTENT_MATCHES.get(s.file))
+        : null,
       el(
         "div",
         { class: "session-id", title: "Click to copy full id: " + s.id, onclick: (e) => copyId(e, s.id) },
@@ -755,11 +762,35 @@ function oneLineJson(obj) {
 }
 
 // ---------- search / filter wiring ----------
+// Fetch content matches from the server, then re-render. Title/cwd/id matching
+// still happens instantly client-side in renderSidebar; this adds full-text.
+let searchSeq = 0;
+async function runSearch(query) {
+  const q = (query || "").trim();
+  if (!q) {
+    CONTENT_MATCHES = null;
+    renderSidebar(query);
+    return;
+  }
+  const seq = ++searchSeq;
+  renderSidebar(query); // instant feedback on title/cwd while content search is in flight
+  try {
+    const res = await fetch("/api/search?q=" + encodeURIComponent(q));
+    const data = await res.json();
+    if (seq !== searchSeq) return; // a newer search superseded this one
+    CONTENT_MATCHES = new Map((data.matches || []).map((m) => [m.file, m.snippet]));
+  } catch (e) {
+    if (seq !== searchSeq) return;
+    CONTENT_MATCHES = new Map();
+  }
+  renderSidebar(query);
+}
+
 let searchTimer;
 $("#search").addEventListener("input", (e) => {
   clearTimeout(searchTimer);
   const v = e.target.value;
-  searchTimer = setTimeout(() => renderSidebar(v), 120);
+  searchTimer = setTimeout(() => runSearch(v), 180);
 });
 
 $$("#filter-row .filter-chip").forEach((chip) => {
@@ -773,7 +804,9 @@ $$("#filter-row .filter-chip").forEach((chip) => {
 $("#refresh").addEventListener("click", async () => {
   const btn = $("#refresh");
   btn.textContent = "↻ …";
-  await loadSessions();
+  const res = await fetch("/api/sessions");
+  SESSIONS = ((await res.json()).sessions) || [];
+  await runSearch($("#search").value); // re-run content search against the fresh set
   if (CURRENT_FILE) {
     const item = $(`.session-item[data-file="${cssEscape(CURRENT_FILE)}"]`);
     if (item) item.classList.add("active");

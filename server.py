@@ -392,6 +392,96 @@ def parse_session(target: Path) -> dict | None:
 
 
 # ---------------------------------------------------------------------------
+# Full-text search across transcript content
+# ---------------------------------------------------------------------------
+_TEXT_CACHE: dict[str, tuple[float, str]] = {}
+
+
+def _session_text(data: dict) -> str:
+    """Flatten a parsed session into searchable human-readable text.
+
+    Pulls prompts, replies, thinking/reasoning, and the meaningful bits of tool
+    calls (commands, paths, queries, outputs) while skipping image blobs.
+    """
+    parts: list[str] = []
+
+    def add(x):
+        if x and isinstance(x, str):
+            parts.append(x)
+
+    add(data.get("title"))
+    add((data.get("meta") or {}).get("cwd"))
+    for ev in data.get("events", []) or []:
+        if ev.get("blocks"):  # Claude Code shape
+            for b in ev["blocks"]:
+                add(b.get("text"))
+                if b.get("type") == "tool_use":
+                    inp = b.get("input") or {}
+                    if isinstance(inp, dict):
+                        for k in ("command", "file_path", "pattern", "query", "prompt", "description", "content", "url"):
+                            add(inp.get(k))
+                    res = b.get("result") or {}
+                    if isinstance(res, dict):
+                        add(res.get("text"))
+        else:  # Codex shape
+            add(ev.get("text"))
+            add(ev.get("summary"))
+            add(ev.get("query"))
+            inp = ev.get("input")
+            if isinstance(inp, str):
+                add(inp)
+            elif isinstance(inp, dict):
+                for k in ("cmd", "command", "file_path", "query", "prompt"):
+                    add(inp.get(k))
+            res = ev.get("result")
+            if isinstance(res, dict):
+                add(res.get("output"))
+            act = ev.get("action")
+            if isinstance(act, dict):
+                for q in act.get("queries") or []:
+                    add(q)
+    return "\n".join(parts)
+
+
+def session_text(path: Path) -> str:
+    """Searchable text for one transcript, cached by file mtime."""
+    try:
+        st = path.stat()
+    except OSError:
+        return ""
+    key = str(path)
+    cached = _TEXT_CACHE.get(key)
+    if cached and cached[0] == st.st_mtime:
+        return cached[1]
+    try:
+        data = parse_session(path)
+    except Exception:  # noqa: BLE001
+        data = None
+    text = _session_text(data) if data else ""
+    _TEXT_CACHE[key] = (st.st_mtime, text)
+    return text
+
+
+def search_sessions(query: str) -> list[dict]:
+    """Return [{file, snippet}] for sessions whose content matches `query`."""
+    q = (query or "").strip().lower()
+    if not q:
+        return []
+    out = []
+    for s in list_sessions():
+        text = session_text(Path(s["file"]))
+        idx = text.lower().find(q)
+        if idx < 0:
+            continue
+        start = max(0, idx - 50)
+        snippet = text[start:idx + len(q) + 70].replace("\n", " ").strip()
+        if start > 0:
+            snippet = "…" + snippet
+        out.append({"file": s["file"], "snippet": snippet})
+    return out
+
+
+# ---------------------------------------------------------------------------
 # HTTP server
 # ---------------------------------------------------------------------------
 class Handler(BaseHTTPRequestHandler):
@@ -449,6 +539,15 @@ class Handler(BaseHTTPRequestHandler):
         if route == "/api/sessions":
             try:
                 self._send_json({"sessions": list_sessions()})
+            except Exception as e:  # noqa: BLE001
+                self._send_json({"error": str(e)}, status=500)
+            return
+
+        if route == "/api/search":
+            qs = parse_qs(parsed.query)
+            q = qs.get("q", [""])[0]
+            try:
+                self._send_json({"matches": search_sessions(q)})
             except Exception as e:  # noqa: BLE001
                 self._send_json({"error": str(e)}, status=500)
             return
