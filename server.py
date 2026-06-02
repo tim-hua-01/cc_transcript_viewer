@@ -398,7 +398,7 @@ def parse_session(target: Path) -> dict | None:
 _TEXT_CACHE: dict[str, tuple[float, str, str]] = {}
 
 # A hit inside the first user message is worth this many ordinary hits.
-FIRST_MSG_WEIGHT = 12
+FIRST_MSG_WEIGHT = 1000
 
 
 def _event_text(ev: dict) -> list[str]:
