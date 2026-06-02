@@ -255,6 +255,16 @@ function renderSidebar(query) {
     return metaHit || contentHit;
   });
 
+  // With an active query, order by relevance score (first-message hits weigh
+  // most); otherwise keep the server's newest-first ordering.
+  if (q) {
+    const scoreOf = (s) => {
+      const cm = CONTENT_MATCHES && CONTENT_MATCHES.get(s.file);
+      return cm ? cm.score : 0.5; // metaHit-only (e.g. id match) sits below content hits
+    };
+    matches.sort((a, b) => (scoreOf(b) - scoreOf(a)) || ((b.mtime || 0) - (a.mtime || 0)));
+  }
+
   const nClaude = matches.filter((s) => s.agent === "claude").length;
   const nCodex = matches.filter((s) => s.agent === "codex").length;
   $("#sidebar-stats").textContent = `${matches.length} sessions · ${nClaude} Claude · ${nCodex} Codex`;
@@ -281,7 +291,7 @@ function renderSidebar(query) {
         s.model ? el("span", { class: "badge" }, shortModel(s.model)) : null
       ),
       CONTENT_MATCHES && CONTENT_MATCHES.has(s.file)
-        ? el("div", { class: "session-snippet" }, CONTENT_MATCHES.get(s.file))
+        ? el("div", { class: "session-snippet" }, CONTENT_MATCHES.get(s.file).snippet)
         : null,
       el(
         "div",
@@ -895,7 +905,7 @@ async function runSearch(query) {
     const res = await fetch("/api/search?q=" + encodeURIComponent(q));
     const data = await res.json();
     if (seq !== searchSeq) return; // a newer search superseded this one
-    CONTENT_MATCHES = new Map((data.matches || []).map((m) => [m.file, m.snippet]));
+    CONTENT_MATCHES = new Map((data.matches || []).map((m) => [m.file, { snippet: m.snippet, score: m.score }]));
   } catch (e) {
     if (seq !== searchSeq) return;
     CONTENT_MATCHES = new Map();

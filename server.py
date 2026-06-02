@@ -394,90 +394,122 @@ def parse_session(target: Path) -> dict | None:
 # ---------------------------------------------------------------------------
 # Full-text search across transcript content
 # ---------------------------------------------------------------------------
-_TEXT_CACHE: dict[str, tuple[float, str]] = {}
+# Cache: path -> (mtime, first_user_message_text, rest_of_text)
+_TEXT_CACHE: dict[str, tuple[float, str, str]] = {}
+
+# A hit inside the first user message is worth this many ordinary hits.
+FIRST_MSG_WEIGHT = 12
 
 
-def _session_text(data: dict) -> str:
-    """Flatten a parsed session into searchable human-readable text.
-
-    Pulls prompts, replies, thinking/reasoning, and the meaningful bits of tool
-    calls (commands, paths, queries, outputs) while skipping image blobs.
-    """
+def _event_text(ev: dict) -> list[str]:
+    """All searchable text from a single event (both agent shapes)."""
     parts: list[str] = []
 
     def add(x):
         if x and isinstance(x, str):
             parts.append(x)
 
-    add(data.get("title"))
-    add((data.get("meta") or {}).get("cwd"))
+    if ev.get("blocks"):  # Claude Code shape
+        for b in ev["blocks"]:
+            add(b.get("text"))
+            if b.get("type") == "tool_use":
+                inp = b.get("input") or {}
+                if isinstance(inp, dict):
+                    for k in ("command", "file_path", "pattern", "query", "prompt", "description", "content", "url"):
+                        add(inp.get(k))
+                res = b.get("result") or {}
+                if isinstance(res, dict):
+                    add(res.get("text"))
+    else:  # Codex shape
+        add(ev.get("text"))
+        add(ev.get("summary"))
+        add(ev.get("query"))
+        inp = ev.get("input")
+        if isinstance(inp, str):
+            add(inp)
+        elif isinstance(inp, dict):
+            for k in ("cmd", "command", "file_path", "query", "prompt"):
+                add(inp.get(k))
+        res = ev.get("result")
+        if isinstance(res, dict):
+            add(res.get("output"))
+        act = ev.get("action")
+        if isinstance(act, dict):
+            for q in act.get("queries") or []:
+                add(q)
+    return parts
+
+
+def _session_segments(data: dict) -> tuple[str, str]:
+    """Split a parsed session into (first user message, everything else).
+
+    The first user message is scored heavily; the rest is searchable too, but
+    weighted as ordinary content. Image blobs are skipped throughout.
+    """
+    first = ""
+    rest: list[str] = []
+    cwd = (data.get("meta") or {}).get("cwd")
+    if cwd:
+        rest.append(cwd)
+    seen_first = False
     for ev in data.get("events", []) or []:
-        if ev.get("blocks"):  # Claude Code shape
-            for b in ev["blocks"]:
-                add(b.get("text"))
-                if b.get("type") == "tool_use":
-                    inp = b.get("input") or {}
-                    if isinstance(inp, dict):
-                        for k in ("command", "file_path", "pattern", "query", "prompt", "description", "content", "url"):
-                            add(inp.get(k))
-                    res = b.get("result") or {}
-                    if isinstance(res, dict):
-                        add(res.get("text"))
-        else:  # Codex shape
-            add(ev.get("text"))
-            add(ev.get("summary"))
-            add(ev.get("query"))
-            inp = ev.get("input")
-            if isinstance(inp, str):
-                add(inp)
-            elif isinstance(inp, dict):
-                for k in ("cmd", "command", "file_path", "query", "prompt"):
-                    add(inp.get(k))
-            res = ev.get("result")
-            if isinstance(res, dict):
-                add(res.get("output"))
-            act = ev.get("action")
-            if isinstance(act, dict):
-                for q in act.get("queries") or []:
-                    add(q)
-    return "\n".join(parts)
+        if not seen_first and ev.get("kind") == "user":
+            seen_first = True
+            first = " ".join(_event_text(ev))
+            continue
+        rest.extend(_event_text(ev))
+    return first, "\n".join(rest)
 
 
-def session_text(path: Path) -> str:
-    """Searchable text for one transcript, cached by file mtime."""
+def session_segments(path: Path) -> tuple[str, str]:
+    """(first message, rest) for one transcript, cached by file mtime."""
     try:
         st = path.stat()
     except OSError:
-        return ""
+        return "", ""
     key = str(path)
     cached = _TEXT_CACHE.get(key)
     if cached and cached[0] == st.st_mtime:
-        return cached[1]
+        return cached[1], cached[2]
     try:
         data = parse_session(path)
     except Exception:  # noqa: BLE001
         data = None
-    text = _session_text(data) if data else ""
-    _TEXT_CACHE[key] = (st.st_mtime, text)
-    return text
+    first, rest = _session_segments(data) if data else ("", "")
+    _TEXT_CACHE[key] = (st.st_mtime, first, rest)
+    return first, rest
 
 
 def search_sessions(query: str) -> list[dict]:
-    """Return [{file, snippet}] for sessions whose content matches `query`."""
+    """Return [{file, snippet, score}] for sessions whose content matches `query`.
+
+    Score = (#hits in the first user message) * FIRST_MSG_WEIGHT + (#hits elsewhere),
+    so a single first-message hit outranks many scattered ones; among equal scores,
+    an earlier first occurrence wins. Sorted best-first.
+    """
     q = (query or "").strip().lower()
     if not q:
         return []
     out = []
     for s in list_sessions():
-        text = session_text(Path(s["file"]))
-        idx = text.lower().find(q)
-        if idx < 0:
+        first, rest = session_segments(Path(s["file"]))
+        first_low, rest_low = first.lower(), rest.lower()
+        c_first = first_low.count(q)
+        c_rest = rest_low.count(q)
+        if not c_first and not c_rest:
             continue
+        score = c_first * FIRST_MSG_WEIGHT + c_rest
+        # snippet from the earliest occurrence (first message preferred)
+        if c_first:
+            combined, idx = first, first_low.find(q)
+        else:
+            combined, idx = rest, rest_low.find(q)
         start = max(0, idx - 50)
-        snippet = text[start:idx + len(q) + 70].replace("\n", " ").strip()
+        snippet = combined[start:idx + len(q) + 70].replace("\n", " ").strip()
         if start > 0:
             snippet = "…" + snippet
-        out.append({"file": s["file"], "snippet": snippet})
+        out.append({"file": s["file"], "snippet": snippet, "score": score, "pos": idx if c_first else len(first) + idx})
+    out.sort(key=lambda m: (-m["score"], m["pos"]))
     return out
 
 
