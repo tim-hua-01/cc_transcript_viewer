@@ -10,6 +10,12 @@ It reads:
 
 Nothing is uploaded anywhere; it's a read-only local web app.
 
+> [!WARNING]
+> **This is vibe-coded.** It was built quickly and iteratively with an AI coding agent, so expect
+> rough edges and the occasional rendering bug. It also depends on the *current* on-disk transcript
+> formats of Claude Code and Codex — if either tool changes how it saves sessions, parts of the viewer
+> may silently break or drop records until the parser is updated.
+
 ## Run it
 
 ```bash
@@ -56,6 +62,13 @@ you hit **↻ Refresh** or reload the page.
     - Codex: `function_call`, `custom_tool_call`, `apply_patch` (rendered as a colored diff),
       `exec_command`/`shell`, `write_stdin`, `view_image`, web search, plus fallback JSON.
   - Codex status/context and token-usage events (tokens hidden by default — **Toggle tokens**).
+- **Survives `/compact`.** After a conversation is compacted, the harness injects bookkeeping records
+  that most viewers drop. This one renders them: 📎 *referenced-file* pointers (including the note the
+  model is actually handed when its context is rebuilt), 📄 re-attached file reads with their full
+  content, and tool-set changes (`+N tools available via ToolSearch`).
+- **Images & sub-agents.** Inline images in prompts/replies and Codex `view_image` are shown. Claude
+  Code sub-agent (`Task`) turns are rendered inline and flagged **sub-agent**, and Codex sub-agent
+  sessions are picked up and listed in the same time-sorted view.
 - **Deep-linkable:** the open session is stored in the URL hash, so you can bookmark/share a link.
 
 ## Notes on Codex transcripts
