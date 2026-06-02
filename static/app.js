@@ -518,13 +518,41 @@ function renderSystem(ev) {
 
 function renderAttachment(ev) {
   const body = [];
-  const label = ["Hook", ev.hook_name, ev.att_type].filter(Boolean).join(" · ");
-  if (ev.command) body.push(el("div", { class: "attach-meta" }, "$ " + ev.command));
-  const out = [ev.content, ev.stdout, ev.stderr].filter(Boolean).join("\n");
-  if (out) body.push(el("pre", { class: "payload truncatable" }, out));
-  if (ev.exit_code != null) body.push(el("div", { class: "attach-meta" }, "exit " + ev.exit_code));
+  const t = ev.att_type;
+  const name = ev.display_path || ev.filename || "";
+
+  if (t === "compact_file_reference") {
+    // post-/compact pointer: file was referenced but its bytes were dropped.
+    // Show the same note the model is actually handed when its context is rebuilt.
+    body.push(el("div", { class: "attach-meta" }, "📎 Referenced file " + name));
+    body.push(el("div", { class: "attach-note" },
+      "Note: " + (ev.filename || name) + " was read before the last conversation was " +
+      "summarized, but the contents are too large to include. Use Read tool if you need " +
+      "to access it."));
+  } else if (t === "file") {
+    // post-/compact re-attachment: the full file text was injected back in
+    const lines = ev.num_lines != null ? ` (${ev.num_lines} lines)` : "";
+    body.push(el("div", { class: "attach-meta" }, "📄 Read " + name + lines));
+    if (ev.content) body.push(el("pre", { class: "payload truncatable" }, ev.content));
+  } else if (t === "deferred_tools_delta") {
+    const parts = [];
+    if (ev.added_count) parts.push("+" + ev.added_count + " tools available via ToolSearch");
+    if (ev.removed_count) parts.push("−" + ev.removed_count + " removed");
+    if (ev.readded_count) parts.push(ev.readded_count + " re-added");
+    body.push(el("div", { class: "attach-meta" }, parts.join(" · ") || "tool set updated"));
+  } else {
+    // hook output and everything else
+    if (ev.command) body.push(el("div", { class: "attach-meta" }, "$ " + ev.command));
+    const out = [ev.content, ev.stdout, ev.stderr].filter(Boolean).join("\n");
+    if (out) body.push(el("pre", { class: "payload truncatable" }, out));
+    if (ev.exit_code != null) body.push(el("div", { class: "attach-meta" }, "exit " + ev.exit_code));
+  }
+
+  const label = ev.hook_name
+    ? ["Hook", ev.hook_name, t].filter(Boolean).join(" · ")
+    : (t ? "Attachment · " + t : "Attachment");
   if (!body.length) return null;
-  return turnShell("attachment", label || "Attachment", ev, body);
+  return turnShell("attachment", label, ev, body);
 }
 
 // ---------- Codex status / context / tokens ----------

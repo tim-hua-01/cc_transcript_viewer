@@ -236,20 +236,41 @@ def parse_cc_session(path: Path) -> dict:
 
         if t == "attachment":
             att = rec.get("attachment", {})
-            events.append(
-                {
-                    "kind": "attachment",
-                    "ts": ts,
-                    "att_type": att.get("type"),
-                    "hook_name": att.get("hookName"),
-                    "command": att.get("command"),
-                    "stdout": att.get("stdout"),
-                    "stderr": att.get("stderr"),
-                    "exit_code": att.get("exitCode"),
-                    "content": att.get("content") if isinstance(att.get("content"), str) else "",
-                    "is_sidechain": is_sidechain,
-                }
-            )
+            att_type = att.get("type")
+            raw_content = att.get("content")
+            content = raw_content if isinstance(raw_content, str) else ""
+            num_lines = None
+            # `file` attachments nest the text under content.file (re-attached
+            # after a /compact); pull it back out so the viewer can show it.
+            if not content and isinstance(raw_content, dict):
+                nested = raw_content.get("file")
+                if isinstance(nested, dict):
+                    content = nested.get("content") or ""
+                    num_lines = nested.get("numLines") or nested.get("totalLines")
+            filename = att.get("filename")
+            display_path = att.get("displayPath")
+            if not display_path and filename:
+                display_path = filename.rsplit("/", 1)[-1]
+            ev = {
+                "kind": "attachment",
+                "ts": ts,
+                "att_type": att_type,
+                "hook_name": att.get("hookName"),
+                "command": att.get("command"),
+                "stdout": att.get("stdout"),
+                "stderr": att.get("stderr"),
+                "exit_code": att.get("exitCode"),
+                "content": content,
+                "filename": filename,
+                "display_path": display_path,
+                "num_lines": num_lines,
+                "is_sidechain": is_sidechain,
+            }
+            if att_type == "deferred_tools_delta":
+                ev["added_count"] = len(att.get("addedNames") or [])
+                ev["removed_count"] = len(att.get("removedNames") or [])
+                ev["readded_count"] = len(att.get("readdedNames") or [])
+            events.append(ev)
             continue
 
         if t == "user":

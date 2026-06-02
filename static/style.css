@@ -278,6 +278,7 @@ pre.payload.truncatable { max-height: 240px; }
 
 /* attachment / hook */
 .attach-meta { font-family: var(--mono); font-size: 12px; color: var(--muted); }
+.attach-note { margin-top: 4px; font-size: 12px; font-style: italic; color: var(--muted); opacity: 0.85; }
 
 /* ---------- Codex-specific turns ---------- */
 .turn-reasoning .turn-head {
