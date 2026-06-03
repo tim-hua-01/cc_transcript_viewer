@@ -69,6 +69,10 @@ you hit **↻ Refresh** or reload the page.
 - **Images & sub-agents.** Inline images in prompts/replies and Codex `view_image` are shown. Claude
   Code sub-agent (`Task`) turns are rendered inline and flagged **sub-agent**, and Codex sub-agent
   sessions are picked up and listed in the same time-sorted view.
+- **Jump between prompts.** A right-side **outline** lists the top-level user messages as truncated,
+  clickable headings and highlights the one you're reading as you scroll. Floating **↑ / ↓** buttons
+  jump to the previous/next user prompt, and **⤓ Jump to end** (in the transcript controls) skips to
+  the bottom.
 - **Deep-linkable:** the open session is stored in the URL hash, so you can bookmark/share a link.
 
 ## Notes on Codex transcripts
