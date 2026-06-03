@@ -549,7 +549,7 @@ function renderUser(ev) {
     for (const img of ev.images || []) body.push(renderImagePayload(img));
     for (const img of ev.local_images || []) body.push(el("div", { class: "attach-meta" }, "local image: " + img));
   }
-  return turnShell("user", "User", ev, body);
+  return turnShell("user", ev.queued ? "User · queued" : "User", ev, body);
 }
 
 function renderAssistant(ev) {

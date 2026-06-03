@@ -220,6 +220,10 @@ def cc_session_summary(path: Path) -> dict:
                 and any(isinstance(b, dict) and b.get("type") == "text" for b in content)
             ):
                 n_user += 1
+        if t == "attachment" and not rec.get("isSidechain"):
+            att = rec.get("attachment", {})
+            if att.get("type") == "queued_command" and att.get("prompt"):
+                n_user += 1
         if t == "assistant":
             msg = rec.get("message", {})
             if msg.get("model"):
@@ -349,6 +353,21 @@ def parse_cc_session(path: Path) -> dict:
         if t == "attachment":
             att = rec.get("attachment", {})
             att_type = att.get("type")
+            # A message the user queued while Claude was still working. It's a
+            # genuine user prompt, but Claude Code records it as an attachment
+            # (not a `user` record), so surface it as a user turn — otherwise it
+            # silently vanishes from the transcript and the outline.
+            if att_type == "queued_command" and att.get("prompt"):
+                events.append(
+                    {
+                        "kind": "user",
+                        "ts": ts,
+                        "blocks": [{"type": "text", "text": att["prompt"]}],
+                        "is_sidechain": is_sidechain,
+                        "queued": True,
+                    }
+                )
+                continue
             raw_content = att.get("content")
             content = raw_content if isinstance(raw_content, str) else ""
             num_lines = None
