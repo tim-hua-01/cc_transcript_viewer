@@ -330,6 +330,8 @@ async function openSession(file, itemEl) {
   }
 
   $("#welcome").hidden = true;
+  $("#outline").hidden = true;
+  $("#nav-buttons").hidden = true;
   const t = $("#transcript");
   t.hidden = false;
   t.innerHTML = `<div class="spinner">Loading transcript…</div>`;
@@ -380,7 +382,8 @@ function renderTranscript(data) {
       el("button", { class: "btn", onclick: () => setAll(".tool-block", false) }, "Expand tools"),
       isCodex ? el("button", { class: "btn", onclick: () => setAll(".status-block", true) }, "Collapse status") : null,
       isCodex ? el("button", { class: "btn", onclick: () => setAll(".status-block", false) }, "Expand status") : null,
-      isCodex ? el("button", { class: "btn", onclick: () => document.body.classList.toggle("show-tokens") }, "Toggle tokens") : null
+      isCodex ? el("button", { class: "btn", onclick: () => document.body.classList.toggle("show-tokens") }, "Toggle tokens") : null,
+      el("button", { class: "btn", onclick: scrollToEnd }, "⤓ Jump to end")
     )
   );
   t.append(header);
@@ -390,6 +393,91 @@ function renderTranscript(data) {
     if (node) t.append(node);
   }
   $("#main").scrollTop = 0;
+  buildOutline();
+}
+
+// ---------- user-message navigation (outline + jump buttons) ----------
+const OUTLINE_MAX = 80; // max chars shown per user message in the outline
+let USER_TURNS = [];     // .turn-user elements in document order, for the current transcript
+
+// Height of the sticky transcript header — scroll targets land just below it.
+function headerOffset() {
+  const h = $(".t-header");
+  return h ? h.offsetHeight + 8 : 0;
+}
+
+function scrollToTurn(turn) {
+  $("#main").scrollTo({ top: Math.max(0, turn.offsetTop - headerOffset()), behavior: "smooth" });
+}
+
+function scrollToEnd() {
+  const main = $("#main");
+  main.scrollTo({ top: main.scrollHeight, behavior: "smooth" });
+}
+
+// Index of the user turn currently at or above the viewport top.
+function currentUserIndex() {
+  const ref = $("#main").scrollTop + headerOffset() + 4;
+  let idx = -1;
+  USER_TURNS.forEach((turn, i) => { if (turn.offsetTop <= ref + 1) idx = i; });
+  return idx;
+}
+
+// dir > 0 → next user message; dir < 0 → previous one. `anchor` is the content
+// y-position at the top of the viewport — scrollToTurn() parks a turn exactly
+// there, so the ±2 tolerance excludes the turn we're currently sitting on.
+function jumpUser(dir) {
+  if (!USER_TURNS.length) return;
+  const main = $("#main");
+  const anchor = main.scrollTop + headerOffset();
+  if (dir > 0) {
+    const next = USER_TURNS.find((t) => t.offsetTop > anchor + 2);
+    if (next) scrollToTurn(next); else scrollToEnd();
+  } else {
+    let prev = null;
+    for (const t of USER_TURNS) { if (t.offsetTop < anchor - 2) prev = t; else break; }
+    if (prev) scrollToTurn(prev); else main.scrollTo({ top: 0, behavior: "smooth" });
+  }
+}
+
+function buildOutline() {
+  const t = $("#transcript");
+  // top-level user prompts only — skip sub-agent (sidechain) prompts
+  USER_TURNS = $$(".turn-user:not(.sidechain)", t);
+  const outline = $("#outline");
+  const list = $("#outline-list");
+  const nav = $("#nav-buttons");
+  list.innerHTML = "";
+
+  if (!USER_TURNS.length) {
+    outline.hidden = true;
+    nav.hidden = true;
+    return;
+  }
+  outline.hidden = false;
+  nav.hidden = false;
+
+  USER_TURNS.forEach((turn, i) => {
+    turn.id = "user-turn-" + i;
+    const full = (($(".turn-body", turn) || {}).textContent || "").trim().replace(/\s+/g, " ");
+    const label = full.slice(0, OUTLINE_MAX) || "(empty message)";
+    const item = el(
+      "div",
+      { class: "outline-item", title: full.slice(0, 500) },
+      el("span", { class: "outline-num" }, String(i + 1)),
+      el("span", { class: "outline-text" }, label)
+    );
+    item.addEventListener("click", () => scrollToTurn(turn));
+    list.append(item);
+  });
+  highlightOutline();
+}
+
+function highlightOutline() {
+  const idx = currentUserIndex();
+  const items = $$("#outline-list .outline-item");
+  items.forEach((it, i) => it.classList.toggle("active", i === idx));
+  if (idx >= 0 && items[idx]) items[idx].scrollIntoView({ block: "nearest" });
 }
 
 function setAll(sel, collapsed) {
@@ -975,6 +1063,17 @@ document.addEventListener("keydown", (e) => {
     $("#search").focus();
   }
   if (e.key === "Escape") $$(".dropdown-panel").forEach((p) => p.classList.add("hidden"));
+});
+
+// ---------- nav button + outline wiring ----------
+$("#nav-prev").addEventListener("click", () => jumpUser(-1));
+$("#nav-next").addEventListener("click", () => jumpUser(1));
+$("#nav-end").addEventListener("click", scrollToEnd);
+
+let outlineRaf = 0;
+$("#main").addEventListener("scroll", () => {
+  if (outlineRaf) return;
+  outlineRaf = requestAnimationFrame(() => { outlineRaf = 0; highlightOutline(); });
 });
 
 // click anywhere outside an open dropdown closes it
