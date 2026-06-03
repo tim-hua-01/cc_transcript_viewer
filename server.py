@@ -534,7 +534,29 @@ def list_sessions() -> list[dict]:
         pass
 
     out.sort(key=lambda s: s.get("mtime") or 0, reverse=True)
-    return out
+
+    # Place each sub-agent directly under its parent session rather than at its
+    # own mtime slot. An actively-updated parent floats to the top of the
+    # time-sorted list while its sub-agents (last touched earlier) sink down and
+    # appear to belong to whatever unrelated session precedes them. Grouping
+    # keeps a sub-agent visually attached to the session that spawned it.
+    parent_files = {s["file"] for s in out if not s.get("is_subagent")}
+    subs_by_parent: dict[str, list] = {}
+    for s in out:
+        if s.get("is_subagent") and s.get("parent_file") in parent_files:
+            subs_by_parent.setdefault(s["parent_file"], []).append(s)
+
+    grouped: list[dict] = []
+    for s in out:
+        if s.get("is_subagent"):
+            # Orphans (parent file not in the list) keep their own mtime slot;
+            # everything else is emitted under its parent below.
+            if s.get("parent_file") not in parent_files:
+                grouped.append(s)
+            continue
+        grouped.append(s)
+        grouped.extend(subs_by_parent.get(s["file"], []))
+    return grouped
 
 
 def _under(target: Path, root: Path) -> bool:
