@@ -67,8 +67,12 @@ you hit **↻ Refresh** or reload the page.
   model is actually handed when its context is rebuilt), 📄 re-attached file reads with their full
   content, and tool-set changes (`+N tools available via ToolSearch`).
 - **Images & sub-agents.** Inline images in prompts/replies and Codex `view_image` are shown. Claude
-  Code sub-agent (`Task`) turns are rendered inline and flagged **sub-agent**, and Codex sub-agent
-  sessions are picked up and listed in the same time-sorted view.
+  Code sub-agents (which newer versions write to their own `…/<session-id>/subagents/agent-*.jsonl`
+  files) and Codex sub-agent sessions are each picked up as their own entry in the same time-sorted
+  list, indented and flagged **sub-agent**. A sub-agent is titled `[type] description` when it can be
+  matched back to the `Task`/`Agent` call that spawned it (others — e.g. compaction agents — fall back
+  to their opening prompt), and its transcript view links **↑ parent session**. Older transcripts that
+  inline sub-agent turns as `isSidechain` records still render those turns inline, flagged **sub-agent**.
 - **Jump between prompts.** A right-side **outline** lists the top-level user messages as truncated,
   clickable headings and highlights the one you're reading as you scroll. Floating **↑ / ↓** buttons
   jump to the previous/next user prompt, and **⤓ Jump to end** (in the transcript controls) skips to

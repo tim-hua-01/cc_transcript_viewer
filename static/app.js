@@ -273,11 +273,12 @@ function renderSidebar(query) {
     const tsForRel = s.last_ts || (s.mtime ? new Date(s.mtime * 1000).toISOString() : null);
     const item = el(
       "div",
-      { class: "session-item", "data-file": s.file },
+      { class: "session-item" + (s.is_subagent ? " subagent" : ""), "data-file": s.file },
       el(
         "div",
         { class: "session-toprow" },
         el("span", { class: "agent-tag agent-" + s.agent }, s.agent === "codex" ? "Codex" : "Claude"),
+        s.is_subagent ? el("span", { class: "sidechain-tag" }, "sub-agent") : null,
         el("span", { class: "session-title" }, s.title)
       ),
       s.cwd ? el("div", { class: "session-cwd", title: s.cwd }, shortPath(s.cwd)) : null,
@@ -359,11 +360,23 @@ function renderTranscript(data) {
       "h1",
       { class: "t-title" },
       el("span", { class: "agent-tag agent-" + data.agent }, isCodex ? "Codex" : "Claude"),
-      data.title || "(untitled session)"
+      data.is_subagent ? el("span", { class: "sidechain-tag" }, "sub-agent") : null,
+      " " + (data.title || "(untitled session)")
     ),
     el(
       "div",
       { class: "t-meta" },
+      data.is_subagent && data.parent_file
+        ? el(
+            "a",
+            {
+              class: "parent-link",
+              href: "#",
+              onclick: (e) => { e.preventDefault(); openSession(data.parent_file); },
+            },
+            "↑ parent session"
+          )
+        : null,
       meta.cwd ? el("span", {}, "📁 " + meta.cwd) : null,
       meta.git_branch ? el("span", {}, "⎇ " + meta.git_branch) : null,
       meta.model ? el("span", {}, shortModel(meta.model)) : null,

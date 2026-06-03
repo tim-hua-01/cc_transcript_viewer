@@ -116,6 +116,14 @@ body {
 }
 .session-item:hover { background: var(--bg-elev); }
 .session-item.active { background: var(--bg-elev); border-color: var(--accent); }
+.session-item.subagent {
+  margin-left: 14px;
+  border-left: 2px dashed var(--border);
+  border-top-left-radius: 0;
+  border-bottom-left-radius: 0;
+}
+.parent-link { color: var(--accent); text-decoration: none; font-weight: 500; }
+.parent-link:hover { text-decoration: underline; }
 .session-toprow { display: flex; align-items: flex-start; gap: 6px; }
 .session-title {
   font-size: 13px; font-weight: 500;

@@ -84,9 +84,112 @@ def _short_title(text: str, n: int = 100) -> str:
     return text[:n] + ("…" if len(text) > n else "")
 
 
+def _subagent_first_user_text(records: list[dict]) -> str:
+    """First user prompt in a sub-agent transcript (every message is a sidechain).
+
+    Returns the full text (used both for the title and for matching the prompt
+    back to its spawning Task/Agent call).
+    """
+    for rec in records:
+        if rec.get("type") != "user":
+            continue
+        content = rec.get("message", {}).get("content")
+        text = ""
+        if isinstance(content, str):
+            text = content
+        elif isinstance(content, list):
+            parts = [b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text"]
+            text = "\n".join(p for p in parts if p)
+        text = " ".join((text or "").split())
+        if text:
+            return text
+    return ""
+
+
+def _subagent_parent(path: Path):
+    """If `path` is a sub-agent transcript, return (parent_id, parent_file).
+
+    Newer Claude Code writes each sub-agent to
+    ``<project>/<session-id>/subagents/agent-<id>.jsonl``; the parent session
+    file sits at ``<project>/<session-id>.jsonl``.
+    """
+    if path.parent.name != "subagents":
+        return None
+    parent_id = path.parent.parent.name
+    parent_file = path.parent.parent.parent / f"{parent_id}.jsonl"
+    return parent_id, parent_file
+
+
+# Cache: parent path -> (mtime, [ {prompt, description, subagent_type} ])
+_AGENT_CALLS_CACHE: dict[str, tuple[float, list]] = {}
+
+
+def _cc_agent_calls(parent_path: Path) -> list[dict]:
+    """Task/Agent tool calls in a parent session, used to label its sub-agents."""
+    try:
+        mtime = parent_path.stat().st_mtime
+    except OSError:
+        return []
+    key = str(parent_path)
+    cached = _AGENT_CALLS_CACHE.get(key)
+    if cached and cached[0] == mtime:
+        return cached[1]
+    calls = []
+    for rec in _iter_records(parent_path):
+        content = (rec.get("message") or {}).get("content")
+        if not isinstance(content, list):
+            continue
+        for b in content:
+            if isinstance(b, dict) and b.get("type") == "tool_use" and b.get("name") in ("Task", "Agent"):
+                inp = b.get("input") or {}
+                calls.append(
+                    {
+                        "prompt": (inp.get("prompt") or "").strip(),
+                        "description": inp.get("description") or "",
+                        "subagent_type": inp.get("subagent_type") or inp.get("agentType") or "",
+                    }
+                )
+    _AGENT_CALLS_CACHE[key] = (mtime, calls)
+    return calls
+
+
+def _subagent_meta(path: Path, records: list[dict]) -> dict | None:
+    """Build the sub-agent fields (title, parent linkage) for one transcript.
+
+    Returns None when `path` is not a sub-agent file. The opening prompt is
+    matched (by prefix) against the parent's Task/Agent calls to recover a nice
+    ``[type] description`` label; sub-agents with no spawning call (e.g. from
+    compaction) fall back to their first prompt.
+    """
+    sub = _subagent_parent(path)
+    if not sub:
+        return None
+    parent_id, parent_file = sub
+    first_text = _subagent_first_user_text(records)
+    description = subagent_type = ""
+    for call in _cc_agent_calls(parent_file):
+        # Normalise both sides the same way: first_text has its whitespace
+        # collapsed, so the raw prompt must be collapsed too before comparing.
+        p = " ".join(call["prompt"].split())
+        if p and first_text and p[:300] == first_text[:300]:
+            description = call["description"]
+            subagent_type = call["subagent_type"]
+            break
+    base = description or first_text or "(sub-agent)"
+    title = _short_title((f"[{subagent_type}] " if subagent_type else "") + base)
+    return {
+        "title": title,
+        "is_subagent": True,
+        "parent_id": parent_id,
+        "parent_file": str(parent_file) if parent_file.exists() else "",
+        "subagent_type": subagent_type,
+    }
+
+
 def cc_session_summary(path: Path) -> dict:
     """Lightweight metadata for a Claude Code session (cheap scan)."""
     records = list(_iter_records(path))
+    is_subagent = path.parent.name == "subagents"
     title = ""
     cwd = ""
     git_branch = ""
@@ -110,7 +213,7 @@ def cc_session_summary(path: Path) -> dict:
         if ts:
             first_ts = first_ts or ts
             last_ts = ts
-        if t == "user" and not rec.get("isSidechain"):
+        if t == "user" and (is_subagent or not rec.get("isSidechain")):
             content = rec.get("message", {}).get("content")
             if isinstance(content, str) or (
                 isinstance(content, list)
@@ -126,12 +229,18 @@ def cc_session_summary(path: Path) -> dict:
                     n_tool += 1
             n_assistant += 1
 
-    return {
+    sub_meta = _subagent_meta(path, records) if is_subagent else None
+    if sub_meta:
+        cwd = cwd or decode_project_name(path.parent.parent.parent.name)
+    else:
+        cwd = cwd or decode_project_name(path.parent.name)
+
+    summary = {
         "agent": "claude",
         "id": path.stem,
         "file": str(path),
         "title": _first_user_text(records) or title or "(untitled session)",
-        "cwd": cwd or decode_project_name(path.parent.name),
+        "cwd": cwd,
         "git_branch": git_branch,
         "version": version,
         "first_ts": first_ts,
@@ -145,6 +254,9 @@ def cc_session_summary(path: Path) -> dict:
         "models": sorted(models),
         "mtime": path.stat().st_mtime,
     }
+    if sub_meta:
+        summary.update(sub_meta)
+    return summary
 
 
 def _normalize_tool_result_content(content) -> dict:
@@ -350,13 +462,25 @@ def parse_cc_session(path: Path) -> dict:
             )
             continue
 
-    return {
+    sub_meta = _subagent_meta(path, records)
+    if sub_meta:
+        meta.setdefault("cwd", decode_project_name(path.parent.parent.parent.name))
+    out = {
         "agent": "claude",
         "id": path.stem,
-        "title": _first_user_text(records) or title or "(untitled session)",
+        "title": (sub_meta["title"] if sub_meta else "")
+        or _first_user_text(records)
+        or title
+        or "(untitled session)",
         "meta": meta,
         "events": events,
     }
+    if sub_meta:
+        out["is_subagent"] = True
+        out["parent_id"] = sub_meta["parent_id"]
+        out["parent_file"] = sub_meta["parent_file"]
+        out["subagent_type"] = sub_meta["subagent_type"]
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -373,6 +497,12 @@ def list_sessions() -> list[dict]:
             for f in proj_dir.glob("*.jsonl"):
                 try:
                     out.append(cc_session_summary(f))
+                except (OSError, ValueError):
+                    continue
+            # Sub-agents live one level down: <session-id>/subagents/agent-*.jsonl
+            for sub in proj_dir.glob("*/subagents/*.jsonl"):
+                try:
+                    out.append(cc_session_summary(sub))
                 except (OSError, ValueError):
                     continue
 
