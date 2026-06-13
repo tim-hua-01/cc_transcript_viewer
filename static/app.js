@@ -116,7 +116,7 @@ let CURRENT_FILE = null;
 let AGENT_FILTER = "all";
 // ---------- live auto-refresh ----------
 let LIVE = true;                 // poll for new/updated transcripts
-const POLL_MS = 3000;            // how often to rescan while Live is on
+const POLL_MS = 1000;            // how often to rescan while Live is on
 let LAST_RENDERED_MTIME = 0;     // mtime of the open transcript as last rendered
 let LAST_SIG = "";               // cheap fingerprint of the session list
 // file -> snippet for the active content search, or null when no search is active

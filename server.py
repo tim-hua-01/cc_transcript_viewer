@@ -186,8 +186,31 @@ def _subagent_meta(path: Path, records: list[dict]) -> dict | None:
     }
 
 
+# Cache: file path -> (mtime, summary dict). Keeps the /api/sessions poll from
+# re-reading and re-parsing every transcript on every request; only files whose
+# mtime moved are rebuilt.
+_SUMMARY_CACHE: dict[str, tuple[float, dict]] = {}
+
+
 def cc_session_summary(path: Path) -> dict:
-    """Lightweight metadata for a Claude Code session (cheap scan)."""
+    """Lightweight metadata for a Claude Code session, cached by file mtime."""
+    key = str(path)
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        mtime = None
+    if mtime is not None:
+        cached = _SUMMARY_CACHE.get(key)
+        if cached and cached[0] == mtime:
+            return cached[1]
+
+    summary = _cc_session_summary_uncached(path)
+    if mtime is not None:
+        _SUMMARY_CACHE[key] = (mtime, summary)
+    return summary
+
+
+def _cc_session_summary_uncached(path: Path) -> dict:
     records = list(_iter_records(path))
     is_subagent = path.parent.name == "subagents"
     title = ""
