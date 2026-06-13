@@ -114,6 +114,11 @@ function fmtDuration(ms) {
 let SESSIONS = [];
 let CURRENT_FILE = null;
 let AGENT_FILTER = "all";
+// ---------- live auto-refresh ----------
+let LIVE = true;                 // poll for new/updated transcripts
+const POLL_MS = 3000;            // how often to rescan while Live is on
+let LAST_RENDERED_MTIME = 0;     // mtime of the open transcript as last rendered
+let LAST_SIG = "";               // cheap fingerprint of the session list
 // file -> snippet for the active content search, or null when no search is active
 let CONTENT_MATCHES = null;
 // Selected values for the dropdown filters; empty set = no constraint (all).
@@ -125,8 +130,22 @@ async function loadSessions() {
   const res = await fetch("/api/sessions");
   const data = await res.json();
   SESSIONS = data.sessions || [];
+  LAST_SIG = sessionsSignature(SESSIONS);
   buildFilters();
   renderSidebar($("#search").value || "");
+}
+
+// Cheap fingerprint of the session list: changes whenever a file is added,
+// removed, or rewritten (mtime bumps). Lets the poller skip needless rebuilds.
+function sessionsSignature(list) {
+  let sig = list.length + "|";
+  for (const s of list) sig += s.file + ":" + (s.mtime || 0) + ";";
+  return sig;
+}
+
+function sessionMtime(file) {
+  const s = SESSIONS.find((x) => x.file === file);
+  return s ? (s.mtime || 0) : 0;
 }
 
 // ---------- dropdown filters (model / directory) ----------
@@ -342,12 +361,13 @@ async function openSession(file, itemEl) {
     const data = await res.json();
     if (data.error) { t.innerHTML = `<div class="empty-note">Error: ${esc(data.error)}</div>`; return; }
     renderTranscript(data);
+    LAST_RENDERED_MTIME = sessionMtime(file);
   } catch (e) {
     t.innerHTML = `<div class="empty-note">Failed to load: ${esc(String(e))}</div>`;
   }
 }
 
-function renderTranscript(data) {
+function renderTranscript(data, opts = {}) {
   const t = $("#transcript");
   t.innerHTML = "";
   const isCodex = data.agent === "codex";
@@ -405,8 +425,45 @@ function renderTranscript(data) {
     const node = renderEvent(ev);
     if (node) t.append(node);
   }
-  $("#main").scrollTop = 0;
+  if (!opts.keepScroll) $("#main").scrollTop = 0;
   buildOutline();
+}
+
+// ---------- live transcript refresh (scroll- and state-preserving) ----------
+// Snapshot what the reader is looking at: scroll offset, whether they're pinned
+// to the bottom (so we can tail-follow), and which collapsible blocks are open.
+function captureView() {
+  const main = $("#main");
+  const atBottom = main.scrollHeight - main.scrollTop - main.clientHeight < 40;
+  const expanded = {};
+  for (const sel of [".thinking-block", ".tool-block", ".status-block"])
+    expanded[sel] = $$(sel).map((n) => !n.classList.contains("collapsed"));
+  return { top: main.scrollTop, atBottom, expanded };
+}
+
+// Re-apply a captured view after a full re-render. Existing blocks keep their
+// index (the transcript only grows by appending), so open/closed state sticks;
+// new blocks appended at the end stay collapsed.
+function restoreView(v) {
+  for (const sel of Object.keys(v.expanded)) {
+    const nodes = $$(sel);
+    v.expanded[sel].forEach((open, i) => { if (nodes[i]) nodes[i].classList.toggle("collapsed", !open); });
+  }
+  const main = $("#main");
+  main.scrollTop = v.atBottom ? main.scrollHeight : v.top;
+}
+
+async function refreshOpenTranscript() {
+  if (!CURRENT_FILE) return;
+  const view = captureView();
+  try {
+    const res = await fetch("/api/session?file=" + encodeURIComponent(CURRENT_FILE));
+    const data = await res.json();
+    if (data.error) return;
+    renderTranscript(data, { keepScroll: true });
+    restoreView(view);
+    LAST_RENDERED_MTIME = sessionMtime(CURRENT_FILE);
+  } catch (e) { /* transient; try again next poll */ }
 }
 
 // ---------- user-message navigation (outline + jump buttons) ----------
@@ -1057,17 +1114,66 @@ $$("#filter-row .filter-chip").forEach((chip) => {
   });
 });
 
+function markActive() {
+  if (!CURRENT_FILE) return;
+  const item = $(`.session-item[data-file="${cssEscape(CURRENT_FILE)}"]`);
+  if (item) item.classList.add("active");
+}
+
+// Rebuild the sidebar from a fresh SESSIONS list without disturbing the
+// reader: keep the sidebar's own scroll offset and re-mark the active session.
+async function refreshSidebar() {
+  const listEl = $("#session-list");
+  const sTop = listEl.scrollTop;
+  await runSearch($("#search").value); // re-run content search against the fresh set
+  listEl.scrollTop = sTop;
+  markActive();
+}
+
 $("#refresh").addEventListener("click", async () => {
   const btn = $("#refresh");
   btn.textContent = "↻ …";
   const res = await fetch("/api/sessions");
   SESSIONS = ((await res.json()).sessions) || [];
-  await runSearch($("#search").value); // re-run content search against the fresh set
-  if (CURRENT_FILE) {
-    const item = $(`.session-item[data-file="${cssEscape(CURRENT_FILE)}"]`);
-    if (item) item.classList.add("active");
-  }
+  LAST_SIG = sessionsSignature(SESSIONS);
+  await refreshSidebar();
   btn.textContent = "↻ Refresh";
+});
+
+// ---------- live polling ----------
+let polling = false;
+async function poll() {
+  if (!LIVE || polling) return;
+  polling = true;
+  try {
+    let next;
+    try {
+      const res = await fetch("/api/sessions");
+      next = (await res.json()).sessions || [];
+    } catch (e) { return; } // server momentarily unreachable; retry next tick
+    const sig = sessionsSignature(next);
+    if (sig !== LAST_SIG) {
+      LAST_SIG = sig;
+      SESSIONS = next;
+      await refreshSidebar();
+    }
+    // Re-render the open transcript only when its file actually grew/changed.
+    if (CURRENT_FILE) {
+      const cur = next.find((s) => s.file === CURRENT_FILE);
+      if (cur && (cur.mtime || 0) > LAST_RENDERED_MTIME) await refreshOpenTranscript();
+    }
+  } finally {
+    polling = false;
+  }
+}
+setInterval(poll, POLL_MS);
+
+$("#live-toggle").addEventListener("click", () => {
+  LIVE = !LIVE;
+  const b = $("#live-toggle");
+  b.classList.toggle("on", LIVE);
+  b.textContent = LIVE ? "● Live" : "○ Live";
+  if (LIVE) poll(); // refresh immediately when re-enabled
 });
 
 document.addEventListener("keydown", (e) => {
