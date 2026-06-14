@@ -21,6 +21,7 @@ import unittest
 import urllib.error
 import urllib.request
 from urllib.parse import quote
+from http.client import HTTPConnection
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 
@@ -159,32 +160,42 @@ class SecurityTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertNotIn(b"forbidden", body)
 
-    def test_local_image_outside_home_is_forbidden(self):
-        """An image file outside the user's home tree must be refused."""
+    def test_local_image_serves_image_from_any_path(self):
+        """Images are served from anywhere (transcripts reference original paths)."""
         with tempfile.NamedTemporaryFile(suffix=".png", delete=True) as tf:
             tf.write(b"\x89PNG\r\n\x1a\n")
             tf.flush()
-            outside = Path(tf.name).resolve()
-            self.assertFalse(server._under(outside, Path.home()),
-                             "test fixture must be outside $HOME to be meaningful")
-            status, _, _ = self.get(
-                "/api/local-image?path=" + quote(str(outside)))
-            self.assertEqual(status, 403)
-
-    def test_local_image_inside_home_ok(self):
-        """A genuine image under the home tree is still served (control case)."""
-        d = Path(tempfile.mkdtemp(dir=Path.home()))
-        try:
-            img = d / "shot.png"
-            img.write_bytes(b"\x89PNG\r\n\x1a\n")
             status, headers, _ = self.get(
-                "/api/local-image?path=" + quote(str(img)))
+                "/api/local-image?path=" + quote(str(Path(tf.name).resolve())))
             self.assertEqual(status, 200)
             self.assertTrue(headers.get("Content-Type", "").startswith("image/"))
+
+    def test_local_image_rejects_non_image(self):
+        """Only image-typed files are served, never arbitrary content."""
+        status, _, _ = self.get("/api/local-image?path=" + quote("/etc/hosts"))
+        self.assertEqual(status, 400)
+
+    # ----- DNS-rebinding guard (Host-header allowlist) --------------------- #
+
+    def request_with_host(self, path: str, host: str):
+        """Issue a GET to the loopback server but forge the Host header."""
+        conn = HTTPConnection("127.0.0.1", self.port, timeout=5)
+        try:
+            conn.putrequest("GET", path, skip_host=True, skip_accept_encoding=True)
+            conn.putheader("Host", host)
+            conn.endheaders()
+            return conn.getresponse().status
         finally:
-            for p in d.iterdir():
-                p.unlink()
-            d.rmdir()
+            conn.close()
+
+    def test_foreign_host_header_rejected(self):
+        """A request claiming a non-loopback Host (DNS rebinding) is refused."""
+        self.assertEqual(self.request_with_host("/api/sessions", "evil.com"), 403)
+
+    def test_loopback_host_header_allowed(self):
+        """A normal loopback Host is served as usual."""
+        self.assertEqual(self.request_with_host("/api/sessions", "localhost:1234"), 200)
+        self.assertEqual(self.request_with_host("/api/sessions", "127.0.0.1"), 200)
 
 
 if __name__ == "__main__":

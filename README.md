@@ -98,9 +98,14 @@ This app reads your private transcripts, so it's built to keep them on your mach
 - **No outbound network code.** The server imports only Python's standard-library `http.server`
   (inbound), with no HTTP client, sockets, mail, or telemetry anywhere. Nothing is ever uploaded.
 - **Loopback by default.** It binds `127.0.0.1`; LAN exposure requires an explicit `--host 0.0.0.0`.
-- **File reads are confined.** `/api/session` only parses files under the transcript roots
-  (`~/.claude/projects`, `~/.codex`); `/api/local-image` only serves image files under your home
-  directory. Anything else returns `403`.
+- **DNS-rebinding guard.** While bound to loopback, it enforces a `Host`-header allowlist
+  (`127.0.0.1` / `localhost`), so a malicious web page that rebinds its domain to `127.0.0.1` can't
+  read your transcripts through the browser — its requests still carry `Host: evil.com` and get a
+  `403`. (Skipped when you deliberately bind a non-loopback `--host`.)
+- **Transcript reads are confined.** `/api/session` only parses files under the transcript roots
+  (`~/.claude/projects`, `~/.codex`); anything else returns `403`. `/api/local-image` serves only
+  image-typed files (it renders images referenced by a transcript, which may live anywhere on disk),
+  never arbitrary file contents.
 
 These guarantees are enforced by a zero-dependency test suite — run it yourself:
 
@@ -109,8 +114,9 @@ python3 -m unittest test_security
 ```
 
 It spins the server up on loopback, exercises every endpoint with a socket-level guard installed, and
-fails if any request dials a non-loopback host; it also statically asserts neither module imports a
-network client, that the default bind is loopback, and that the path-confinement checks above hold.
+fails if any request dials a non-loopback host; it also forges a foreign `Host` header to confirm the
+rebinding guard rejects it, and statically asserts neither module imports a network client and that
+the default bind is loopback.
 
 ## Notes on Codex transcripts
 
@@ -172,10 +178,10 @@ Restart Claude Code (or run `/config` once) for the change to take effect. Note 
 
 | File | Role |
 |------|------|
-| `server.py` | The unified stdlib HTTP server. Scans both transcript roots into one time-sorted list (caching per-file summaries by mtime), parses each Claude Code session into a clean event stream (pairing tool results to calls), dispatches `/api/session` to the right parser by transcript root, and serves the JSON API (`/api/sessions`, `/api/session?file=...`, `/api/search?q=...`, `/api/local-image`) plus the static frontend. `/api/session` only serves files under the allowed roots; `/api/local-image` only serves images under your home directory. |
+| `server.py` | The unified stdlib HTTP server. Scans both transcript roots into one time-sorted list (caching per-file summaries by mtime), parses each Claude Code session into a clean event stream (pairing tool results to calls), dispatches `/api/session` to the right parser by transcript root, and serves the JSON API (`/api/sessions`, `/api/session?file=...`, `/api/search?q=...`, `/api/local-image`) plus the static frontend. `/api/session` only serves files under the allowed roots; `/api/local-image` serves only image-typed files; and a `Host`-header allowlist guards the loopback server against DNS rebinding. |
 | `codex_server.py` | Codex parsing library (imported by `server.py`): parses rollout JSONL, reads `state_5.sqlite` metadata, pairs tool calls with outputs, and renders `apply_patch` diffs. Call `configure(codex_home)` to point it elsewhere. |
 | `static/index.html`, `static/style.css`, `static/app.js` | The single frontend (vanilla JS, no build step). `app.js` dispatches on event kind and renders both Claude Code (block-based) and Codex (flat) shapes, and runs the live-refresh poll loop. |
-| `test_security.py` | Zero-dependency security tests (`python3 -m unittest test_security`): asserts no outbound connections at runtime, no network-client imports, loopback default bind, and path-confinement on `/api/session` and `/api/local-image`. |
+| `test_security.py` | Zero-dependency security tests (`python3 -m unittest test_security`): asserts no outbound connections at runtime, no network-client imports, loopback default bind, the `Host`-header rebinding guard, and that `/api/session` is confined to the transcript roots while `/api/local-image` serves images only. |
 
 ### Transcript format notes
 

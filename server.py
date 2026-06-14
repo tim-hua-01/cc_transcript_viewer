@@ -28,6 +28,14 @@ DEFAULT_PROJECTS_DIR = Path.home() / ".claude" / "projects"
 # reachable from the network unless the user deliberately overrides --host.
 DEFAULT_HOST = "127.0.0.1"
 
+# Hostnames a browser legitimately uses to reach a loopback-bound server.
+LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
+# When bound to loopback we enforce a Host-header allowlist (set in main()).
+# This defeats DNS-rebinding: a malicious page that rebinds its domain to
+# 127.0.0.1 still sends `Host: evil.com`, which we reject. Disabled when the
+# user deliberately binds a non-loopback --host (they've opted into exposure).
+HOST_CHECK = True
+
 # Set by main() so handlers can reach it.
 PROJECTS_DIR = DEFAULT_PROJECTS_DIR
 
@@ -758,7 +766,28 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _host_allowed(self) -> bool:
+        """True if the request's Host header names this loopback server.
+
+        The Host reflects the hostname in the URL the client used; an attacker
+        who rebinds DNS to 127.0.0.1 cannot change it away from their domain.
+        """
+        host = self.headers.get("Host", "")
+        if not host:
+            return False
+        if host.startswith("["):            # bracketed IPv6, e.g. [::1]:3132
+            hostname = host[1:host.find("]")] if "]" in host else host
+        elif ":" in host:
+            hostname = host.rsplit(":", 1)[0]
+        else:
+            hostname = host
+        return hostname in LOOPBACK_HOSTS
+
     def do_GET(self):
+        if HOST_CHECK and not self._host_allowed():
+            self.send_error(403, "Host not allowed")
+            return
+
         parsed = urlparse(self.path)
         route = parsed.path
 
@@ -779,12 +808,10 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json({"error": "missing path param"}, status=400)
                 return
             t = Path(path_arg).expanduser().resolve()
-            # Confine reads to the user's own home tree. The transcript roots and
-            # any images pasted into a session live under it; this stops the
-            # endpoint from serving arbitrary files (e.g. /etc, other users).
-            if not _under(t, Path.home()):
-                self._send_json({"error": "forbidden"}, status=403)
-                return
+            # Serve only image-typed files. Transcripts reference images by their
+            # original local path, which may live anywhere (project dirs, /tmp,
+            # external volumes), so we don't constrain the location — the
+            # Host-header check above is what keeps this off-limits to the web.
             content_type = mimetypes.guess_type(str(t))[0] or ""
             if not content_type.startswith("image/"):
                 self._send_json({"error": "not an image"}, status=400)
@@ -833,7 +860,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-    global PROJECTS_DIR
+    global PROJECTS_DIR, HOST_CHECK
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--port", type=int, default=3132)
     ap.add_argument("--host", default=DEFAULT_HOST)
@@ -843,6 +870,9 @@ def main():
 
     PROJECTS_DIR = args.projects_dir.expanduser()
     codex.configure(args.codex_home)
+    # Enforce the Host allowlist only on the safe loopback default; if the user
+    # deliberately binds elsewhere for LAN access, step aside so it still works.
+    HOST_CHECK = args.host in LOOPBACK_HOSTS
 
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     url = f"http://{args.host}:{args.port}/"
