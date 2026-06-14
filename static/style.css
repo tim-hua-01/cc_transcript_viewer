@@ -1,19 +1,20 @@
 :root {
   /* Clean light */
-  --bg: #ffffff;
-  --bg-alt: #f6f7f8;
-  --bg-elev: #eef0f2;
-  --border: #e2e5e9;
-  --text: #111418;          /* near-black body text */
-  --muted: #5c6470;
+  --bg: #fffdfa;            /* warm white */
+  --bg-alt: #f7f3ec;        /* warm off-white field */
+  --bg-elev: #efe8dc;       /* warm raised surface */
+  --border: #e7e0d2;        /* warm hairline */
+  --text: #1c1813;          /* warm near-black */
+  --muted: #6b6258;         /* warm grey */
   --accent: #c0492a;        /* clay */
   --user: #1f6feb;          /* blue */
   --assistant: #c0492a;     /* clay */
   --thinking: #6b4fbb;      /* violet */
   --tool: #1f7a45;          /* green */
   --tool-err: #d1242f;      /* red */
-  --code-bg: #f4f5f7;
+  --code-bg: #f6f1e9;
   --radius: 10px;
+  --ease: .13s ease;
   --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
   --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
 }
@@ -49,8 +50,11 @@ body {
   display: flex; align-items: center; gap: 8px;
   font-weight: 600; font-size: 15px; margin-bottom: 10px;
 }
-.brand-mark { color: var(--accent); }
-#refresh { margin-left: auto; font-size: 11px; padding: 3px 8px; }
+/* A small square (not a diamond), sized to the cap height of the title. */
+.brand-mark {
+  width: 0.85em; height: 0.85em; flex: none; border-radius: 2px;
+  background: #2a55a0;  /* matches the blue square on tim-hua-01.github.io */
+}
 #search {
   width: 100%;
   padding: 8px 10px;
@@ -60,7 +64,8 @@ body {
   color: var(--text);
   font-size: 13px;
 }
-#search:focus { outline: none; border-color: var(--accent); }
+#search { transition: border-color var(--ease), box-shadow var(--ease); }
+#search:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px rgba(192,73,42,.12); }
 #sidebar-stats { margin-top: 8px; font-size: 11px; }
 
 #filter-row { display: flex; gap: 6px; margin-top: 8px; }
@@ -113,8 +118,10 @@ body {
   cursor: pointer;
   margin: 2px 2px;
   border: 1px solid transparent;
+  transition: background var(--ease), border-color var(--ease), box-shadow var(--ease), transform var(--ease);
 }
-.session-item:hover { background: var(--bg-elev); }
+.session-item:hover { background: var(--bg-elev); transform: translateY(-1px); box-shadow: 0 2px 8px rgba(0,0,0,.05); }
+.session-item.active:hover { transform: none; box-shadow: none; }
 .session-item.active { background: var(--bg-elev); border-color: var(--accent); }
 .session-item.subagent {
   margin-left: 14px;
@@ -147,8 +154,8 @@ body {
   font-size: 9px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em;
   padding: 2px 6px; border-radius: 5px; line-height: 1.4;
 }
-.agent-claude { background: rgba(192,73,42,.12); color: var(--assistant); }
-.agent-codex { background: rgba(31,111,235,.12); color: var(--user); }
+.agent-claude { background: #d4a27f; color: #141414; }
+.agent-codex { background: #141414; color: #fff; }
 .t-title .agent-tag { vertical-align: middle; margin-right: 8px; font-size: 11px; }
 .session-meta {
   margin-top: 4px; font-size: 11px; color: var(--muted);
@@ -218,7 +225,8 @@ body {
   box-shadow: 0 2px 10px rgba(0,0,0,.12);
   display: flex; align-items: center; justify-content: center;
 }
-.nav-btn:hover { border-color: var(--accent); color: var(--accent); }
+.nav-btn:hover { border-color: var(--accent); color: var(--accent); transform: translateY(-1px); box-shadow: 0 4px 12px rgba(0,0,0,.12); }
+.nav-btn:active { transform: scale(.94); }
 
 .welcome { max-width: 560px; margin: 12vh auto; padding: 24px; text-align: center; }
 .welcome h1 { font-weight: 600; }
@@ -247,6 +255,9 @@ body {
 }
 .btn:hover { border-color: var(--accent); }
 .btn.on { background: var(--accent); border-color: var(--accent); color: #fff; }
+.btn, .filter-chip, .dropdown-btn, .dd-clear, .nav-btn {
+  transition: background var(--ease), border-color var(--ease), color var(--ease), box-shadow var(--ease), transform var(--ease);
+}
 
 /* Turn blocks */
 .turn { margin: 14px 0; border-radius: var(--radius); border: 1px solid var(--border); overflow: hidden; }
@@ -256,8 +267,8 @@ body {
   padding: 7px 12px; font-size: 12px; font-weight: 600;
   border-bottom: 1px solid var(--border);
 }
-.turn-user .turn-head { color: var(--user); background: rgba(31,111,235,.08); border-color: rgba(31,111,235,.25); }
-.turn-assistant .turn-head { color: var(--assistant); background: rgba(192,73,42,.08); border-color: rgba(192,73,42,.25); }
+.turn-user .turn-head { color: var(--user); background: rgba(31,111,235,.055); border-color: rgba(31,111,235,.16); }
+.turn-assistant .turn-head { color: var(--assistant); background: rgba(192,73,42,.055); border-color: rgba(192,73,42,.16); }
 .turn-system .turn-head, .turn-attachment .turn-head { color: var(--muted); background: var(--bg-alt); }
 .turn-body { padding: 4px 14px 12px; }
 .turn-time { margin-left: auto; font-weight: 400; color: var(--muted); font-size: 11px; }

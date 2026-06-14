@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Agent Transcript Browser</title>
+  <title>Transcript Viewer</title>
   <link rel="stylesheet" href="/style.css" />
   <!-- markdown + sanitization, loaded from CDN; falls back to plain text if offline -->
   <script src="https://cdn.jsdelivr.net/npm/marked@12/marked.min.js"></script>
@@ -17,10 +17,8 @@
     <aside id="sidebar">
       <div id="sidebar-header">
         <div class="brand">
-          <span class="brand-mark">◆</span>
-          <span>Agent Transcripts</span>
-          <button id="refresh" class="btn" title="Rescan ~/.claude/projects and ~/.codex/sessions">↻ Refresh</button>
-          <button id="live-toggle" class="btn on" title="Auto-refresh the session list and the open transcript">● Live</button>
+          <span class="brand-mark"></span>
+          <span class="brand-name">Transcript Viewer</span>
         </div>
         <input id="search" type="search" placeholder="Search title, project, or id…" autocomplete="off" />
         <div id="filter-row">
@@ -36,7 +34,7 @@
 
     <main id="main">
       <div id="welcome" class="welcome">
-        <h1>Agent Transcript Browser</h1>
+        <h1>Transcript Viewer</h1>
         <p class="muted">Claude Code and Codex sessions, newest first. Select one on the
           left to view the full conversation — every prompt, response, thought, and tool call.</p>
         <ul class="legend">

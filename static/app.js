@@ -114,9 +114,8 @@ function fmtDuration(ms) {
 let SESSIONS = [];
 let CURRENT_FILE = null;
 let AGENT_FILTER = "all";
-// ---------- live auto-refresh ----------
-let LIVE = true;                 // poll for new/updated transcripts
-const POLL_MS = 1000;            // how often to rescan while Live is on
+// ---------- live auto-refresh (always on) ----------
+const POLL_MS = 1000;            // how often to rescan disk for changes
 let LAST_RENDERED_MTIME = 0;     // mtime of the open transcript as last rendered
 let LAST_SIG = "";               // cheap fingerprint of the session list
 // file -> snippet for the active content search, or null when no search is active
@@ -1130,20 +1129,10 @@ async function refreshSidebar() {
   markActive();
 }
 
-$("#refresh").addEventListener("click", async () => {
-  const btn = $("#refresh");
-  btn.textContent = "↻ …";
-  const res = await fetch("/api/sessions");
-  SESSIONS = ((await res.json()).sessions) || [];
-  LAST_SIG = sessionsSignature(SESSIONS);
-  await refreshSidebar();
-  btn.textContent = "↻ Refresh";
-});
-
-// ---------- live polling ----------
+// ---------- live polling (always on) ----------
 let polling = false;
 async function poll() {
-  if (!LIVE || polling) return;
+  if (polling) return;
   polling = true;
   try {
     let next;
@@ -1167,14 +1156,6 @@ async function poll() {
   }
 }
 setInterval(poll, POLL_MS);
-
-$("#live-toggle").addEventListener("click", () => {
-  LIVE = !LIVE;
-  const b = $("#live-toggle");
-  b.classList.toggle("on", LIVE);
-  b.textContent = LIVE ? "● Live" : "○ Live";
-  if (LIVE) poll(); // refresh immediately when re-enabled
-});
 
 document.addEventListener("keydown", (e) => {
   if (e.key === "/" && document.activeElement !== $("#search")) {
