@@ -8,7 +8,9 @@ It reads:
 - Claude Code transcripts from `~/.claude/projects/`
 - Codex transcripts from `~/.codex/sessions/` and `~/.codex/archived_sessions/`
 
-Nothing is uploaded anywhere; it's a read-only local web app.
+Nothing is uploaded anywhere; it's a read-only local web app that listens on loopback only. The
+server contains no outbound-network code at all, and a [test suite](#privacy--security) verifies it —
+so you can check that claim rather than take it on faith.
 
 > [!WARNING]
 > **This is vibe-coded.** It was built quickly and iteratively with an AI coding agent, so expect
@@ -28,13 +30,20 @@ Options:
 
 ```bash
 python3 server.py --port 8080            # use a different port
-python3 server.py --host 0.0.0.0         # listen on all interfaces (LAN access)
+python3 server.py --host 0.0.0.0         # listen on all interfaces (LAN access — opt-in)
 python3 server.py --projects-dir PATH    # different Claude Code projects directory
 python3 server.py --codex-home PATH      # different Codex home (default ~/.codex)
 ```
 
-The server re-scans both transcript locations on every request, so new sessions show up as soon as
-you hit **↻ Refresh** or reload the page.
+By default the server binds **127.0.0.1** (loopback only), so it isn't reachable from other machines
+unless you deliberately pass `--host 0.0.0.0`.
+
+The viewer **auto-refreshes**: while the **● Live** toggle (top of the sidebar) is on — the default —
+it polls about once a second and updates the sidebar **and the open transcript in place** as sessions
+change on disk, preserving your scroll position and which thinking/tool blocks you've expanded. So an
+active session you're watching tails live. Click **○ Live** to pause it, **↻ Refresh** to force a
+rescan, or just reload. Session metadata is cached by file mtime, so each poll only re-reads the
+files that actually changed — the cost doesn't grow with how many transcripts you've accumulated.
 
 ## Features
 
@@ -77,7 +86,31 @@ you hit **↻ Refresh** or reload the page.
   clickable headings and highlights the one you're reading as you scroll. Floating **↑ / ↓** buttons
   jump to the previous/next user prompt, and **⤓ Jump to end** (in the transcript controls) skips to
   the bottom.
+- **Live updates.** With the **● Live** toggle on (default), the sidebar and the transcript you're
+  reading refresh themselves about once a second — new sessions appear, and an in-progress session
+  tails as it's written — without disturbing your scroll position or your expanded/collapsed blocks.
 - **Deep-linkable:** the open session is stored in the URL hash, so you can bookmark/share a link.
+
+## Privacy & security
+
+This app reads your private transcripts, so it's built to keep them on your machine:
+
+- **No outbound network code.** The server imports only Python's standard-library `http.server`
+  (inbound), with no HTTP client, sockets, mail, or telemetry anywhere. Nothing is ever uploaded.
+- **Loopback by default.** It binds `127.0.0.1`; LAN exposure requires an explicit `--host 0.0.0.0`.
+- **File reads are confined.** `/api/session` only parses files under the transcript roots
+  (`~/.claude/projects`, `~/.codex`); `/api/local-image` only serves image files under your home
+  directory. Anything else returns `403`.
+
+These guarantees are enforced by a zero-dependency test suite — run it yourself:
+
+```bash
+python3 -m unittest test_security
+```
+
+It spins the server up on loopback, exercises every endpoint with a socket-level guard installed, and
+fails if any request dials a non-loopback host; it also statically asserts neither module imports a
+network client, that the default bind is loopback, and that the path-confinement checks above hold.
 
 ## Notes on Codex transcripts
 
@@ -139,9 +172,10 @@ Restart Claude Code (or run `/config` once) for the change to take effect. Note 
 
 | File | Role |
 |------|------|
-| `server.py` | The unified stdlib HTTP server. Scans both transcript roots into one time-sorted list, parses each Claude Code session into a clean event stream (pairing tool results to calls), dispatches `/api/session` to the right parser by transcript root, and serves the JSON API (`/api/sessions`, `/api/session?file=...`, `/api/search?q=...`, `/api/local-image`) plus the static frontend. Only files under the allowed roots are served. |
+| `server.py` | The unified stdlib HTTP server. Scans both transcript roots into one time-sorted list (caching per-file summaries by mtime), parses each Claude Code session into a clean event stream (pairing tool results to calls), dispatches `/api/session` to the right parser by transcript root, and serves the JSON API (`/api/sessions`, `/api/session?file=...`, `/api/search?q=...`, `/api/local-image`) plus the static frontend. `/api/session` only serves files under the allowed roots; `/api/local-image` only serves images under your home directory. |
 | `codex_server.py` | Codex parsing library (imported by `server.py`): parses rollout JSONL, reads `state_5.sqlite` metadata, pairs tool calls with outputs, and renders `apply_patch` diffs. Call `configure(codex_home)` to point it elsewhere. |
-| `static/index.html`, `static/style.css`, `static/app.js` | The single frontend (vanilla JS, no build step). `app.js` dispatches on event kind and renders both Claude Code (block-based) and Codex (flat) shapes. |
+| `static/index.html`, `static/style.css`, `static/app.js` | The single frontend (vanilla JS, no build step). `app.js` dispatches on event kind and renders both Claude Code (block-based) and Codex (flat) shapes, and runs the live-refresh poll loop. |
+| `test_security.py` | Zero-dependency security tests (`python3 -m unittest test_security`): asserts no outbound connections at runtime, no network-client imports, loopback default bind, and path-confinement on `/api/session` and `/api/local-image`. |
 
 ### Transcript format notes
 

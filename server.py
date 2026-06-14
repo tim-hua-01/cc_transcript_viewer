@@ -24,6 +24,9 @@ import codex_server as codex
 
 STATIC_DIR = Path(__file__).parent / "static"
 DEFAULT_PROJECTS_DIR = Path.home() / ".claude" / "projects"
+# Loopback only by default: the app reads private transcripts, so it must not be
+# reachable from the network unless the user deliberately overrides --host.
+DEFAULT_HOST = "127.0.0.1"
 
 # Set by main() so handlers can reach it.
 PROJECTS_DIR = DEFAULT_PROJECTS_DIR
@@ -776,6 +779,12 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json({"error": "missing path param"}, status=400)
                 return
             t = Path(path_arg).expanduser().resolve()
+            # Confine reads to the user's own home tree. The transcript roots and
+            # any images pasted into a session live under it; this stops the
+            # endpoint from serving arbitrary files (e.g. /etc, other users).
+            if not _under(t, Path.home()):
+                self._send_json({"error": "forbidden"}, status=403)
+                return
             content_type = mimetypes.guess_type(str(t))[0] or ""
             if not content_type.startswith("image/"):
                 self._send_json({"error": "not an image"}, status=400)
@@ -827,7 +836,7 @@ def main():
     global PROJECTS_DIR
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--port", type=int, default=3132)
-    ap.add_argument("--host", default="127.0.0.1")
+    ap.add_argument("--host", default=DEFAULT_HOST)
     ap.add_argument("--projects-dir", type=Path, default=DEFAULT_PROJECTS_DIR)
     ap.add_argument("--codex-home", type=Path, default=codex.DEFAULT_CODEX_HOME)
     args = ap.parse_args()

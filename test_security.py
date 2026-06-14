@@ -1,0 +1,191 @@
+#!/usr/bin/env python3
+"""Security tests for the transcript viewer.
+
+The viewer reads your private Claude Code / Codex transcripts, so the things
+that matter are: (1) it never sends them anywhere, and (2) it never serves
+files outside the directories it's meant to expose. These tests assert both,
+so anyone who downloads the project can verify the guarantees rather than
+trust them.
+
+Run with:  python -m unittest test_security    (zero dependencies, stdlib only)
+"""
+
+from __future__ import annotations
+
+import ast
+import json
+import socket
+import tempfile
+import threading
+import unittest
+import urllib.error
+import urllib.request
+from urllib.parse import quote
+from http.server import ThreadingHTTPServer
+from pathlib import Path
+
+import server
+import codex_server as codex
+
+
+# --------------------------------------------------------------------------- #
+# Outbound-connection guard: record any socket that dials a non-loopback host.
+# --------------------------------------------------------------------------- #
+_real_connect = socket.socket.connect
+_real_connect_ex = socket.socket.connect_ex
+OUTBOUND: list = []
+
+
+def _is_loopback(addr) -> bool:
+    try:
+        host = addr[0]
+    except (TypeError, IndexError, KeyError):
+        return True  # AF_UNIX / odd address — local IPC, not remote exfiltration
+    host = str(host)
+    return host in ("127.0.0.1", "::1", "localhost") or host.startswith("127.")
+
+
+def _guard(real):
+    def wrapper(self, addr, *a, **kw):
+        if self.family in (socket.AF_INET, socket.AF_INET6) and not _is_loopback(addr):
+            OUTBOUND.append(tuple(addr) if isinstance(addr, tuple) else addr)
+        return real(self, addr, *a, **kw)
+    return wrapper
+
+
+def _write_fixture_session(projects_dir: Path) -> Path:
+    """A minimal but valid Claude Code transcript so endpoints have real data."""
+    proj = projects_dir / "-tmp-proj"
+    proj.mkdir(parents=True, exist_ok=True)
+    f = proj / "11111111-1111-1111-1111-111111111111.jsonl"
+    records = [
+        {"type": "user", "timestamp": "2024-01-01T00:00:00Z", "cwd": "/tmp/proj",
+         "message": {"role": "user", "content": "hello world"}},
+        {"type": "assistant", "timestamp": "2024-01-01T00:00:01Z",
+         "message": {"role": "assistant", "model": "claude-test",
+                     "content": [{"type": "text", "text": "hi there"}]}},
+    ]
+    f.write_text("\n".join(json.dumps(r) for r in records) + "\n")
+    return f
+
+
+class SecurityTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        # Route the server at hermetic temp dirs (fast + deterministic).
+        cls._tmp = tempfile.TemporaryDirectory()
+        tmp = Path(cls._tmp.name)
+        cls.projects_dir = tmp / "projects"
+        cls.projects_dir.mkdir()
+        cls.fixture = _write_fixture_session(cls.projects_dir)
+        server.PROJECTS_DIR = cls.projects_dir
+        codex.configure(tmp / "codex")  # empty -> no codex sessions
+
+        # Install the outbound-connection guard for the whole class.
+        socket.socket.connect = _guard(_real_connect)
+        socket.socket.connect_ex = _guard(_real_connect_ex)
+
+        # Serve on an ephemeral loopback port in a background thread.
+        cls.httpd = ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
+        cls.port = cls.httpd.server_address[1]
+        cls.thread = threading.Thread(target=cls.httpd.serve_forever, daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+        cls.thread.join(timeout=5)
+        socket.socket.connect = _real_connect
+        socket.socket.connect_ex = _real_connect_ex
+        cls._tmp.cleanup()
+
+    def get(self, path: str):
+        url = f"http://127.0.0.1:{self.port}{path}"
+        try:
+            with urllib.request.urlopen(url, timeout=5) as r:
+                return r.status, r.headers, r.read()
+        except urllib.error.HTTPError as e:
+            return e.code, e.headers, e.read()
+
+    # ----- exfiltration guarantees ----------------------------------------- #
+
+    def test_runtime_makes_no_outbound_connections(self):
+        """Exercising every endpoint must not dial any non-loopback host."""
+        OUTBOUND.clear()
+        for path in ["/", "/app.js", "/style.css", "/api/sessions",
+                     "/api/search?q=hello",
+                     "/api/session?file=" + quote(str(self.fixture))]:
+            self.get(path)
+        self.assertEqual(OUTBOUND, [], f"server made outbound connections: {OUTBOUND}")
+
+    def test_default_bind_is_loopback(self):
+        """The server must default to 127.0.0.1, not a network-exposed address."""
+        self.assertEqual(server.DEFAULT_HOST, "127.0.0.1")
+
+    def test_no_network_client_imports(self):
+        """Neither module may import an outbound network client / mail / ftp lib."""
+        forbidden_roots = {
+            "requests", "httpx", "aiohttp", "urllib3", "socket",
+            "smtplib", "ftplib", "telnetlib", "poplib", "imaplib",
+            "websocket", "websockets", "paramiko", "boto3", "google",
+        }
+        forbidden_full = {"urllib.request", "urllib.error", "http.client"}
+        for mod_path in (Path("server.py"), Path("codex_server.py")):
+            tree = ast.parse(mod_path.read_text())
+            imported = set()
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    imported.update(n.name for n in node.names)
+                elif isinstance(node, ast.ImportFrom) and node.module:
+                    imported.add(node.module)
+            for name in imported:
+                root = name.split(".")[0]
+                self.assertNotIn(root, forbidden_roots,
+                                 f"{mod_path} imports {name} (root {root})")
+                self.assertNotIn(name, forbidden_full,
+                                 f"{mod_path} imports {name}")
+
+    # ----- arbitrary-file-read guarantees ---------------------------------- #
+
+    def test_session_outside_roots_is_forbidden(self):
+        """A real file outside the transcript roots must not be parseable."""
+        status, _, _ = self.get("/api/session?file=" + quote("/etc/hosts"))
+        self.assertEqual(status, 403)
+
+    def test_session_inside_roots_ok(self):
+        status, _, body = self.get(
+            "/api/session?file=" + quote(str(self.fixture)))
+        self.assertEqual(status, 200)
+        self.assertNotIn(b"forbidden", body)
+
+    def test_local_image_outside_home_is_forbidden(self):
+        """An image file outside the user's home tree must be refused."""
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=True) as tf:
+            tf.write(b"\x89PNG\r\n\x1a\n")
+            tf.flush()
+            outside = Path(tf.name).resolve()
+            self.assertFalse(server._under(outside, Path.home()),
+                             "test fixture must be outside $HOME to be meaningful")
+            status, _, _ = self.get(
+                "/api/local-image?path=" + quote(str(outside)))
+            self.assertEqual(status, 403)
+
+    def test_local_image_inside_home_ok(self):
+        """A genuine image under the home tree is still served (control case)."""
+        d = Path(tempfile.mkdtemp(dir=Path.home()))
+        try:
+            img = d / "shot.png"
+            img.write_bytes(b"\x89PNG\r\n\x1a\n")
+            status, headers, _ = self.get(
+                "/api/local-image?path=" + quote(str(img)))
+            self.assertEqual(status, 200)
+            self.assertTrue(headers.get("Content-Type", "").startswith("image/"))
+        finally:
+            for p in d.iterdir():
+                p.unlink()
+            d.rmdir()
+
+
+if __name__ == "__main__":
+    unittest.main()
