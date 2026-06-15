@@ -372,6 +372,11 @@ pre.payload.truncatable { max-height: 240px; }
   color: var(--muted);
   background: var(--bg-alt);
 }
+.turn-instructions .turn-head {
+  color: var(--thinking);
+  background: rgba(107,79,187,.05);
+  border-color: rgba(107,79,187,.18);
+}
 
 .token-event { display: none; opacity: .72; }
 body.show-tokens .token-event { display: block; }
@@ -381,14 +386,14 @@ body.show-tokens .token-event { display: block; }
   background: var(--bg-elev); color: var(--muted);
 }
 
-.status-block { margin: 4px 0; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; background: var(--bg-alt); }
-.status-block .tool-head {
+.status-block, .instructions-block { margin: 4px 0; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; background: var(--bg-alt); }
+.status-block .tool-head, .instructions-block .tool-head {
   cursor: pointer; user-select: none; display: flex; align-items: center; gap: 8px;
   padding: 7px 12px; font-size: 12.5px;
 }
-.status-block .tool-head .chev { font-size: 9px; transition: transform .15s; color: var(--muted); }
-.status-block.collapsed .chev { transform: rotate(-90deg); }
-.status-block.collapsed .tool-body { display: none; }
+.status-block .tool-head .chev, .instructions-block .tool-head .chev { font-size: 9px; transition: transform .15s; color: var(--muted); }
+.status-block.collapsed .chev, .instructions-block.collapsed .chev { transform: rotate(-90deg); }
+.status-block.collapsed .tool-body, .instructions-block.collapsed .tool-body { display: none; }
 
 .token-grid {
   display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 6px;

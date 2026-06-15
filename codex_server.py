@@ -81,6 +81,33 @@ def _extract_text_content(content) -> str:
     return ""
 
 
+def _instruction_label(role: str, text: str) -> str:
+    """Human label for an injected instruction/context message."""
+    head = (text or "").lstrip()
+    if head.startswith("<environment_context>"):
+        return "Environment context"
+    if head.startswith("<user_instructions>"):
+        return "User instructions (AGENTS.md)"
+    if role == "developer":
+        return "Developer instructions"
+    if role == "system":
+        return "System prompt"
+    return "Context"
+
+
+def _base_instructions_text(value) -> str:
+    """Codex stores the base system prompt in session_meta.base_instructions,
+    usually as {"text": ...} (sometimes a JSON-encoded string)."""
+    if isinstance(value, dict):
+        return value.get("text") or ""
+    if isinstance(value, str):
+        parsed = _parse_json_string(value)
+        if isinstance(parsed, dict) and "text" in parsed:
+            return parsed.get("text") or ""
+        return value
+    return ""
+
+
 def _first_user_message(records: list[dict]) -> str:
     for rec in records:
         if rec.get("type") != "event_msg":
@@ -419,11 +446,19 @@ def parse_session(path: Path) -> dict:
     tool_calls: dict[str, dict] = {}
     tool_outputs: dict[str, dict] = {}
     web_searches: dict[str, dict] = {}
+    # Normalized text of every real user prompt (event_msg user_message). Used to
+    # tell injected context (environment_context, AGENTS.md) apart from the prompt
+    # when a `message` response_item repeats the user's turn.
+    user_event_texts: set[str] = set()
 
     for rec in records:
         payload = rec.get("payload") or {}
         if rec.get("type") == "session_meta":
             meta.update(payload)
+        elif rec.get("type") == "event_msg" and payload.get("type") == "user_message":
+            msg = payload.get("message")
+            if msg:
+                user_event_texts.add(" ".join(str(msg).split()))
         elif rec.get("type") == "turn_context":
             turn_id = payload.get("turn_id")
             if turn_id:
@@ -517,6 +552,15 @@ def parse_session(path: Path) -> dict:
         payload = rec.get("payload") or {}
 
         if typ == "session_meta":
+            base = _base_instructions_text(payload.get("base_instructions"))
+            if base:
+                events.append(
+                    _event_payload(
+                        "instructions",
+                        ts,
+                        {"role": "system", "label": "Base instructions", "text": base},
+                    )
+                )
             continue
 
         if typ == "turn_context":
@@ -666,6 +710,24 @@ def parse_session(path: Path) -> dict:
                     },
                 )
             )
+        elif pt == "message":
+            # Real user/assistant turns arrive as event_msg; the `message`
+            # response_items repeat them plus carry the injected system prompt
+            # (developer/system) and context (environment_context, AGENTS.md),
+            # which is otherwise never surfaced. Emit only the latter.
+            role = payload.get("role") or ""
+            text = _extract_text_content(payload.get("content"))
+            if text.strip() and (
+                role in {"developer", "system"}
+                or (role == "user" and " ".join(text.split()) not in user_event_texts)
+            ):
+                events.append(
+                    _event_payload(
+                        "instructions",
+                        ts,
+                        {"role": role, "label": _instruction_label(role, text), "text": text},
+                    )
+                )
         elif pt == "web_search_call":
             action = payload.get("action") or {}
             call_id = payload.get("call_id")
@@ -683,6 +745,7 @@ def parse_session(path: Path) -> dict:
             )
 
     title = _first_user_message(records) or title
+    meta.pop("base_instructions", None)  # surfaced as an instructions event instead
 
     return {
         "id": meta.get("id") or _thread_id_from_path(path),

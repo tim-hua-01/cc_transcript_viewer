@@ -435,7 +435,7 @@ function captureView() {
   const main = $("#main");
   const atBottom = main.scrollHeight - main.scrollTop - main.clientHeight < 40;
   const expanded = {};
-  for (const sel of [".thinking-block", ".tool-block", ".status-block"])
+  for (const sel of [".thinking-block", ".tool-block", ".status-block", ".instructions-block"])
     expanded[sel] = $$(sel).map((n) => !n.classList.contains("collapsed"));
   return { top: main.scrollTop, atBottom, expanded };
 }
@@ -558,6 +558,7 @@ function renderEvent(ev) {
   switch (ev.kind) {
     case "user": return renderUser(ev);
     case "assistant": return renderAssistant(ev);
+    case "instructions": return renderInstructions(ev);
     case "system": return renderSystem(ev);
     case "attachment": return renderAttachment(ev);
     case "reasoning": return turnShell("reasoning", "Reasoning", ev, [renderReasoning(ev)]);
@@ -665,6 +666,17 @@ function renderReasoning(ev) {
       );
   block.append(head, body);
   return block;
+}
+
+// Codex injected system prompt / context (developer instructions, base prompt,
+// environment_context, AGENTS.md). Collapsed by default — it's large and static.
+function renderInstructions(ev) {
+  const block = collapsibleBlock(
+    "instructions-block collapsed",
+    ev.label || "Instructions",
+    [preFrom(ev.text || "", "payload")]
+  );
+  return turnShell("instructions", "📋 Instructions", ev, [block]);
 }
 
 function renderSystem(ev) {
