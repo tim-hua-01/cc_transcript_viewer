@@ -15,7 +15,9 @@ from __future__ import annotations
 import argparse
 import json
 import mimetypes
+import os
 import re
+from concurrent.futures import ProcessPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -197,10 +199,270 @@ def _subagent_meta(path: Path, records: list[dict]) -> dict | None:
     }
 
 
+def _subagents_dir_for(path: Path) -> Path:
+    """The directory holding a session's sub-agent transcripts.
+
+    For a sub-agent file the dir is its own parent; for a top-level session file
+    ``<project>/<id>.jsonl`` the sub-agents live in ``<project>/<id>/subagents``.
+    """
+    if path.parent.name == "subagents":
+        return path.parent
+    return path.parent / path.stem / "subagents"
+
+
+# Cache: subagents-dir -> (mtime, {"by_id": {toolUseId: file}, "by_prompt": [(prefix, file)]})
+_SUBAGENT_INDEX_CACHE: dict[str, tuple[float, dict]] = {}
+
+
+def _subagent_index(subagents_dir: Path) -> dict:
+    """Map a session's Task/Agent tool calls to the sub-agent files they spawned.
+
+    All of a session's sub-agents (and their sub-agents, recursively) are stored
+    flat in one ``subagents/`` dir. Each ``agent-<id>.jsonl`` has a sibling
+    ``agent-<id>.meta.json`` that carries the spawning ``toolUseId`` when known —
+    an exact link. When it's absent (e.g. fleet/teammate agents), we fall back to
+    matching the sub-agent's first prompt against the Task call's prompt prefix.
+
+    Keyed on the dir's mtime so a single index serves every Task block at every
+    nesting depth and is rebuilt only when a sub-agent is added or rewritten.
+    """
+    empty = {"by_id": {}, "by_prompt": [], "agents": []}
+    if not subagents_dir.is_dir():
+        return empty
+    key = str(subagents_dir)
+    try:
+        mtime = subagents_dir.stat().st_mtime
+    except OSError:
+        return empty
+    cached = _SUBAGENT_INDEX_CACHE.get(key)
+    if cached and cached[0] == mtime:
+        return cached[1]
+
+    by_id: dict[str, str] = {}
+    by_prompt: list[tuple[str, str]] = []
+    agents: list[dict] = []
+    for f in sorted(subagents_dir.glob("agent-*.jsonl")):
+        fstr = str(f)
+        info = _subagent_file_info(f)
+        if info["tool_use_id"]:
+            by_id[info["tool_use_id"]] = fstr
+        # A fleet/teammate agent wraps its real prompt in <teammate-message …>; we
+        # index both the wrapped and unwrapped forms so prompt-matching works.
+        if info["inner"]:
+            by_prompt.append((info["inner"][:300], fstr))
+        if info["prompt"]:
+            by_prompt.append((info["prompt"][:300], fstr))
+        title = info["description"] or info["summary"] or (info["inner"] or info["prompt"])[:120] or "(sub-agent)"
+        agents.append({
+            "file": fstr,
+            "id": f.stem.replace("agent-", ""),
+            "agent_type": info["agent_type"],
+            "title": title,
+            "first_ts": info.get("first_ts", ""),
+        })
+
+    index = {"by_id": by_id, "by_prompt": by_prompt, "agents": agents}
+    _SUBAGENT_INDEX_CACHE[key] = (mtime, index)
+    return index
+
+
+# Cache: agent file path -> (meta_mtime, info dict). A sub-agent's first prompt and
+# meta are immutable once written, so we re-read a file only when its .meta.json
+# changes — keeping live-session index rebuilds O(stat), not O(read), per file.
+_SUBAGENT_FILE_CACHE: dict[str, tuple[float, dict]] = {}
+
+
+def _subagent_file_info(f: Path) -> dict:
+    meta_path = f.with_suffix(".meta.json")
+    try:
+        meta_mtime = meta_path.stat().st_mtime
+    except OSError:
+        meta_mtime = 0.0
+    cached = _SUBAGENT_FILE_CACHE.get(str(f))
+    if cached and cached[0] == meta_mtime:
+        return cached[1]
+
+    tool_use_id = agent_type = description = ""
+    if meta_mtime:
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            tool_use_id = meta.get("toolUseId") or ""
+            agent_type = meta.get("agentType") or ""
+            description = meta.get("description") or ""
+        except (OSError, ValueError):
+            pass
+    # Stream records and stop at the first user prompt — never read the whole
+    # (often multi-MB) sub-agent file just to title/place it.
+    prompt = ""
+    first_ts = ""
+    try:
+        for rec in _iter_records(f):
+            if not first_ts and rec.get("timestamp"):
+                first_ts = rec["timestamp"]
+            if rec.get("type") == "user":
+                prompt = _subagent_first_user_text([rec])
+                if prompt:
+                    break
+    except OSError:
+        pass
+    summary, inner = _unwrap_teammate(prompt)
+    info = {
+        "tool_use_id": tool_use_id,
+        "agent_type": agent_type,
+        "description": description,
+        "prompt": prompt,
+        "summary": summary,
+        "inner": inner,
+        "first_ts": first_ts,
+    }
+    _SUBAGENT_FILE_CACHE[str(f)] = (meta_mtime, info)
+    return info
+
+
+def _unwrap_teammate(prompt: str):
+    """Split a possible <teammate-message summary="…">body</…> wrapper.
+
+    Returns (summary, body). Both empty when there is no wrapper. Lets fleet/
+    teammate sub-agents (whose first message is wrapped) match their spawning
+    Task prompt and get a readable title.
+    """
+    if not prompt or "<teammate-message" not in prompt:
+        return "", ""
+    m = re.search(r'<teammate-message[^>]*\bsummary="([^"]*)"', prompt)
+    summary = m.group(1) if m else ""
+    body = re.sub(r"^.*?<teammate-message[^>]*>", "", prompt, count=1, flags=re.S)
+    body = re.sub(r"</teammate-message>\s*$", "", body, flags=re.S).strip()
+    return summary, body
+
+
+def _resolve_subagent_file(index: dict, tool_use_id: str, prompt: str) -> str:
+    """Find the sub-agent file a Task/Agent call spawned, by id then prompt prefix."""
+    if tool_use_id and tool_use_id in index["by_id"]:
+        return index["by_id"][tool_use_id]
+    needle = " ".join((prompt or "").split())[:300]
+    if needle:
+        for prefix, fstr in index["by_prompt"]:
+            if prefix and prefix[:200] == needle[:200]:
+                return fstr
+    return ""
+
+
 # Cache: file path -> (mtime, summary dict). Keeps the /api/sessions poll from
 # re-reading and re-parsing every transcript on every request; only files whose
-# mtime moved are rebuilt.
+# mtime moved are rebuilt. This is also persisted to disk (see CACHE_FILE) so a
+# server restart doesn't trigger a multi-minute cold rescan of every transcript.
 _SUMMARY_CACHE: dict[str, tuple[float, dict]] = {}
+
+# Where the persisted summary cache lives. Parsing every transcript from scratch
+# can take minutes on a large history (gigabytes of JSONL); persisting the
+# per-file summaries keyed by mtime makes every run after the first one instant,
+# and incremental thereafter (only changed files are re-parsed).
+CACHE_FILE = Path.home() / ".cache" / "transcript_viewer" / "summaries.json"
+_CACHE_LOADED = False
+_LAST_SAVED_SIG: tuple | None = None
+
+
+def _cache_signature() -> tuple:
+    """Cheap fingerprint of both caches; changes whenever an entry is added or its mtime moves."""
+    cc = len(_SUMMARY_CACHE)
+    cc_m = 0.0
+    for m, _ in _SUMMARY_CACHE.values():
+        cc_m += m or 0
+    cx = codex._SUMMARY_CACHE
+    cx_m = 0.0
+    for v in cx.values():
+        cx_m += v[0] or 0
+    return (cc, round(cc_m, 3), len(cx), round(cx_m, 3))
+
+
+def load_caches() -> None:
+    """Load persisted summaries from disk into both in-memory caches (best effort)."""
+    global _CACHE_LOADED, _LAST_SAVED_SIG
+    _CACHE_LOADED = True
+    try:
+        data = json.loads(CACHE_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    for key, val in (data.get("cc") or {}).items():
+        try:
+            _SUMMARY_CACHE[key] = (float(val[0]), val[1])
+        except (TypeError, ValueError, IndexError):
+            continue
+    codex.load_cache(data.get("codex") or {})
+    _LAST_SAVED_SIG = _cache_signature()
+
+
+def save_caches() -> None:
+    """Persist both summary caches to disk, but only when something changed."""
+    global _LAST_SAVED_SIG
+    try:
+        sig = _cache_signature()
+        if sig == _LAST_SAVED_SIG:
+            return
+        # Snapshot the live caches with list() before building the payload; under
+        # ThreadingHTTPServer another request may be mutating them concurrently.
+        payload = {
+            "cc": {k: [m, s] for k, (m, s) in list(_SUMMARY_CACHE.items())},
+            "codex": codex.dump_cache(),
+        }
+    except RuntimeError:
+        return  # a concurrent request mutated a cache mid-iteration; next save retries
+    try:
+        CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = CACHE_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(payload), encoding="utf-8")
+        tmp.replace(CACHE_FILE)
+        _LAST_SAVED_SIG = sig
+    except OSError:
+        pass
+
+
+def _summary_worker(path_str: str):
+    """Process-pool worker: parse one Claude Code transcript into its summary."""
+    p = Path(path_str)
+    try:
+        mtime = p.stat().st_mtime
+        return (path_str, mtime, _cc_session_summary_uncached(p))
+    except Exception:  # noqa: BLE001 — a bad file shouldn't abort the whole scan
+        return (path_str, 0.0, None)
+
+
+# Below this many cold (uncached) files we just parse serially — the process-pool
+# spin-up isn't worth it for a handful of changed transcripts.
+_PARALLEL_THRESHOLD = 32
+
+
+def _prefill_cc_cache(files: list[Path]) -> None:
+    """Warm the Claude Code summary cache for any stale files, in parallel when cold."""
+    stale: list[str] = []
+    for f in files:
+        try:
+            mtime = f.stat().st_mtime
+        except OSError:
+            continue
+        cached = _SUMMARY_CACHE.get(str(f))
+        if not (cached and cached[0] == mtime):
+            stale.append(str(f))
+
+    if not stale:
+        return
+
+    workers = min(os.cpu_count() or 1, 8)
+    if len(stale) >= _PARALLEL_THRESHOLD and workers > 1:
+        try:
+            with ProcessPoolExecutor(max_workers=workers) as ex:
+                for path_str, mtime, summary in ex.map(_summary_worker, stale, chunksize=8):
+                    if summary is not None:
+                        _SUMMARY_CACHE[path_str] = (mtime, summary)
+            return
+        except Exception:  # noqa: BLE001 — fall back to serial if the pool can't start
+            pass
+
+    for path_str in stale:
+        try:
+            cc_session_summary(Path(path_str))  # computes and caches in-process
+        except (OSError, ValueError):
+            continue
 
 
 def cc_session_summary(path: Path) -> dict:
@@ -332,6 +594,10 @@ def _normalize_tool_result_content(content) -> dict:
 def parse_cc_session(path: Path) -> dict:
     """Full structured parse of one Claude Code session, ready for rendering."""
     records = list(_iter_records(path))
+
+    # Index of this session's sub-agents so each Task/Agent call can point at the
+    # transcript it spawned (rendered inline, lazily, by the frontend).
+    sub_index = _subagent_index(_subagents_dir_for(path))
 
     results_by_id: dict[str, dict] = {}
     for rec in records:
@@ -485,16 +751,22 @@ def parse_cc_session(path: Path) -> dict:
                 elif bt == "tool_use":
                     tid = b.get("id")
                     result = results_by_id.get(tid)
-                    blocks.append(
-                        {
-                            "type": "tool_use",
-                            "id": tid,
-                            "name": b.get("name"),
-                            "input": b.get("input", {}),
-                            "caller": b.get("caller"),
-                            "result": result,
-                        }
-                    )
+                    name = b.get("name")
+                    inp = b.get("input", {})
+                    block = {
+                        "type": "tool_use",
+                        "id": tid,
+                        "name": name,
+                        "input": inp,
+                        "caller": b.get("caller"),
+                        "result": result,
+                    }
+                    if name in ("Task", "Agent"):
+                        prompt = inp.get("prompt", "") if isinstance(inp, dict) else ""
+                        sub_file = _resolve_subagent_file(sub_index, tid, prompt)
+                        if sub_file:
+                            block["subagent_file"] = sub_file
+                    blocks.append(block)
             if not blocks:
                 continue
             usage = msg.get("usage", {}) or {}
@@ -527,6 +799,10 @@ def parse_cc_session(path: Path) -> dict:
         or "(untitled session)",
         "meta": meta,
         "events": events,
+        # Every sub-agent this session spawned (flat, including nested ones),
+        # surfaced as a section so they're reachable even when they can't be tied
+        # to a specific Task call (e.g. fleet/teammate agents).
+        "subagents": sub_index.get("agents", []),
     }
     if sub_meta:
         out["is_subagent"] = True
@@ -541,23 +817,29 @@ def parse_cc_session(path: Path) -> dict:
 # ---------------------------------------------------------------------------
 def list_sessions() -> list[dict]:
     """Flat list of every Claude Code and Codex session, newest first."""
+    if not _CACHE_LOADED:
+        load_caches()
+
     out: list[dict] = []
 
     if PROJECTS_DIR.exists():
+        cc_files: list[Path] = []
         for proj_dir in sorted(PROJECTS_DIR.iterdir()):
             if not proj_dir.is_dir():
                 continue
-            for f in proj_dir.glob("*.jsonl"):
-                try:
-                    out.append(cc_session_summary(f))
-                except (OSError, ValueError):
-                    continue
+            cc_files.extend(proj_dir.glob("*.jsonl"))
             # Sub-agents live one level down: <session-id>/subagents/agent-*.jsonl
-            for sub in proj_dir.glob("*/subagents/*.jsonl"):
-                try:
-                    out.append(cc_session_summary(sub))
-                except (OSError, ValueError):
-                    continue
+            cc_files.extend(proj_dir.glob("*/subagents/*.jsonl"))
+
+        # Warm the cache (in parallel on a cold start) before building summaries,
+        # so the expensive first scan uses every core instead of one.
+        _prefill_cc_cache(cc_files)
+
+        for f in cc_files:
+            try:
+                out.append(cc_session_summary(f))
+            except (OSError, ValueError):
+                continue
 
     try:
         for group in codex.list_sessions():
@@ -566,6 +848,9 @@ def list_sessions() -> list[dict]:
                 out.append(s)
     except Exception:  # noqa: BLE001 — never let Codex errors hide CC sessions
         pass
+
+    # Persist whatever we just (re)parsed so the next start is instant.
+    save_caches()
 
     out.sort(key=lambda s: s.get("mtime") or 0, reverse=True)
 
@@ -754,6 +1039,32 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _send_index(self):
+        """Serve index.html with app.js/style.css versioned by their mtime.
+
+        A changing query string forces the browser to fetch fresh assets after an
+        update, so a stale cached app.js can never linger across runs.
+        """
+        try:
+            html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+        except OSError:
+            self.send_error(404)
+            return
+        ver = 0
+        for name in ("app.js", "style.css"):
+            try:
+                ver = max(ver, int((STATIC_DIR / name).stat().st_mtime))
+            except OSError:
+                pass
+        html = html.replace("/app.js", f"/app.js?v={ver}").replace("/style.css", f"/style.css?v={ver}")
+        body = html.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+        self.end_headers()
+        self.wfile.write(body)
+
     def _send_file(self, path: Path, content_type: str):
         try:
             body = path.read_bytes()
@@ -763,6 +1074,9 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
+        # The frontend is served from disk and changes between runs; never let the
+        # browser serve a stale app.js/style.css from its cache.
+        self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
         self.end_headers()
         self.wfile.write(body)
 
@@ -792,7 +1106,7 @@ class Handler(BaseHTTPRequestHandler):
         route = parsed.path
 
         if route == "/" or route == "/index.html":
-            self._send_file(STATIC_DIR / "index.html", "text/html; charset=utf-8")
+            self._send_index()
             return
         if route == "/app.js":
             self._send_file(STATIC_DIR / "app.js", "application/javascript; charset=utf-8")
@@ -874,12 +1188,15 @@ def main():
     # deliberately binds elsewhere for LAN access, step aside so it still works.
     HOST_CHECK = args.host in LOOPBACK_HOSTS
 
+    load_caches()
+
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     url = f"http://{args.host}:{args.port}/"
     print("Claude Code + Codex transcript browser")
     print(f"  claude projects: {PROJECTS_DIR}")
     print(f"  codex sessions:  {codex.SESSIONS_DIR}")
     print(f"  serving at:      {url}")
+    print(f"  summary cache:   {CACHE_FILE}")
     print("  (Ctrl-C to stop)")
     try:
         server.serve_forever()

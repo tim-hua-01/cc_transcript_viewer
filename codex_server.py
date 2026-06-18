@@ -163,7 +163,47 @@ def _iso_from_ms(ms) -> str:
         return ""
 
 
+# Cache: path -> (mtime, row_signature, summary). Like the Claude Code cache in
+# server.py, this keeps the /api/sessions poll from re-parsing every rollout on
+# every request; it is also persisted to disk by server.py so a restart doesn't
+# trigger a full cold rescan. The row_signature guards against stale sqlite
+# metadata (title/cwd/model fallbacks) that can change without the file's mtime.
+_SUMMARY_CACHE: dict[str, tuple] = {}
+
+
+def _row_sig(thread_row: dict | None) -> float:
+    row = thread_row or {}
+    return float(row.get("updated_at_ms") or row.get("updated_at") or 0)
+
+
+def load_cache(data: dict) -> None:
+    """Populate the in-memory summary cache from a persisted dict (path -> [mtime, row_sig, summary])."""
+    for key, val in (data or {}).items():
+        try:
+            _SUMMARY_CACHE[key] = (float(val[0]), float(val[1]), val[2])
+        except (TypeError, ValueError, IndexError):
+            continue
+
+
+def dump_cache() -> dict:
+    """Serialize the in-memory summary cache for persistence."""
+    return {k: [m, sig, summ] for k, (m, sig, summ) in _SUMMARY_CACHE.items()}
+
+
 def session_summary(path: Path, thread_row: dict | None = None) -> dict:
+    key = str(path)
+    st = _safe_stat(path)
+    mtime = st.st_mtime if st else 0
+    sig = _row_sig(thread_row)
+    cached = _SUMMARY_CACHE.get(key)
+    if cached and cached[0] == mtime and cached[1] == sig:
+        return cached[2]
+    summary = _session_summary_uncached(path, thread_row)
+    _SUMMARY_CACHE[key] = (mtime, sig, summary)
+    return summary
+
+
+def _session_summary_uncached(path: Path, thread_row: dict | None = None) -> dict:
     records = list(_iter_records(path))
     meta = {}
     first_ts = None

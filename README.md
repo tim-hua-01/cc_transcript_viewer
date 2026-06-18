@@ -45,6 +45,10 @@ active session you're watching tails live. Click **○ Live** to pause it, **↻
 rescan, or just reload. Session metadata is cached by file mtime, so each poll only re-reads the
 files that actually changed — the cost doesn't grow with how many transcripts you've accumulated.
 
+The summary cache is also **persisted to disk** (`~/.cache/transcript_viewer/summaries.json`) and the
+first cold scan is **parallelized across CPU cores**, so the very first run on a large history takes
+seconds rather than minutes, and every run after that loads near-instantly.
+
 ## Features
 
 - **One sidebar, sorted by time.** Every Claude Code and Codex session in a single flat list, newest
@@ -82,10 +86,20 @@ files that actually changed — the cost doesn't grow with how many transcripts 
   matched back to the `Task`/`Agent` call that spawned it (others — e.g. compaction agents — fall back
   to their opening prompt), and its transcript view links **↑ parent session**. Older transcripts that
   inline sub-agent turns as `isSidechain` records still render those turns inline, flagged **sub-agent**.
+- **Sub-agents inline, in place.** Within a parent transcript, each spawned sub-agent also appears
+  **right where it was spawned** — under the `Task`/`Agent` call that launched it (linked exactly via
+  the `…​.meta.json` `toolUseId`, with a first-prompt fallback), or, for fleet/teammate agents that
+  aren't tied to a single call, slotted into the timeline by their start timestamp. Click one to expand
+  its **full transcript inline** (fetched lazily — these files are large), recursively for agents that
+  spawn their own. `<teammate-message>` wrappers are unwrapped for clean titles and matching.
+- **Collapsible panels & copy.** The sessions sidebar and the right-hand outline each have a **«**
+  collapse toggle (a small edge button brings them back), and **⧉ Copy all** in the transcript controls
+  copies the whole conversation as plain text.
 - **Jump between prompts.** A right-side **outline** lists the top-level user messages as truncated,
   clickable headings and highlights the one you're reading as you scroll. Floating **↑ / ↓** buttons
   jump to the previous/next user prompt, and **⤓ Jump to end** (in the transcript controls) skips to
-  the bottom.
+  the bottom. Large transcripts render in time-sliced chunks, so even a session with tens of thousands
+  of turns stays responsive while it streams in.
 - **Live updates.** With the **● Live** toggle on (default), the sidebar and the transcript you're
   reading refresh themselves about once a second — new sessions appear, and an in-progress session
   tails as it's written — without disturbing your scroll position or your expanded/collapsed blocks.
@@ -178,9 +192,9 @@ Restart Claude Code (or run `/config` once) for the change to take effect. Note 
 
 | File | Role |
 |------|------|
-| `server.py` | The unified stdlib HTTP server. Scans both transcript roots into one time-sorted list (caching per-file summaries by mtime), parses each Claude Code session into a clean event stream (pairing tool results to calls), dispatches `/api/session` to the right parser by transcript root, and serves the JSON API (`/api/sessions`, `/api/session?file=...`, `/api/search?q=...`, `/api/local-image`) plus the static frontend. `/api/session` only serves files under the allowed roots; `/api/local-image` serves only image-typed files; and a `Host`-header allowlist guards the loopback server against DNS rebinding. |
+| `server.py` | The unified stdlib HTTP server. Scans both transcript roots into one time-sorted list (caching per-file summaries by mtime, **persisted to disk** and warmed by a **parallel** first scan), parses each Claude Code session into a clean event stream (pairing tool results to calls, and linking each `Task`/`Agent` call to the sub-agent transcript it spawned), dispatches `/api/session` to the right parser by transcript root, and serves the JSON API (`/api/sessions`, `/api/session?file=...`, `/api/search?q=...`, `/api/local-image`) plus the static frontend. `/api/session` only serves files under the allowed roots; `/api/local-image` serves only image-typed files; static assets are sent `no-cache` and versioned; and a `Host`-header allowlist guards the loopback server against DNS rebinding. |
 | `codex_server.py` | Codex parsing library (imported by `server.py`): parses rollout JSONL, reads `state_5.sqlite` metadata, pairs tool calls with outputs, and renders `apply_patch` diffs. Call `configure(codex_home)` to point it elsewhere. |
-| `static/index.html`, `static/style.css`, `static/app.js` | The single frontend (vanilla JS, no build step). `app.js` dispatches on event kind and renders both Claude Code (block-based) and Codex (flat) shapes, and runs the live-refresh poll loop. |
+| `static/index.html`, `static/style.css`, `static/app.js` | The single frontend (vanilla JS, no build step). `app.js` dispatches on event kind and renders both Claude Code (block-based) and Codex (flat) shapes, interleaves spawned sub-agents into the timeline (expanded lazily), renders large transcripts in time-sliced chunks, and runs the live-refresh poll loop. |
 | `test_security.py` | Zero-dependency security tests (`python3 -m unittest test_security`): asserts no outbound connections at runtime, no network-client imports, loopback default bind, the `Host`-header rebinding guard, and that `/api/session` is confined to the transcript roots while `/api/local-image` serves images only. |
 
 ### Transcript format notes
@@ -193,6 +207,9 @@ Claude Code stores each session as a JSONL file at
   side — tool results are paired to calls by `tool_use_id`).
 - Metadata lines: `ai-title`, `system`, `attachment` (hook output), and a few others the viewer
   ignores.
+- Sub-agents are written to `…/<session-uuid>/subagents/agent-<id>.jsonl`, each with a sibling
+  `agent-<id>.meta.json` sidecar holding `agentType`, `description`, and (when known) the spawning
+  `toolUseId` — which the viewer uses to link a sub-agent back to its exact `Task`/`Agent` call.
 
 Codex stores each session as a rollout JSONL file at
 `~/.codex/sessions/YYYY/MM/DD/rollout-<timestamp>-<thread-id>.jsonl` (and under

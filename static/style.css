@@ -30,7 +30,26 @@ body {
 }
 .muted { color: var(--muted); }
 
-#app { display: flex; height: 100vh; overflow: hidden; }
+#app { display: flex; height: 100vh; overflow: hidden; position: relative; }
+
+/* ---------- Collapsible side panels ---------- */
+.panel-collapse {
+  margin-left: auto; background: none; border: none; cursor: pointer;
+  color: var(--muted); font-size: 15px; line-height: 1; padding: 2px 4px; border-radius: 4px;
+}
+.panel-collapse:hover { background: var(--bg-elev); color: var(--fg); }
+body.sidebar-collapsed #sidebar { display: none; }
+body.outline-collapsed #outline { display: none; }
+.edge-toggle {
+  display: none; position: absolute; top: 8px; z-index: 20;
+  background: var(--bg-elev); border: 1px solid var(--border); color: var(--muted);
+  cursor: pointer; font-size: 14px; line-height: 1; padding: 6px 8px; border-radius: 6px;
+}
+.edge-toggle:hover { color: var(--fg); }
+.edge-toggle.left { left: 8px; }
+.edge-toggle.right { right: 8px; }
+body.sidebar-collapsed .edge-toggle.left { display: block; }
+body.has-session.outline-collapsed .edge-toggle.right { display: block; }
 
 /* ---------- Sidebar ---------- */
 #sidebar {
@@ -190,6 +209,7 @@ body {
   font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .05em;
   color: var(--muted);
   border-bottom: 1px solid var(--border);
+  display: flex; align-items: center; gap: 8px;
 }
 #outline-list { overflow-y: auto; flex: 1; padding: 6px; }
 .outline-item {
@@ -324,6 +344,19 @@ body {
 .tool-summary { color: var(--muted); font-family: var(--mono); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
 .tool-caller { font-size: 10px; padding: 1px 6px; border-radius: 4px; background: var(--bg-elev); color: var(--muted); }
 .tool-body { padding: 10px 12px; border-top: 1px solid var(--border); }
+
+/* Inline sub-agent transcript embedded under a Task/Agent call. */
+.tool-block.subagent-embed { margin-top: 10px; border-color: var(--accent, #2a55a0); background: rgba(42,85,160,.05); }
+.tool-block.subagent-embed > .tool-head { background: rgba(42,85,160,.10); }
+.subagent-body { border-left: 3px solid var(--accent, #2a55a0); padding-left: 14px; }
+.subagent-badge {
+  flex: none; font-size: 10px; font-weight: 600; padding: 1px 6px; border-radius: 10px;
+  background: rgba(42,85,160,.15); color: var(--accent, #2a55a0); border: 1px solid rgba(42,85,160,.3);
+}
+/* A sub-agent placed in the timeline at the point it was spawned (fleet/teammate
+   agents not tied to a Task call). Tinted left rail marks it as a spawned agent. */
+.tool-block.subagent-embed.spawned { border-left-width: 3px; }
+.subagent-body .turn { margin-left: 0; }
 .tool-section-label { font-size: 10px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 8px 0 4px; }
 .tool-section-label:first-child { margin-top: 0; }
 

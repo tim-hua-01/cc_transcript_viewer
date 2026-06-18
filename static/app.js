@@ -69,6 +69,10 @@ function md(text) {
   return `<p>${esc(text).replace(/\n/g, "<br>")}</p>`;
 }
 
+function mdNode(text, cls = "md") {
+  return el("div", { class: cls, html: md(text || "") });
+}
+
 // ---------- time formatting ----------
 function fmtTime(ts) {
   if (!ts) return "";
@@ -112,7 +116,9 @@ function fmtDuration(ms) {
 
 // ---------- state ----------
 let SESSIONS = [];
+let LOADED = false;              // first /api/sessions response has arrived
 let CURRENT_FILE = null;
+let CURRENT_DATA = null;         // the parsed session currently rendered (for Copy all)
 let AGENT_FILTER = "all";
 // ---------- live auto-refresh (always on) ----------
 const POLL_MS = 1000;            // how often to rescan disk for changes
@@ -129,6 +135,7 @@ async function loadSessions() {
   const res = await fetch("/api/sessions");
   const data = await res.json();
   SESSIONS = data.sessions || [];
+  LOADED = true;
   LAST_SIG = sessionsSignature(SESSIONS);
   buildFilters();
   renderSidebar($("#search").value || "");
@@ -323,7 +330,12 @@ function renderSidebar(query) {
   }
 
   if (!list.children.length) {
-    list.append(el("div", { class: "empty-note" }, q ? "No matching sessions." : "No transcripts found."));
+    const note = q
+      ? "No matching sessions."
+      : LOADED
+        ? "No transcripts found."
+        : "Loading transcripts… (the first scan can take a moment)";
+    list.append(el("div", { class: "empty-note" }, note));
   }
 }
 
@@ -336,6 +348,67 @@ function copyId(e, id) {
     () => {}
   );
 }
+
+// Flatten the open session into plain text for the clipboard.
+function transcriptToText(data) {
+  const out = [];
+  out.push("# " + (data.title || "(untitled session)"));
+  const m = data.meta || {};
+  if (m.cwd) out.push("Project: " + m.cwd);
+  if (m.model) out.push("Model: " + m.model);
+  out.push("Session: " + data.id + (data.is_subagent ? " (sub-agent)" : ""));
+  out.push("");
+  for (const ev of data.events || []) {
+    const tag = ev.is_sidechain ? " (sub-agent)" : "";
+    switch (ev.kind) {
+      case "user":
+      case "assistant":
+        out.push("## " + (ev.kind === "user" ? "User" : "Assistant") + tag);
+        for (const b of ev.blocks || []) {
+          if (b.type === "text") out.push(b.text || "");
+          else if (b.type === "thinking") out.push("<thinking>\n" + (b.text || "") + "\n</thinking>");
+          else if (b.type === "image") out.push("[image]");
+          else if (b.type === "tool_use") {
+            out.push("> tool: " + (b.name || "") + " " + JSON.stringify(b.input || {}));
+            if (b.result && b.result.text) out.push("> result: " + b.result.text);
+          }
+        }
+        break;
+      case "reasoning":
+        out.push("## Reasoning"); out.push(ev.text || ev.summary || ""); break;
+      case "tool":
+        out.push("> tool: " + (ev.name || "") + " — " + (ev.summary || ""));
+        if (ev.result && ev.result.output) out.push(ev.result.output);
+        break;
+      case "web_search":
+      case "web_call":
+        out.push("> web search: " + (ev.query || ev.summary || "")); break;
+      default:
+        if (ev.text) out.push(ev.text);
+    }
+    out.push("");
+  }
+  return out.join("\n");
+}
+
+function copyAll(e, data) {
+  const node = e.currentTarget;
+  const restore = node.textContent;
+  navigator.clipboard?.writeText(transcriptToText(data || CURRENT_DATA)).then(
+    () => { node.textContent = "Copied ✓"; setTimeout(() => (node.textContent = restore), 1200); },
+    () => { node.textContent = "Copy failed"; setTimeout(() => (node.textContent = restore), 1200); }
+  );
+}
+
+// ---------- collapsible side panels ----------
+function wireCollapse() {
+  const set = (cls, on) => document.body.classList.toggle(cls, on);
+  $("#collapse-sidebar")?.addEventListener("click", () => set("sidebar-collapsed", true));
+  $("#show-sidebar")?.addEventListener("click", () => set("sidebar-collapsed", false));
+  $("#collapse-outline")?.addEventListener("click", () => set("outline-collapsed", true));
+  $("#show-outline")?.addEventListener("click", () => set("outline-collapsed", false));
+}
+wireCollapse();
 
 // ---------- session view ----------
 async function openSession(file, itemEl) {
@@ -351,6 +424,7 @@ async function openSession(file, itemEl) {
   $("#welcome").hidden = true;
   $("#outline").hidden = true;
   $("#nav-buttons").hidden = true;
+  document.body.classList.add("has-session");
   const t = $("#transcript");
   t.hidden = false;
   t.innerHTML = `<div class="spinner">Loading transcript…</div>`;
@@ -366,6 +440,7 @@ async function openSession(file, itemEl) {
   }
 }
 
+let RENDER_GEN = 0;  // bumped per render so a superseded in-flight render aborts
 function renderTranscript(data, opts = {}) {
   const t = $("#transcript");
   t.innerHTML = "";
@@ -415,17 +490,71 @@ function renderTranscript(data, opts = {}) {
       isCodex ? el("button", { class: "btn", onclick: () => setAll(".status-block", true) }, "Collapse status") : null,
       isCodex ? el("button", { class: "btn", onclick: () => setAll(".status-block", false) }, "Expand status") : null,
       isCodex ? el("button", { class: "btn", onclick: () => document.body.classList.toggle("show-tokens") }, "Toggle tokens") : null,
+      el("button", { class: "btn", onclick: (e) => copyAll(e, data) }, "⧉ Copy all"),
       el("button", { class: "btn", onclick: scrollToEnd }, "⤓ Jump to end")
     )
   );
   t.append(header);
+  CURRENT_DATA = data;
 
-  for (const ev of data.events) {
-    const node = renderEvent(ev);
-    if (node) t.append(node);
+  // Build the render list: the session's events, plus each spawned sub-agent
+  // placed at the point in the timeline where it was spawned. Sub-agents tied to
+  // a Task call already render inline under that call (renderAssistant); the rest
+  // (fleet/teammate agents) are slotted in by their first timestamp.
+  const items = buildRenderItems(data);
+
+  // Render in chunks across animation frames so a huge session never blocks the
+  // main thread. A generation token lets a newer render (or a session switch)
+  // abort an in-flight one. Resolves once everything is in the DOM.
+  const gen = ++RENDER_GEN;
+  return new Promise((resolve) => {
+    let i = 0;
+    const renderOne = (it) => it.ev ? renderEvent(it.ev)
+      : subagentEmbed(it.sub.file, (it.sub.agent_type ? "[" + it.sub.agent_type + "] " : "") + (it.sub.title || ""), true);
+    // Time-sliced: render as many items as fit in a frame budget, then yield, so
+    // the page is interactive immediately and never freezes — even on a session
+    // with tens of thousands of turns. First slice is bigger to fill the screen.
+    function step(budgetMs) {
+      if (gen !== RENDER_GEN) { resolve(false); return; }
+      const frag = document.createDocumentFragment();
+      const start = performance.now();
+      while (i < items.length && performance.now() - start < budgetMs) {
+        const node = renderOne(items[i++]);
+        if (node) frag.append(node);
+      }
+      t.append(frag);
+      if (i < items.length) { requestAnimationFrame(() => step(10)); return; }
+      if (!opts.keepScroll) $("#main").scrollTop = 0;
+      buildOutline();
+      resolve(true);
+    }
+    step(40);  // first frame: fill the viewport generously
+  });
+}
+
+// Merge events and orphan sub-agents (those not tied to a Task call) into one
+// time-ordered list, without reordering the events themselves.
+function buildRenderItems(data) {
+  const events = data.events || [];
+  const subs = data.is_subagent ? [] : (data.subagents || []);
+  if (!subs.length) return events.map((ev) => ({ ev }));
+  const linked = new Set();
+  for (const ev of events) for (const b of ev.blocks || []) if (b.subagent_file) linked.add(b.subagent_file);
+  // Place undated agents last (sentinel "￿") so a single timestamp-less agent
+  // can't block the rest from interleaving. Same sentinel in sort and merge.
+  const tsOf = (a) => a.first_ts || "￿";
+  const orphans = subs.filter((a) => !linked.has(a.file))
+    .sort((a, b) => (tsOf(a) < tsOf(b) ? -1 : tsOf(a) > tsOf(b) ? 1 : 0));
+  if (!orphans.length) return events.map((ev) => ({ ev }));
+  const items = [];
+  let oi = 0;
+  for (const ev of events) {
+    const ts = ev.ts || "￿";
+    while (oi < orphans.length && tsOf(orphans[oi]) <= ts) items.push({ sub: orphans[oi++] });
+    items.push({ ev });
   }
-  if (!opts.keepScroll) $("#main").scrollTop = 0;
-  buildOutline();
+  while (oi < orphans.length) items.push({ sub: orphans[oi++] });
+  return items;
 }
 
 // ---------- live transcript refresh (scroll- and state-preserving) ----------
@@ -449,7 +578,8 @@ function restoreView(v) {
     v.expanded[sel].forEach((open, i) => { if (nodes[i]) nodes[i].classList.toggle("collapsed", !open); });
   }
   const main = $("#main");
-  main.scrollTop = v.atBottom ? main.scrollHeight : v.top;
+  if (v.atBottom) scrollToEnd();
+  else main.scrollTop = v.top;
 }
 
 async function refreshOpenTranscript() {
@@ -459,8 +589,8 @@ async function refreshOpenTranscript() {
     const res = await fetch("/api/session?file=" + encodeURIComponent(CURRENT_FILE));
     const data = await res.json();
     if (data.error) return;
-    renderTranscript(data, { keepScroll: true });
-    restoreView(view);
+    const done = await renderTranscript(data, { keepScroll: true });
+    if (done) restoreView(view);
     LAST_RENDERED_MTIME = sessionMtime(CURRENT_FILE);
   } catch (e) { /* transient; try again next poll */ }
 }
@@ -481,7 +611,16 @@ function scrollToTurn(turn) {
 
 function scrollToEnd() {
   const main = $("#main");
-  main.scrollTo({ top: main.scrollHeight, behavior: "smooth" });
+  // content-visibility estimates off-screen heights, so scrollHeight grows as we
+  // approach the bottom and a single jump lands short. Chase it across frames
+  // until we're genuinely pinned to the end (or we run out of tries).
+  let tries = 0;
+  (function chase() {
+    main.scrollTop = main.scrollHeight;
+    if (++tries < 60 && main.scrollHeight - main.scrollTop - main.clientHeight > 2) {
+      requestAnimationFrame(chase);
+    }
+  })();
 }
 
 // Index of the user turn currently at or above the viewport top.
@@ -597,12 +736,12 @@ function renderUser(ev) {
   if (ev.blocks) {
     // Claude Code shape
     for (const b of ev.blocks) {
-      if (b.type === "text") body.push(el("div", { class: "md", html: md(b.text) }));
+      if (b.type === "text") body.push(mdNode(b.text));
       else if (b.type === "image" && b.data_uri) body.push(el("img", { src: b.data_uri, style: "max-width:100%;border-radius:8px" }));
     }
   } else {
     // Codex shape
-    if (ev.text) body.push(el("div", { class: "md", html: md(ev.text) }));
+    if (ev.text) body.push(mdNode(ev.text));
     for (const img of ev.images || []) body.push(renderImagePayload(img));
     for (const img of ev.local_images || []) body.push(el("div", { class: "attach-meta" }, "local image: " + img));
   }
@@ -614,14 +753,23 @@ function renderAssistant(ev) {
     // Claude Code shape
     const body = [];
     for (const b of ev.blocks) {
-      if (b.type === "text") body.push(el("div", { class: "md", html: md(b.text) }));
+      if (b.type === "text") body.push(mdNode(b.text));
       else if (b.type === "thinking") body.push(renderThinking(b));
-      else if (b.type === "tool_use") body.push(renderTool(b));
+      else if (b.type === "tool_use") {
+        body.push(renderTool(b));
+        // Surface the spawned sub-agent as its own visible block in the flow,
+        // not buried inside the (collapsed-by-default) Task tool block.
+        if (b.subagent_file) {
+          const inp = b.input || {};
+          const lbl = ((inp.subagent_type || inp.agentType) ? "[" + (inp.subagent_type || inp.agentType) + "] " : "") + (inp.description || "");
+          body.push(subagentEmbed(b.subagent_file, lbl));
+        }
+      }
     }
     return turnShell("assistant", "Claude", ev, body);
   }
   // Codex shape (flat text; reasoning/tools are separate events)
-  return turnShell("assistant", "Codex", ev, [el("div", { class: "md", html: md(ev.text || "") })]);
+  return turnShell("assistant", "Codex", ev, [mdNode(ev.text)]);
 }
 
 function renderThinking(b) {
@@ -635,7 +783,7 @@ function renderThinking(b) {
   );
   head.addEventListener("click", () => block.classList.toggle("collapsed"));
   const body = hasText
-    ? el("div", { class: "thinking-body md", html: md(b.text) })
+    ? mdNode(b.text, "thinking-body md")
     : el(
         "div",
         { class: "thinking-body thinking-empty" },
@@ -656,7 +804,7 @@ function renderReasoning(ev) {
   );
   head.addEventListener("click", () => block.classList.toggle("collapsed"));
   const body = hasText
-    ? el("div", { class: "thinking-body md", html: md(ev.text) })
+    ? mdNode(ev.text, "thinking-body md")
     : el(
         "div",
         { class: "thinking-body thinking-empty" },
@@ -681,7 +829,7 @@ function renderInstructions(ev) {
 
 function renderSystem(ev) {
   return turnShell("system", "System · " + (ev.subtype || ""), ev, [
-    el("div", { class: "md", html: md(ev.text || "") }),
+    mdNode(ev.text),
   ]);
 }
 
@@ -847,6 +995,13 @@ function renderWebSearch(ev) {
 }
 
 // ---------- tool rendering ----------
+// The `caller` field used to be a string ("assistant"); newer Claude Code writes
+// an object like {type:"direct"}. Show it only when it names a non-default caller.
+function callerLabel(caller) {
+  const s = typeof caller === "string" ? caller : (caller && typeof caller === "object" ? caller.type || "" : "");
+  return s && s !== "assistant" && s !== "direct" ? s : "";
+}
+
 // Claude Code tool (input formatted client-side; result attached on the block).
 function renderTool(b) {
   const name = b.name || "tool";
@@ -861,7 +1016,8 @@ function renderTool(b) {
     el("span", { class: "tool-icon" }, isErr ? "✗" : "🔧"),
     el("span", { class: "tool-name" }, name),
     el("span", { class: "tool-summary", title: fmt.summary }, fmt.summary),
-    b.caller && b.caller !== "assistant" ? el("span", { class: "tool-caller" }, b.caller) : null
+    b.subagent_file ? el("span", { class: "subagent-badge" }, "🤖 sub-agent ↓") : null,
+    callerLabel(b.caller) ? el("span", { class: "tool-caller" }, callerLabel(b.caller)) : null
   );
   head.addEventListener("click", () => block.classList.toggle("collapsed"));
 
@@ -879,6 +1035,49 @@ function renderTool(b) {
   }
 
   block.append(head, el("div", { class: "tool-body" }, ...bodyKids));
+  return block;
+}
+
+// Collapsible inline sub-agent transcript, rendered as its own block in the
+// conversation flow (right after the Task/Agent call), fetched lazily on first
+// expand. Recursive: the sub-agent's own Task calls carry their own subagent_file.
+function subagentEmbed(file, label, spawned) {
+  const block = el("div", { class: "tool-block subagent-embed collapsed" + (spawned ? " spawned" : "") });
+  const head = el(
+    "div",
+    { class: "tool-head" },
+    el("span", { class: "chev" }, "▼"),
+    el("span", { class: "tool-icon" }, "🤖"),
+    el("span", { class: "tool-name" }, spawned ? "Sub-agent" : "Sub-agent transcript"),
+    el("span", { class: "tool-summary", title: file }, label || "click to load")
+  );
+  const body = el("div", { class: "tool-body subagent-body" });
+  let loaded = false;
+  head.addEventListener("click", async () => {
+    block.classList.toggle("collapsed");
+    if (loaded || block.classList.contains("collapsed")) return;
+    loaded = true;
+    body.append(el("div", { class: "spinner" }, "Loading sub-agent…"));
+    try {
+      const res = await fetch("/api/session?file=" + encodeURIComponent(file));
+      const data = await res.json();
+      body.innerHTML = "";
+      if (data.error) { body.append(el("div", { class: "empty-note" }, "Error: " + data.error)); return; }
+      const open = el("a", { class: "parent-link", href: "#", onclick: (e) => { e.preventDefault(); openSession(file); } }, "↗ open as its own session");
+      body.append(open);
+      const evs = data.events || [];
+      head.querySelector(".tool-summary").textContent = (label ? label + " · " : "") + evs.length + " events";
+      if (!evs.length) { body.append(el("div", { class: "empty-note" }, "(no readable content)")); return; }
+      for (const ev of evs) {
+        const node = renderEvent(ev);
+        if (node) body.append(node);
+      }
+    } catch (e) {
+      body.innerHTML = "";
+      body.append(el("div", { class: "empty-note" }, "Failed to load: " + String(e)));
+    }
+  });
+  block.append(head, body);
   return block;
 }
 
@@ -1152,6 +1351,7 @@ async function poll() {
       const res = await fetch("/api/sessions");
       next = (await res.json()).sessions || [];
     } catch (e) { return; } // server momentarily unreachable; retry next tick
+    LOADED = true;
     const sig = sessionsSignature(next);
     if (sig !== LAST_SIG) {
       LAST_SIG = sig;
@@ -1210,4 +1410,4 @@ window.addEventListener("hashchange", () => {
   if (file && file !== CURRENT_FILE) openSession(file);
 });
 
-loadSessions().then(openFromHash);
+loadSessions().then(openFromHash, openFromHash);
