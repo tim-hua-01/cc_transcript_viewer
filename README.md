@@ -46,8 +46,11 @@ rescan, or just reload. Session metadata is cached by file mtime, so each poll o
 files that actually changed — the cost doesn't grow with how many transcripts you've accumulated.
 
 The summary cache is also **persisted to disk** (`~/.cache/transcript_viewer/summaries.json`) and the
-first cold scan is **parallelized across CPU cores**, so the very first run on a large history takes
-seconds rather than minutes, and every run after that loads near-instantly.
+first cold scan is **parallelized across CPU cores** (via the standard library's `multiprocessing` —
+no new dependency and no network), so the very first run on a large history takes seconds rather than
+minutes, and every run after that loads near-instantly. That cache file holds only the same metadata
+shown in the sidebar — session title, project path, model, counts, mtime — derived from your
+transcripts and kept **local** (nothing is uploaded). Delete it any time; it's rebuilt on demand.
 
 ## Features
 
