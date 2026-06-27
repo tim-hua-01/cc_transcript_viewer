@@ -261,8 +261,21 @@ body {
 }
 
 /* Turn blocks */
-.turn { margin: 14px 0; border-radius: var(--radius); border: 1px solid var(--border); overflow: hidden; }
+.turn { margin: 4px 0; border-radius: var(--radius); border: 1px solid var(--border); overflow: hidden; }
 .turn.sidechain { border-style: dashed; opacity: .92; }
+/* A "run" is a stretch of consecutive turns from the same author/model
+   (e.g. a string of tool calls). We show the header once on the first turn and
+   connect the rest seamlessly — one column with thin separators — instead of
+   repeating the "Claude · model · time" header and a gap on every action. */
+.turn.run-mid, .turn.run-end {
+  margin-top: 0; border-top: none;
+  border-top-left-radius: 0; border-top-right-radius: 0;
+}
+.turn.run-start, .turn.run-mid {
+  border-bottom-left-radius: 0; border-bottom-right-radius: 0;
+}
+.turn.run-mid .turn-head, .turn.run-end .turn-head { display: none; }
+.turn.run-mid .turn-body, .turn.run-end .turn-body { padding-top: 8px; }
 .turn-head {
   display: flex; align-items: center; gap: 8px;
   padding: 7px 12px; font-size: 12px; font-weight: 600;

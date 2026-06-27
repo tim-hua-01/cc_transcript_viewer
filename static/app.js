@@ -433,8 +433,43 @@ function renderTranscript(data, opts = {}) {
     const node = renderEvent(ev);
     if (node) t.append(node);
   }
+  groupTurnRuns(t);
   if (!opts.keepScroll) $("#main").scrollTop = 0;
   buildOutline();
+}
+
+// Collapse consecutive turns that share a header (same author/model) into one
+// connected run: the first keeps its header (run-start), the rest hide theirs
+// and butt up against it (run-mid / run-end). This is what
+// turns a wall of repeated "Claude · model · time" cards into a single tidy
+// column of actions. User prompts are never folded — they stay distinct so they
+// remain clear anchors (and outline targets).
+function groupTurnRuns(container) {
+  const turns = $$(".turn", container);
+  let uid = 0;
+  const sig = (t) => {
+    if (t.classList.contains("turn-user")) return "user-" + uid++; // never groups
+    const head = t.querySelector(".turn-head");
+    if (!head) return "none-" + uid++;
+    // Key on author/model/etc. but NOT the timestamp — otherwise a continuous
+    // run of actions spanning a minute boundary would split and re-show the
+    // header every minute. The displayed time stays on the run-start head.
+    const timeText = (head.querySelector(".turn-time") || {}).textContent || "";
+    const headText = head.textContent.replace(timeText, "").replace(/\s+/g, " ").trim();
+    return t.className + "|" + headText;
+  };
+  const sigs = turns.map(sig);
+  let i = 0;
+  while (i < turns.length) {
+    let j = i;
+    while (j + 1 < turns.length && sigs[j + 1] === sigs[i]) j++;
+    if (j > i) {
+      turns[i].classList.add("run-start");
+      for (let k = i + 1; k < j; k++) turns[k].classList.add("run-mid");
+      turns[j].classList.add("run-end");
+    }
+    i = j + 1;
+  }
 }
 
 // ---------- live transcript refresh (scroll- and state-preserving) ----------
@@ -855,6 +890,15 @@ function renderWebSearch(ev) {
   return block;
 }
 
+// Caller pill text, or "" to hide it. Claude Code records `caller` either as a
+// string or an object like {type:"direct"}; the normal direct/assistant call is
+// noise, so we only surface a genuinely different caller (e.g. a sub-agent).
+function callerLabel(caller) {
+  const t = caller && typeof caller === "object" ? caller.type : caller;
+  if (!t || t === "assistant" || t === "direct") return "";
+  return String(t);
+}
+
 // ---------- tool rendering ----------
 // Claude Code tool (input formatted client-side; result attached on the block).
 function renderTool(b) {
@@ -870,7 +914,7 @@ function renderTool(b) {
     el("span", { class: "tool-icon" }, isErr ? "✗" : "🔧"),
     el("span", { class: "tool-name" }, name),
     el("span", { class: "tool-summary", title: fmt.summary }, fmt.summary),
-    b.caller && b.caller !== "assistant" ? el("span", { class: "tool-caller" }, b.caller) : null
+    callerLabel(b.caller) ? el("span", { class: "tool-caller" }, callerLabel(b.caller)) : null
   );
   head.addEventListener("click", () => block.classList.toggle("collapsed"));
 
