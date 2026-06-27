@@ -27,6 +27,7 @@ from pathlib import Path
 
 import server
 import codex_server as codex
+import cursor_server as cursor
 
 
 # --------------------------------------------------------------------------- #
@@ -81,6 +82,7 @@ class SecurityTest(unittest.TestCase):
         cls.fixture = _write_fixture_session(cls.projects_dir)
         server.PROJECTS_DIR = cls.projects_dir
         codex.configure(tmp / "codex")  # empty -> no codex sessions
+        cursor.configure(tmp / "cursor")  # empty -> no cursor sessions
 
         # Install the outbound-connection guard for the whole class.
         socket.socket.connect = _guard(_real_connect)
@@ -132,7 +134,7 @@ class SecurityTest(unittest.TestCase):
             "websocket", "websockets", "paramiko", "boto3", "google",
         }
         forbidden_full = {"urllib.request", "urllib.error", "http.client"}
-        for mod_path in (Path("server.py"), Path("codex_server.py")):
+        for mod_path in (Path("server.py"), Path("codex_server.py"), Path("cursor_server.py")):
             tree = ast.parse(mod_path.read_text())
             imported = set()
             for node in ast.walk(tree):

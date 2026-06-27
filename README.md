@@ -1,12 +1,15 @@
-# Claude Code and Codex Transcript Viewer
+# Claude Code, Codex, and Cursor Transcript Viewer
 
 A tiny, **zero-dependency** local web app for browsing your local coding-agent transcripts —
-**Claude Code and Codex together** in one time-sorted view.
+**Claude Code, Codex, and Cursor together** in one time-sorted view.
 
 It reads:
 
 - Claude Code transcripts from `~/.claude/projects/`
 - Codex transcripts from `~/.codex/sessions/` and `~/.codex/archived_sessions/`
+- Cursor agent conversations from Cursor's store at
+  `~/Library/Application Support/Cursor/User/globalStorage/state.vscdb` (not the lossy
+  `~/.cursor/projects/.../agent-transcripts/` JSONL export — see [Notes on Cursor](#notes-on-cursor-conversations))
 
 Nothing is uploaded anywhere; it's a read-only local web app that listens on loopback only. The
 server contains no outbound-network code at all, and a [test suite](#privacy--security) verifies it —
@@ -15,8 +18,8 @@ so you can check that claim rather than take it on faith.
 > [!WARNING]
 > **This is vibe-coded.** It was built quickly and iteratively with an AI coding agent, so expect
 > rough edges and the occasional rendering bug. It also depends on the *current* on-disk transcript
-> formats of Claude Code and Codex — if either tool changes how it saves sessions, parts of the viewer
-> may silently break or drop records until the parser is updated.
+> formats of Claude Code, Codex, and Cursor — if any tool changes how it saves sessions, parts of the
+> viewer may silently break or drop records until the parser is updated.
 
 ## Run it
 
@@ -33,6 +36,7 @@ python3 server.py --port 8080            # use a different port
 python3 server.py --host 0.0.0.0         # listen on all interfaces (LAN access — opt-in)
 python3 server.py --projects-dir PATH    # different Claude Code projects directory
 python3 server.py --codex-home PATH      # different Codex home (default ~/.codex)
+python3 server.py --cursor-db PATH       # different Cursor state.vscdb (or its Cursor app-support dir)
 ```
 
 By default the server binds **127.0.0.1** (loopback only), so it isn't reachable from other machines
@@ -47,17 +51,17 @@ files that actually changed — the cost doesn't grow with how many transcripts 
 
 ## Features
 
-- **One sidebar, sorted by time.** Every Claude Code and Codex session in a single flat list, newest
-  (most recently modified) first — no per-project grouping. Each entry shows an **agent tag**
-  (Claude / Codex), the project path, recency, message/tool/web counts, model, and the full session
-  **id** (click to copy).
+- **One sidebar, sorted by time.** Every Claude Code, Codex, and Cursor session in a single flat list,
+  newest (most recently modified) first — no per-project grouping. Each entry shows an **agent tag**
+  (Claude / Codex / Cursor), the project path, recency, message/tool/web counts, model, and the full
+  session **id** (click to copy).
 - **Titles from the first message.** Each session is titled with the first ~100 characters of its
   first user message, so the list reads like your prompts.
 - **Search across everything.** The search box (press `/` to focus) matches session **content** —
   prompts, replies, reasoning, tool commands/paths/queries/outputs — in addition to titles and
   directories, and shows a snippet of the match. Powered by `/api/search` with an mtime-keyed cache.
 - **Filters that compose.**
-  - **All / Claude / Codex** chips.
+  - **All / Claude / Codex / Cursor** chips.
   - A **Model** dropdown grouped by family (Claude / GPT / Other): tick a family to select all its
     models, or pick individual ones (e.g. only Sonnet). The family box shows an indeterminate state
     on partial selection.
@@ -70,6 +74,10 @@ files that actually changed — the cost doesn't grow with how many transcripts 
       `Task`/`Agent` (sub-agent turns flagged), `TodoWrite`, and pretty-printed JSON for the rest.
     - Codex: `function_call`, `custom_tool_call`, `apply_patch` (rendered as a colored diff),
       `exec_command`/`shell`, `write_stdin`, `view_image`, web search, plus fallback JSON.
+    - Cursor: tool calls **with their outputs** — `run_terminal_command` (stdout + exit code),
+      `read_file` (contents), `edit_file` (reconstructed before/after diff), `ripgrep`, `glob`,
+      `read_lints`, `todo_write`, `delete_file`, semantic/web search. Names/inputs are normalized onto
+      the same renderers as Claude Code, so a Cursor `edit_file` shows the same colorized diff.
   - Codex status/context and token-usage events (tokens hidden by default — **Toggle tokens**).
 - **Survives `/compact`.** After a conversation is compacted, the harness injects bookkeeping records
   that most viewers drop. This one renders them: 📎 *referenced-file* pointers (including the note the
@@ -103,7 +111,9 @@ This app reads your private transcripts, so it's built to keep them on your mach
   read your transcripts through the browser — its requests still carry `Host: evil.com` and get a
   `403`. (Skipped when you deliberately bind a non-loopback `--host`.)
 - **Transcript reads are confined.** `/api/session` only parses files under the transcript roots
-  (`~/.claude/projects`, `~/.codex`); anything else returns `403`. `/api/local-image` serves only
+  (`~/.claude/projects`, `~/.codex`), or a Cursor conversation addressed by the `cursordb:<id>` scheme
+  (read from the local `state.vscdb` by id, never an arbitrary path); anything else returns `403`.
+  `/api/local-image` serves only
   image-typed files (it renders images referenced by a transcript, which may live anywhere on disk),
   never arbitrary file contents.
 
@@ -137,6 +147,24 @@ the default bind is loopback.
 - **Images.** `view_image` prefers serving the original local file via `/api/local-image`; if the file
   is gone it falls back to the (often large) base64 payload embedded in the JSONL. It also reads
   `~/.codex/state_5.sqlite` for thread metadata (cwd, model) when available.
+
+## Notes on Cursor conversations
+
+- **Read from the SQLite store, not the JSONL export.** Cursor also writes a transcript export under
+  `~/.cursor/projects/<project>/agent-transcripts/`, but that export is **lossy** — it drops tool
+  outputs, the model, thinking text, timestamps, and token counts. The viewer instead reads Cursor's
+  real store at `~/Library/Application Support/Cursor/User/globalStorage/state.vscdb`, which has all of
+  it. (Each conversation is a "composer"; each message is a "bubble".)
+- **Tool outputs are included.** `run_terminal_command` stdout + exit code, `read_file` contents,
+  `ripgrep`/`glob` results, lints, etc. `edit_file` only stores before/after *content ids*, so the
+  viewer resolves them against the `composer.content.*` file snapshots to reconstruct a real diff.
+- **Thinking is included** where Cursor recorded it (the readable summary text; the encrypted
+  reasoning signature is not stored). Model, per-turn timestamps, and AI-generated titles are shown.
+- **Read-only & safe while Cursor runs.** The DB is opened read-only; the session list is cached and
+  re-read only when the DB file changes.
+- **Empty draft composers are hidden** (conversations with no messages).
+- **macOS path by default.** Override the location with `--cursor-db` (point it at a `state.vscdb` or
+  at a Cursor app-support directory) for Linux/Windows or a non-standard install.
 
 ## Requirements
 
@@ -180,7 +208,8 @@ Restart Claude Code (or run `/config` once) for the change to take effect. Note 
 |------|------|
 | `server.py` | The unified stdlib HTTP server. Scans both transcript roots into one time-sorted list (caching per-file summaries by mtime), parses each Claude Code session into a clean event stream (pairing tool results to calls), dispatches `/api/session` to the right parser by transcript root, and serves the JSON API (`/api/sessions`, `/api/session?file=...`, `/api/search?q=...`, `/api/local-image`) plus the static frontend. `/api/session` only serves files under the allowed roots; `/api/local-image` serves only image-typed files; and a `Host`-header allowlist guards the loopback server against DNS rebinding. |
 | `codex_server.py` | Codex parsing library (imported by `server.py`): parses rollout JSONL, reads `state_5.sqlite` metadata, pairs tool calls with outputs, and renders `apply_patch` diffs. Call `configure(codex_home)` to point it elsewhere. |
-| `static/index.html`, `static/style.css`, `static/app.js` | The single frontend (vanilla JS, no build step). `app.js` dispatches on event kind and renders both Claude Code (block-based) and Codex (flat) shapes, and runs the live-refresh poll loop. |
+| `cursor_server.py` | Cursor parsing library (imported by `server.py`): reads Cursor's `state.vscdb` (`composerData`/`bubbleId`/`composer.content` keys) read-only, normalizes tool names/inputs onto the canonical renderers, reconstructs `edit_file` diffs from content snapshots, and emits events in the Claude Code block shape. Sessions are addressed by the `cursordb:<id>` scheme. Call `configure(db_path)` to point it elsewhere. |
+| `static/index.html`, `static/style.css`, `static/app.js` | The single frontend (vanilla JS, no build step). `app.js` dispatches on event kind and renders the Claude Code / Cursor (block-based) and Codex (flat) shapes, and runs the live-refresh poll loop. |
 | `test_security.py` | Zero-dependency security tests (`python3 -m unittest test_security`): asserts no outbound connections at runtime, no network-client imports, loopback default bind, the `Host`-header rebinding guard, and that `/api/session` is confined to the transcript roots while `/api/local-image` serves images only. |
 
 ### Transcript format notes
@@ -198,6 +227,20 @@ Codex stores each session as a rollout JSONL file at
 `~/.codex/sessions/YYYY/MM/DD/rollout-<timestamp>-<thread-id>.jsonl` (and under
 `~/.codex/archived_sessions/`), with `session_meta`, `turn_context`, `response_item`, and `event_msg`
 records.
+
+Cursor stores conversations in a SQLite DB at
+`~/Library/Application Support/Cursor/User/globalStorage/state.vscdb` (table `cursorDiskKV`):
+
+- `composerData:<id>` — conversation metadata: `name` (AI title), `modelConfig.modelName`,
+  `workspaceIdentifier`/`trackedGitRepos` (cwd), and `fullConversationHeadersOnly` (the ordered list
+  of bubbles, with per-bubble type and timestamp).
+- `bubbleId:<id>:<bubbleId>` — one message: a user prompt (`type: 1`), or an assistant `type: 2`
+  bubble carrying `text`, a `thinking.text` block, or a `toolFormerData` tool call with its `result`.
+- `composer.content.<hash>` — raw file snapshots; `edit_file` results reference these by id, so
+  before/after pairs reconstruct into diffs.
+
+(Cursor also writes a lossy JSONL export under `~/.cursor/projects/.../agent-transcripts/`, but it
+omits tool outputs, model, thinking, and timestamps, so the viewer does not use it.)
 
 ## License
 

@@ -99,6 +99,11 @@ function shortModel(m) {
     .replace(/\[1m\]$/, " (1M)")
     .replace(/-codex$/, "");
 }
+function agentLabel(a) {
+  if (a === "codex") return "Codex";
+  if (a === "cursor") return "Cursor";
+  return "Claude";
+}
 function shortPath(p) {
   const parts = (p || "").split("/").filter(Boolean);
   if (parts.length <= 2) return p || "";
@@ -113,6 +118,7 @@ function fmtDuration(ms) {
 // ---------- state ----------
 let SESSIONS = [];
 let CURRENT_FILE = null;
+let CURRENT_AGENT = "claude";
 let AGENT_FILTER = "all";
 // ---------- live auto-refresh (always on) ----------
 const POLL_MS = 1000;            // how often to rescan disk for changes
@@ -285,7 +291,9 @@ function renderSidebar(query) {
 
   const nClaude = matches.filter((s) => s.agent === "claude").length;
   const nCodex = matches.filter((s) => s.agent === "codex").length;
-  $("#sidebar-stats").textContent = `${matches.length} sessions · ${nClaude} Claude · ${nCodex} Codex`;
+  const nCursor = matches.filter((s) => s.agent === "cursor").length;
+  $("#sidebar-stats").textContent =
+    `${matches.length} sessions · ${nClaude} Claude · ${nCodex} Codex · ${nCursor} Cursor`;
 
   for (const s of matches) {
     const tsForRel = s.last_ts || (s.mtime ? new Date(s.mtime * 1000).toISOString() : null);
@@ -295,7 +303,7 @@ function renderSidebar(query) {
       el(
         "div",
         { class: "session-toprow" },
-        el("span", { class: "agent-tag agent-" + s.agent }, s.agent === "codex" ? "Codex" : "Claude"),
+        el("span", { class: "agent-tag agent-" + s.agent }, agentLabel(s.agent)),
         s.is_subagent ? el("span", { class: "sidechain-tag" }, "sub-agent") : null,
         el("span", { class: "session-title" }, s.title)
       ),
@@ -369,7 +377,8 @@ async function openSession(file, itemEl) {
 function renderTranscript(data, opts = {}) {
   const t = $("#transcript");
   t.innerHTML = "";
-  const isCodex = data.agent === "codex";
+  CURRENT_AGENT = data.agent || "claude";
+  const isCodex = CURRENT_AGENT === "codex";
 
   const meta = data.meta || {};
   const header = el(
@@ -378,7 +387,7 @@ function renderTranscript(data, opts = {}) {
     el(
       "h1",
       { class: "t-title" },
-      el("span", { class: "agent-tag agent-" + data.agent }, isCodex ? "Codex" : "Claude"),
+      el("span", { class: "agent-tag agent-" + data.agent }, agentLabel(data.agent)),
       data.is_subagent ? el("span", { class: "sidechain-tag" }, "sub-agent") : null,
       " " + (data.title || "(untitled session)")
     ),
@@ -598,7 +607,7 @@ function renderUser(ev) {
     // Claude Code shape
     for (const b of ev.blocks) {
       if (b.type === "text") body.push(el("div", { class: "md", html: md(b.text) }));
-      else if (b.type === "image" && b.data_uri) body.push(el("img", { src: b.data_uri, style: "max-width:100%;border-radius:8px" }));
+      else if (b.type === "image" && (b.data_uri || b.src)) body.push(el("img", { src: b.data_uri || b.src, style: "max-width:100%;border-radius:8px", loading: "lazy" }));
     }
   } else {
     // Codex shape
@@ -618,7 +627,7 @@ function renderAssistant(ev) {
       else if (b.type === "thinking") body.push(renderThinking(b));
       else if (b.type === "tool_use") body.push(renderTool(b));
     }
-    return turnShell("assistant", "Claude", ev, body);
+    return turnShell("assistant", agentLabel(CURRENT_AGENT), ev, body);
   }
   // Codex shape (flat text; reasoning/tools are separate events)
   return turnShell("assistant", "Codex", ev, [el("div", { class: "md", html: md(ev.text || "") })]);
@@ -974,12 +983,15 @@ function formatToolInput(name, input) {
     return { summary: "patch", inputNode: renderPatch(text) };
   }
   if ((n === "exec_command" || n === "shell") && typeof value === "object") {
+    // Codex sends `cmd`; Cursor's Shell sends a `command` string plus a `description`.
+    const cmd = value.cmd || (Array.isArray(value.command) ? value.command.join(" ") : value.command) || "";
     const node = el("div", {},
+      value.description ? el("div", { class: "muted", style: "margin-bottom:4px" }, value.description) : null,
       value.workdir ? el("div", { class: "attach-meta", style: "margin-bottom:6px" }, "cwd: " + value.workdir) : null,
-      preFrom(value.cmd || (Array.isArray(value.command) ? value.command.join(" ") : value.command) || "", "payload"),
+      preFrom(cmd, "payload"),
       value.yield_time_ms ? el("div", { class: "attach-meta", style: "margin-top:6px" }, "yield: " + value.yield_time_ms + "ms") : null
     );
-    return { summary: firstLine(value.cmd || ""), inputNode: node };
+    return { summary: firstLine(cmd), inputNode: node };
   }
   if (n === "write_stdin" && typeof value === "object") {
     const chars = value.chars || "";
@@ -1003,6 +1015,33 @@ function formatToolInput(name, input) {
     return { summary: value.tool_uses.length + " tool calls", inputNode: wrap };
   }
 
+  // ----- Cursor tools -----
+  // (Cursor's other tools — terminal/read/edit/grep/glob — are normalized to the
+  // canonical Claude Code names server-side and handled by those branches below.)
+  if (n === "awaitshell") {
+    const meta = [
+      value.shell_id != null ? "shell: " + value.shell_id : "",
+      value.pattern ? "until: " + value.pattern : "",
+      value.block_until_ms ? "timeout: " + fmtDuration(value.block_until_ms) : "",
+    ].filter(Boolean).join("  ·  ");
+    return { summary: meta, inputNode: el("div", { class: "attach-meta" }, meta || "(polling shell)") };
+  }
+  if (n === "delete" && value.path) {
+    return { summary: value.path, inputNode: el("div", { class: "attach-meta" }, "delete: " + value.path) };
+  }
+  if (n === "readlints") {
+    const paths = value.paths || (value.path ? [value.path] : []);
+    return { summary: paths.join(", "), inputNode: el("div", { class: "attach-meta" }, paths.join("\n") || "(workspace)") };
+  }
+  if (n === "semanticsearch") {
+    const dirs = value.target_directories || [];
+    const meta = [dirs.length ? "in " + dirs.join(", ") : "", value.num_results ? value.num_results + " results" : ""].filter(Boolean).join(", ");
+    return { summary: value.query || "", inputNode: el("div", { class: "attach-meta" }, (value.query || "") + (meta ? "\n" + meta : "")) };
+  }
+  if (n === "websearch" && value.search_term) {
+    return { summary: value.search_term, inputNode: el("div", { class: "attach-meta" }, value.search_term + (value.explanation ? "\n\n" + value.explanation : "")) };
+  }
+
   // ----- Claude Code tools -----
   if (n === "bash") {
     const cmd = value.command || "";
@@ -1020,9 +1059,14 @@ function formatToolInput(name, input) {
   }
   if (n === "edit") {
     const fp = value.file_path || "";
+    // Cursor edits arrive as a precomputed unified-diff patch; Claude edits as
+    // old/new strings. Render whichever is present.
+    const body = value.patch != null
+      ? renderPatch(value.patch)
+      : diffNode(value.old_string, value.new_string);
     const node = el("div", {},
       el("div", { class: "attach-meta", style: "margin-bottom:6px" }, fp + (value.replace_all ? "  (replace all)" : "")),
-      diffNode(value.old_string, value.new_string)
+      body
     );
     return { summary: fp, inputNode: node };
   }

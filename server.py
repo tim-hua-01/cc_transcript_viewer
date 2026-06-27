@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
-"""Unified Claude Code + Codex transcript browser.
+"""Unified Claude Code + Codex + Cursor transcript browser.
 
-A zero-dependency local web app for browsing both Claude Code session
-transcripts (under ~/.claude/projects) and Codex session transcripts (under
-~/.codex/sessions) in a single, time-sorted sidebar. Run it and open the
-printed URL.
+A zero-dependency local web app for browsing Claude Code session transcripts
+(under ~/.claude/projects), Codex session transcripts (under ~/.codex/sessions),
+and Cursor agent conversations (from Cursor's state.vscdb) in a single,
+time-sorted sidebar. Run it and open the printed URL.
 
 Usage:
     python server.py [--port 3132] [--projects-dir PATH] [--codex-home PATH]
+                     [--cursor-db PATH]
 """
 
 from __future__ import annotations
@@ -21,6 +22,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 import codex_server as codex
+import cursor_server as cursor
 
 STATIC_DIR = Path(__file__).parent / "static"
 DEFAULT_PROJECTS_DIR = Path.home() / ".claude" / "projects"
@@ -567,6 +569,14 @@ def list_sessions() -> list[dict]:
     except Exception:  # noqa: BLE001 — never let Codex errors hide CC sessions
         pass
 
+    try:
+        for group in cursor.list_sessions():
+            for s in group.get("sessions", []):
+                s["agent"] = "cursor"
+                out.append(s)
+    except Exception:  # noqa: BLE001 — never let Cursor errors hide other sessions
+        pass
+
     out.sort(key=lambda s: s.get("mtime") or 0, reverse=True)
 
     # Place each sub-agent directly under its parent session rather than at its
@@ -615,6 +625,24 @@ def parse_session(target: Path) -> dict | None:
         data["agent"] = "codex"
         return data
     return None
+
+
+def load_session(file_id: str) -> dict | None:
+    """Resolve a session id to parsed data, for both `/api/session` and search.
+
+    Cursor sessions are addressed by the synthetic `cursordb:<composerId>` scheme
+    (they live in a SQLite DB, not a file); everything else is a real transcript
+    path that must resolve under an allowed root.
+    """
+    if file_id.startswith(cursor.SESSION_SCHEME):
+        data = cursor.parse_session_by_id(file_id[len(cursor.SESSION_SCHEME):])
+        if data is not None:
+            data["agent"] = "cursor"
+        return data
+    target = Path(file_id).expanduser().resolve()
+    if not target.exists():
+        return None
+    return parse_session(target)
 
 
 # ---------------------------------------------------------------------------
@@ -687,22 +715,23 @@ def _session_segments(data: dict) -> tuple[str, str]:
     return first, "\n".join(rest)
 
 
-def session_segments(path: Path) -> tuple[str, str]:
-    """(first message, rest) for one transcript, cached by file mtime."""
-    try:
-        st = path.stat()
-    except OSError:
-        return "", ""
-    key = str(path)
+def session_segments(s: dict) -> tuple[str, str]:
+    """(first message, rest) for one session, cached by its mtime.
+
+    Works for both real transcript files and synthetic-id sessions (Cursor's
+    `cursordb:` scheme); the session summary already carries a stable mtime.
+    """
+    key = s.get("file", "")
+    mtime = s.get("mtime") or 0
     cached = _TEXT_CACHE.get(key)
-    if cached and cached[0] == st.st_mtime:
+    if cached and cached[0] == mtime:
         return cached[1], cached[2]
     try:
-        data = parse_session(path)
+        data = load_session(key)
     except Exception:  # noqa: BLE001
         data = None
     first, rest = _session_segments(data) if data else ("", "")
-    _TEXT_CACHE[key] = (st.st_mtime, first, rest)
+    _TEXT_CACHE[key] = (mtime, first, rest)
     return first, rest
 
 
@@ -718,7 +747,7 @@ def search_sessions(query: str) -> list[dict]:
         return []
     out = []
     for s in list_sessions():
-        first, rest = session_segments(Path(s["file"]))
+        first, rest = session_segments(s)
         first_low, rest_low = first.lower(), rest.lower()
         c_first = first_low.count(q)
         c_rest = rest_low.count(q)
@@ -841,12 +870,15 @@ class Handler(BaseHTTPRequestHandler):
             if not file_arg:
                 self._send_json({"error": "missing file param"}, status=400)
                 return
-            target = Path(file_arg).expanduser().resolve()
-            if not target.exists():
-                self._send_json({"error": "not found"}, status=404)
-                return
+            # Cursor sessions use the `cursordb:<id>` scheme (no file on disk);
+            # everything else is a real path confined to an allowed root.
+            if not file_arg.startswith(cursor.SESSION_SCHEME):
+                target = Path(file_arg).expanduser().resolve()
+                if not target.exists():
+                    self._send_json({"error": "not found"}, status=404)
+                    return
             try:
-                data = parse_session(target)
+                data = load_session(file_arg)
             except Exception as e:  # noqa: BLE001
                 self._send_json({"error": str(e)}, status=500)
                 return
@@ -866,19 +898,27 @@ def main():
     ap.add_argument("--host", default=DEFAULT_HOST)
     ap.add_argument("--projects-dir", type=Path, default=DEFAULT_PROJECTS_DIR)
     ap.add_argument("--codex-home", type=Path, default=codex.DEFAULT_CODEX_HOME)
+    ap.add_argument(
+        "--cursor-db",
+        type=Path,
+        default=cursor.DEFAULT_DB_PATH,
+        help="Cursor state.vscdb (or its Cursor app-support dir)",
+    )
     args = ap.parse_args()
 
     PROJECTS_DIR = args.projects_dir.expanduser()
     codex.configure(args.codex_home)
+    cursor.configure(args.cursor_db)
     # Enforce the Host allowlist only on the safe loopback default; if the user
     # deliberately binds elsewhere for LAN access, step aside so it still works.
     HOST_CHECK = args.host in LOOPBACK_HOSTS
 
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     url = f"http://{args.host}:{args.port}/"
-    print("Claude Code + Codex transcript browser")
+    print("Claude Code + Codex + Cursor transcript browser")
     print(f"  claude projects: {PROJECTS_DIR}")
     print(f"  codex sessions:  {codex.SESSIONS_DIR}")
+    print(f"  cursor db:       {cursor.DB_PATH}")
     print(f"  serving at:      {url}")
     print("  (Ctrl-C to stop)")
     try:

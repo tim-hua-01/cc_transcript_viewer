@@ -148,7 +148,7 @@ body {
   display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
 }
 
-/* agent tag (Claude / Codex) */
+/* agent tag (Claude / Codex / Cursor) */
 .agent-tag {
   flex: none;
   font-size: 9px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em;
@@ -156,6 +156,7 @@ body {
 }
 .agent-claude { background: #d4a27f; color: #141414; }
 .agent-codex { background: #141414; color: #fff; }
+.agent-cursor { background: #4a6fa5; color: #fff; }
 .t-title .agent-tag { vertical-align: middle; margin-right: 8px; font-size: 11px; }
 .session-meta {
   margin-top: 4px; font-size: 11px; color: var(--muted);
