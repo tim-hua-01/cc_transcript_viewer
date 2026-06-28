@@ -410,6 +410,22 @@ function renderTranscript(data, opts = {}) {
             "↑ parent session"
           )
         : null,
+      // Cross-session fork: link back to the session this one branched from.
+      data.forked_from
+        ? (data.forked_from.file
+            ? el(
+                "a",
+                {
+                  class: "parent-link",
+                  href: "#",
+                  title: "Branched from session " + data.forked_from.session_id,
+                  onclick: (e) => { e.preventDefault(); openSession(data.forked_from.file); },
+                },
+                "⑂ forked from " + (data.forked_from.session_id || "").slice(0, 8) + "…"
+              )
+            : el("span", { title: "Branched from session " + data.forked_from.session_id },
+                "⑂ forked from " + (data.forked_from.session_id || "").slice(0, 8) + "…"))
+        : null,
       meta.cwd ? el("span", {}, "📁 " + meta.cwd) : null,
       meta.git_branch ? el("span", {}, "⎇ " + meta.git_branch) : null,
       meta.model ? el("span", {}, shortModel(meta.model)) : null,
@@ -578,9 +594,34 @@ function buildOutline() {
   outline.hidden = false;
   nav.hidden = false;
 
-  USER_TURNS.forEach((turn, i) => {
-    turn.id = "user-turn-" + i;
-    const full = (($(".turn-body", turn) || {}).textContent || "").trim().replace(/\s+/g, " ");
+  // Walk user prompts and abandoned-branch markers together in document order so
+  // branches appear in the outline at the point they occur. Branch entries use a
+  // separate class so they stay out of the numbered `.outline-item` sequence that
+  // highlightOutline()/nav rely on.
+  const anchors = $$(".turn-user:not(.sidechain), .branch-block", t).filter((n) =>
+    n.classList.contains("branch-block") ? true : !n.closest(".branch-block")
+  );
+  let ui = 0;
+  anchors.forEach((node) => {
+    if (node.classList.contains("branch-block")) {
+      const label = ((node.querySelector(".tool-name") || {}).textContent || "abandoned branch").replace(/^⑂\s*/, "");
+      const item = el(
+        "div",
+        { class: "outline-branch", title: label },
+        el("span", { class: "outline-num" }, "⑂"),
+        el("span", { class: "outline-text" }, label)
+      );
+      item.addEventListener("click", () => {
+        node.classList.remove("collapsed");
+        node.scrollIntoView({ block: "start" });
+        $("#main").scrollBy(0, -20);
+      });
+      list.append(item);
+      return;
+    }
+    const i = ui++;
+    node.id = "user-turn-" + i;
+    const full = (($(".turn-body", node) || {}).textContent || "").trim().replace(/\s+/g, " ");
     const label = full.slice(0, OUTLINE_MAX) || "(empty message)";
     const item = el(
       "div",
@@ -588,7 +629,7 @@ function buildOutline() {
       el("span", { class: "outline-num" }, String(i + 1)),
       el("span", { class: "outline-text" }, label)
     );
-    item.addEventListener("click", () => scrollToTurn(turn));
+    item.addEventListener("click", () => scrollToTurn(node));
     list.append(item);
   });
   highlightOutline();

@@ -631,6 +631,26 @@ def parse_cc_session(path: Path) -> dict:
 
     events = _fold_branches(records, events, active_leaf)
 
+    # Cross-session fork: branching into a new "section" spawns a fresh session
+    # file whose copied-over records each carry a `forkedFrom` pointer into the
+    # parent session. The last such pointer is the divergence point; everything
+    # after it is this session's new work. Surface it so the header can link back
+    # to the parent (where the other branch lives).
+    forked_from = None
+    for rec in records:
+        ff = rec.get("forkedFrom")
+        if isinstance(ff, dict) and ff.get("sessionId"):
+            forked_from = ff
+    fork_info = None
+    if forked_from:
+        sid = forked_from.get("sessionId")
+        cand = path.parent / f"{sid}.jsonl"
+        fork_info = {
+            "session_id": sid,
+            "message_uuid": forked_from.get("messageUuid"),
+            "file": str(cand) if cand.exists() else "",
+        }
+
     sub_meta = _subagent_meta(path, records)
     if sub_meta:
         meta.setdefault("cwd", decode_project_name(path.parent.parent.parent.name))
@@ -643,6 +663,7 @@ def parse_cc_session(path: Path) -> dict:
         or "(untitled session)",
         # Latest Claude Code AI-generated title (shown under the header); "" if none.
         "ai_title": title,
+        "forked_from": fork_info,
         "meta": meta,
         "events": events,
     }
