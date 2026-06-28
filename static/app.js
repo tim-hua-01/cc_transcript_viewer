@@ -274,7 +274,7 @@ function renderSidebar(query) {
     if (SELECTED_MODELS.size && !SELECTED_MODELS.has(s.model || "")) return false;
     if (SELECTED_DIRS.size && !SELECTED_DIRS.has(s.cwd || "")) return false;
     if (!q) return true;
-    const metaHit = (s.title + " " + (s.cwd || "") + " " + s.id + " " + s.agent).toLowerCase().includes(q);
+    const metaHit = (s.title + " " + (s.ai_title || "") + " " + (s.cwd || "") + " " + s.id + " " + s.agent).toLowerCase().includes(q);
     const contentHit = CONTENT_MATCHES && CONTENT_MATCHES.has(s.file);
     return metaHit || contentHit;
   });
@@ -391,6 +391,11 @@ function renderTranscript(data, opts = {}) {
       data.is_subagent ? el("span", { class: "sidechain-tag" }, "sub-agent") : null,
       " " + (data.title || "(untitled session)")
     ),
+    // The agent's own AI-generated session title (Claude Code's /resume label),
+    // shown as a subtitle when present and not identical to the prompt title.
+    data.ai_title && data.ai_title !== data.title
+      ? el("div", { class: "t-aititle", title: "AI-generated session title" }, "✦ " + data.ai_title)
+      : null,
     el(
       "div",
       { class: "t-meta" },

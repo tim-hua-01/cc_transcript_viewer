@@ -280,6 +280,9 @@ def _cc_session_summary_uncached(path: Path) -> dict:
         "id": path.stem,
         "file": str(path),
         "title": _first_user_text(records) or title or "(untitled session)",
+        # Latest Claude Code AI-generated session title (the one its /resume
+        # picker shows); "" if none yet. `title` holds the last ai-title record.
+        "ai_title": title,
         "cwd": cwd,
         "git_branch": git_branch,
         "version": version,
@@ -527,6 +530,8 @@ def parse_cc_session(path: Path) -> dict:
         or _first_user_text(records)
         or title
         or "(untitled session)",
+        # Latest Claude Code AI-generated title (shown under the header); "" if none.
+        "ai_title": title,
         "meta": meta,
         "events": events,
     }
@@ -705,6 +710,8 @@ def _session_segments(data: dict) -> tuple[str, str]:
     cwd = (data.get("meta") or {}).get("cwd")
     if cwd:
         rest.append(cwd)
+    if data.get("ai_title"):
+        rest.append(data["ai_title"])
     seen_first = False
     for ev in data.get("events", []) or []:
         if not seen_first and ev.get("kind") == "user":
