@@ -392,9 +392,9 @@ function renderTranscript(data, opts = {}) {
       " " + (data.title || "(untitled session)")
     ),
     // The agent's own AI-generated session title (Claude Code's /resume label),
-    // shown as a subtitle when present and not identical to the prompt title.
+    // shown as a muted subtitle when present and not identical to the prompt title.
     data.ai_title && data.ai_title !== data.title
-      ? el("div", { class: "t-aititle", title: "AI-generated session title" }, "✦ " + data.ai_title)
+      ? el("div", { class: "t-aititle", title: "AI-generated session title" }, "Short title: " + data.ai_title)
       : null,
     el(
       "div",
@@ -450,7 +450,9 @@ function renderTranscript(data, opts = {}) {
 // column of actions. User prompts are never folded — they stay distinct so they
 // remain clear anchors (and outline targets).
 function groupTurnRuns(container) {
-  const turns = $$(".turn", container);
+  // Only group top-level turns; turns nested inside an abandoned-branch block
+  // are their own (collapsed) context and shouldn't merge with the live thread.
+  const turns = $$(".turn", container).filter((t) => !t.closest(".branch-block"));
   let uid = 0;
   const sig = (t) => {
     if (t.classList.contains("turn-user")) return "user-" + uid++; // never groups
@@ -484,7 +486,7 @@ function captureView() {
   const main = $("#main");
   const atBottom = main.scrollHeight - main.scrollTop - main.clientHeight < 40;
   const expanded = {};
-  for (const sel of [".thinking-block", ".tool-block", ".status-block", ".instructions-block"])
+  for (const sel of [".thinking-block", ".tool-block", ".status-block", ".instructions-block", ".branch-block"])
     expanded[sel] = $$(sel).map((n) => !n.classList.contains("collapsed"));
   return { top: main.scrollTop, atBottom, expanded };
 }
@@ -561,7 +563,8 @@ function jumpUser(dir) {
 function buildOutline() {
   const t = $("#transcript");
   // top-level user prompts only — skip sub-agent (sidechain) prompts
-  USER_TURNS = $$(".turn-user:not(.sidechain)", t);
+  // Skip prompts inside abandoned branches — they aren't part of the live thread.
+  USER_TURNS = $$(".turn-user:not(.sidechain)", t).filter((n) => !n.closest(".branch-block"));
   const outline = $("#outline");
   const list = $("#outline-list");
   const nav = $("#nav-buttons");
@@ -614,6 +617,7 @@ function renderEvent(ev) {
     case "tool": return turnShell("tool", "Tool · " + (ev.name || "tool"), ev, [renderCodexTool(ev)]);
     case "web_search":
     case "web_call": return turnShell("web_call", "Web search", ev, [renderWebSearch(ev)]);
+    case "branch": return renderBranch(ev);
     case "status": return renderStatus(ev);
     case "context": return renderContext(ev);
     case "tokens": return renderTokens(ev);
@@ -774,6 +778,35 @@ function renderAttachment(ev) {
 }
 
 // ---------- Codex status / context / tokens ----------
+// An abandoned branch (a path you rewound away from), folded into a collapsed
+// marker at the fork. Expands in place to show the rewound turns, de-emphasized.
+function renderBranch(ev) {
+  const groups = ev.groups || [];
+  const count = ev.count || groups.reduce((n, g) => n + g.length, 0);
+  const label =
+    groups.length > 1
+      ? `⑂ ${count} messages on ${groups.length} abandoned branches`
+      : `⑂ ${count} message${count === 1 ? "" : "s"} on an abandoned branch`;
+  const block = el("div", { class: "branch-block collapsed" });
+  const head = el(
+    "div",
+    { class: "tool-head" },
+    el("span", { class: "chev" }, "▼"),
+    el("span", { class: "tool-name" }, label)
+  );
+  head.addEventListener("click", () => block.classList.toggle("collapsed"));
+  const body = el("div", { class: "tool-body" });
+  groups.forEach((g, i) => {
+    if (groups.length > 1) body.append(el("div", { class: "tool-section-label" }, "branch " + (i + 1)));
+    for (const child of g) {
+      const node = renderEvent(child);
+      if (node) body.append(node);
+    }
+  });
+  block.append(head, body);
+  return block;
+}
+
 function collapsibleBlock(cls, label, bodyNodes) {
   const block = el("div", { class: cls });
   const head = el(

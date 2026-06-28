@@ -247,7 +247,7 @@ body {
   padding: 14px 0 12px; margin-bottom: 8px;
 }
 .t-title { font-size: 19px; font-weight: 600; margin: 0 0 6px; }
-.t-aititle { font-size: 13px; color: var(--assistant); font-weight: 500; margin: 0 0 8px; opacity: .85; }
+.t-aititle { font-size: 12px; color: var(--muted); font-weight: 400; margin: 0 0 8px; }
 .t-meta { display: flex; gap: 10px; flex-wrap: wrap; font-size: 12px; color: var(--muted); align-items: center; }
 .t-controls { margin-top: 10px; display: flex; gap: 8px; flex-wrap: wrap; }
 .btn {
@@ -409,6 +409,19 @@ body.show-tokens .token-event { display: block; }
 .status-block .tool-head .chev, .instructions-block .tool-head .chev { font-size: 9px; transition: transform .15s; color: var(--muted); }
 .status-block.collapsed .chev, .instructions-block.collapsed .chev { transform: rotate(-90deg); }
 .status-block.collapsed .tool-body, .instructions-block.collapsed .tool-body { display: none; }
+
+/* Abandoned branch (rewound path), folded into a collapsible marker at the fork. */
+.branch-block { margin: 6px 0; border: 1px dashed var(--border); border-radius: 8px; overflow: hidden; background: repeating-linear-gradient(45deg, var(--bg-alt), var(--bg-alt) 10px, transparent 10px, transparent 20px); }
+.branch-block .tool-head {
+  cursor: pointer; user-select: none; display: flex; align-items: center; gap: 8px;
+  padding: 7px 12px; font-size: 12px; color: var(--muted); background: var(--bg-alt);
+}
+.branch-block .tool-head .chev { font-size: 9px; transition: transform .15s; color: var(--muted); }
+.branch-block.collapsed .chev { transform: rotate(-90deg); }
+.branch-block.collapsed .tool-body { display: none; }
+.branch-block .tool-body { padding: 6px 12px 10px; border-top: 1px dashed var(--border); }
+/* Dim the rewound turns so they read as context, not the live thread. */
+.branch-block .turn { opacity: .82; }
 
 .token-grid {
   display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 6px;

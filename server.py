@@ -334,6 +334,99 @@ def _normalize_tool_result_content(content) -> dict:
     return out
 
 
+def _strip_event(ev: dict) -> dict:
+    """Drop the internal branch-folding bookkeeping fields from an event."""
+    for k in ("_uuid", "_parent", "_idx"):
+        ev.pop(k, None)
+    return ev
+
+
+def _fold_branches(records: list[dict], events: list[dict], active_leaf) -> list[dict]:
+    """Keep only the active conversation path; fold rewound/edited branches into
+    inline ``branch`` events the frontend renders as collapsible markers.
+
+    Claude Code stores the conversation as a tree over ``uuid``/``parentUuid``.
+    Editing or rewinding a message forks the tree (a parent gains a second
+    child); every branch is appended to the same file, so a flat read shows
+    abandoned turns inline. The active tip is the most recent ``last-prompt``
+    leaf. We walk root→leaf and, at each fork on that path, bundle the abandoned
+    sibling subtree(s) into one marker placed just before the active child.
+
+    Falls back to the unchanged flat list when there are no forks, the leaf is
+    unusable, or the reconstructed path wouldn't cover every event (so we never
+    silently drop content).
+    """
+    children: dict = {}
+    byu: dict = {}
+    for r in records:
+        u = r.get("uuid")
+        if not u:
+            continue
+        byu[u] = r
+        children.setdefault(r.get("parentUuid"), []).append(u)
+
+    if not any(len(c) > 1 for c in children.values()):
+        return [_strip_event(e) for e in events]
+
+    if not active_leaf or active_leaf not in byu:
+        uuids = [r.get("uuid") for r in records if r.get("uuid")]
+        active_leaf = uuids[-1] if uuids else None
+    if not active_leaf:
+        return [_strip_event(e) for e in events]
+
+    chain, seen, node = [], set(), active_leaf
+    while node in byu and node not in seen:
+        seen.add(node)
+        chain.append(node)
+        node = byu[node].get("parentUuid")
+    chain.reverse()  # root → leaf
+
+    ev_by_uuid = {e["_uuid"]: e for e in events if e.get("_uuid")}
+
+    def subtree(root):
+        out, stack = [], [root]
+        while stack:
+            x = stack.pop()
+            out.append(x)
+            stack.extend(children.get(x, []))
+        return out
+
+    new_events: list = []
+    covered: set = set()
+    for i, u in enumerate(chain):
+        ev = ev_by_uuid.get(u)
+        if ev is not None:
+            new_events.append(ev)
+        covered.add(u)
+        nxt = chain[i + 1] if i + 1 < len(chain) else None
+        groups = []
+        for ab in (c for c in children.get(u, []) if c != nxt):
+            sub = subtree(ab)
+            covered.update(sub)
+            sub_evs = sorted(
+                (ev_by_uuid[x] for x in sub if x in ev_by_uuid),
+                key=lambda e: e["_idx"],
+            )
+            if sub_evs:
+                groups.append([_strip_event(e) for e in sub_evs])
+        if groups:
+            new_events.append(
+                {
+                    "kind": "branch",
+                    "ts": ev.get("ts") if ev else None,
+                    "groups": groups,
+                    "count": sum(len(g) for g in groups),
+                }
+            )
+
+    # Safety net: if anything with an event wasn't placed, don't risk dropping
+    # it — return the flat list unchanged.
+    all_ev_uuids = {e["_uuid"] for e in events if e.get("_uuid")}
+    if not all_ev_uuids.issubset(covered):
+        return [_strip_event(e) for e in events]
+    return [_strip_event(e) for e in new_events]
+
+
 def parse_cc_session(path: Path) -> dict:
     """Full structured parse of one Claude Code session, ready for rendering."""
     records = list(_iter_records(path))
@@ -360,12 +453,28 @@ def parse_cc_session(path: Path) -> dict:
     events = []
     title = ""
     meta = {}
+    active_leaf = None
+
+    # Tag each emitted event with its record's uuid/parentUuid (and file order)
+    # so branch folding can reorganize them afterward. `rec` is read from the
+    # loop scope at call time.
+    def emit(ev):
+        ev["_uuid"] = rec.get("uuid")
+        ev["_parent"] = rec.get("parentUuid")
+        ev["_idx"] = len(events)
+        events.append(ev)
+
     for rec in records:
         t = rec.get("type")
         if t == "ai-title" and rec.get("aiTitle"):
             title = rec["aiTitle"]
             continue
-        if t in ("permission-mode", "last-prompt", "file-history-snapshot"):
+        if t == "last-prompt":
+            # Points at the current branch tip; the latest one wins.
+            if rec.get("leafUuid"):
+                active_leaf = rec["leafUuid"]
+            continue
+        if t in ("permission-mode", "file-history-snapshot"):
             continue
 
         ts = rec.get("timestamp")
@@ -378,7 +487,7 @@ def parse_cc_session(path: Path) -> dict:
             meta["version"] = rec["version"]
 
         if t == "system":
-            events.append(
+            emit(
                 {
                     "kind": "system",
                     "ts": ts,
@@ -397,7 +506,7 @@ def parse_cc_session(path: Path) -> dict:
             # (not a `user` record), so surface it as a user turn — otherwise it
             # silently vanishes from the transcript and the outline.
             if att_type == "queued_command" and att.get("prompt"):
-                events.append(
+                emit(
                     {
                         "kind": "user",
                         "ts": ts,
@@ -440,7 +549,7 @@ def parse_cc_session(path: Path) -> dict:
                 ev["added_count"] = len(att.get("addedNames") or [])
                 ev["removed_count"] = len(att.get("removedNames") or [])
                 ev["readded_count"] = len(att.get("readdedNames") or [])
-            events.append(ev)
+            emit(ev)
             continue
 
         if t == "user":
@@ -466,7 +575,7 @@ def parse_cc_session(path: Path) -> dict:
                         has_text = True
             if not has_text:
                 continue
-            events.append(
+            emit(
                 {
                     "kind": "user",
                     "ts": ts,
@@ -503,7 +612,7 @@ def parse_cc_session(path: Path) -> dict:
             if not blocks:
                 continue
             usage = msg.get("usage", {}) or {}
-            events.append(
+            emit(
                 {
                     "kind": "assistant",
                     "ts": ts,
@@ -519,6 +628,8 @@ def parse_cc_session(path: Path) -> dict:
                 }
             )
             continue
+
+    events = _fold_branches(records, events, active_leaf)
 
     sub_meta = _subagent_meta(path, records)
     if sub_meta:
@@ -714,6 +825,13 @@ def _session_segments(data: dict) -> tuple[str, str]:
         rest.append(data["ai_title"])
     seen_first = False
     for ev in data.get("events", []) or []:
+        # Abandoned branches are folded into a `branch` event; index their text
+        # too so rewound content stays searchable.
+        if ev.get("kind") == "branch":
+            for group in ev.get("groups", []) or []:
+                for ge in group:
+                    rest.extend(_event_text(ge))
+            continue
         if not seen_first and ev.get("kind") == "user":
             seen_first = True
             first = " ".join(_event_text(ev))
