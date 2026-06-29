@@ -653,6 +653,7 @@ function renderEvent(ev) {
     case "assistant": return renderAssistant(ev);
     case "instructions": return renderInstructions(ev);
     case "system": return renderSystem(ev);
+    case "notice": return renderNotice(ev);
     case "attachment": return renderAttachment(ev);
     case "reasoning": return turnShell("reasoning", "Reasoning", ev, [renderReasoning(ev)]);
     case "tool": return turnShell("tool", "Tool · " + (ev.name || "tool"), ev, [renderCodexTool(ev)]);
@@ -771,6 +772,16 @@ function renderInstructions(ev) {
     [preFrom(ev.text || "", "payload")]
   );
   return turnShell("instructions", "📋 Instructions", ev, [block]);
+}
+
+// System-injected message recorded as a `user` record but not a real prompt
+// (background-task notification, slash-command echo, hook output, …). Rendered
+// de-emphasized and — crucially — not as a `.turn-user`, so it stays out of the
+// user-message outline on the right.
+function renderNotice(ev) {
+  return turnShell("notice", ev.label || "Notice", ev, [
+    preFrom(ev.text || ""),
+  ]);
 }
 
 function renderSystem(ev) {

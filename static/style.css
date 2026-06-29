@@ -294,7 +294,8 @@ body {
 }
 .turn-user .turn-head { color: var(--user); background: rgba(31,111,235,.055); border-color: rgba(31,111,235,.16); }
 .turn-assistant .turn-head { color: var(--assistant); background: rgba(192,73,42,.055); border-color: rgba(192,73,42,.16); }
-.turn-system .turn-head, .turn-attachment .turn-head { color: var(--muted); background: var(--bg-alt); }
+.turn-system .turn-head, .turn-attachment .turn-head, .turn-notice .turn-head { color: var(--muted); background: var(--bg-alt); }
+.turn-notice .turn-body { color: var(--muted); font-size: 13px; }
 .turn-body { padding: 4px 14px 12px; }
 .turn-time { margin-left: auto; font-weight: 400; color: var(--muted); font-size: 11px; }
 .sidechain-tag {

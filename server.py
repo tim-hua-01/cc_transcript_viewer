@@ -68,21 +68,67 @@ def _iter_records(path: Path):
                 continue
 
 
+# ---------- what counts as a "real" user message ----------
+# Claude Code records several system-injected messages as `user` records (or as
+# queued-command attachments) even though the user never typed them: background-
+# task notifications, slash-command machinery, hook output, and standalone system
+# reminders. They all open with a recognizable wrapper tag. We detect them in one
+# place so the title, the user count, and the rendered outline all agree on which
+# turns are genuine prompts. To support a new wrapper, add its opening tag here.
+_SYNTHETIC_USER_LABELS = {
+    "task-notification": "Background task",
+    "command-name": "Slash command",
+    "command-message": "Slash command",
+    "command-args": "Slash command",
+    "local-command-stdout": "Command output",
+    "local-command-stderr": "Command output",
+    "local-command-caveat": "Command caveat",
+    "system-reminder": "System reminder",
+    "user-prompt-submit-hook": "Hook",
+}
+
+
+def _user_record_text(rec: dict) -> str:
+    """Concatenated text of a `user` record's content. Ignores images and
+    tool-result blocks; returns '' when the record carries no text."""
+    content = rec.get("message", {}).get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = [
+            b.get("text", "")
+            for b in content
+            if isinstance(b, dict) and b.get("type") == "text"
+        ]
+        return "\n".join(p for p in parts if p)
+    return ""
+
+
+def _synthetic_user_notice(text) -> dict | None:
+    """If user-authored ``text`` is actually a system-injected wrapper rather than
+    a real prompt, return a ``{label, text}`` notice; otherwise ``None``.
+
+    The full message is surfaced verbatim (the frontend renders it as escaped
+    preformatted text, so the angle-bracket markup is preserved, not dropped).
+    """
+    if not isinstance(text, str):
+        return None
+    m = re.match(r"<([a-zA-Z0-9_-]+)", text.lstrip())
+    if not m:
+        return None
+    label = _SYNTHETIC_USER_LABELS.get(m.group(1))
+    if not label:
+        return None
+    return {"label": label, "text": text.strip()}
+
+
 def _first_user_text(records: list[dict]) -> str:
     """First real user prompt text (skip tool results / command noise)."""
     for rec in records:
         if rec.get("type") != "user" or rec.get("isSidechain"):
             continue
-        content = rec.get("message", {}).get("content")
-        text = ""
-        if isinstance(content, str):
-            text = content
-        elif isinstance(content, list):
-            parts = [b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text"]
-            text = "\n".join(p for p in parts if p)
-        if not text:
-            continue
-        if text.lstrip().startswith("<") and ("command-name" in text or "local-command" in text):
+        text = _user_record_text(rec)
+        if not text or _synthetic_user_notice(text):
             continue
         text = re.sub(r"<[^>]+>", " ", text)
         text = " ".join(text.split())
@@ -106,14 +152,7 @@ def _subagent_first_user_text(records: list[dict]) -> str:
     for rec in records:
         if rec.get("type") != "user":
             continue
-        content = rec.get("message", {}).get("content")
-        text = ""
-        if isinstance(content, str):
-            text = content
-        elif isinstance(content, list):
-            parts = [b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text"]
-            text = "\n".join(p for p in parts if p)
-        text = " ".join((text or "").split())
+        text = " ".join(_user_record_text(rec).split())
         if text:
             return text
     return ""
@@ -250,15 +289,17 @@ def _cc_session_summary_uncached(path: Path) -> dict:
             first_ts = first_ts or ts
             last_ts = ts
         if t == "user" and (is_subagent or not rec.get("isSidechain")):
-            content = rec.get("message", {}).get("content")
-            if isinstance(content, str) or (
-                isinstance(content, list)
-                and any(isinstance(b, dict) and b.get("type") == "text" for b in content)
-            ):
+            # Skip system-injected wrappers so the count matches the user outline.
+            text = _user_record_text(rec)
+            if text and not _synthetic_user_notice(text):
                 n_user += 1
         if t == "attachment" and not rec.get("isSidechain"):
             att = rec.get("attachment", {})
-            if att.get("type") == "queued_command" and att.get("prompt"):
+            if (
+                att.get("type") == "queued_command"
+                and att.get("prompt")
+                and not _synthetic_user_notice(att["prompt"])
+            ):
                 n_user += 1
         if t == "assistant":
             msg = rec.get("message", {})
@@ -334,6 +375,18 @@ def _normalize_tool_result_content(content) -> dict:
     return out
 
 
+def _notice_event(notice: dict, ts, is_sidechain: bool) -> dict:
+    """Build a `notice` event (a system-injected, non-prompt user record) from a
+    ``{label, text}`` returned by :func:`_synthetic_user_notice`."""
+    return {
+        "kind": "notice",
+        "ts": ts,
+        "label": notice["label"],
+        "text": notice["text"],
+        "is_sidechain": is_sidechain,
+    }
+
+
 def _strip_event(ev: dict) -> dict:
     """Drop the internal branch-folding bookkeeping fields from an event."""
     for k in ("_uuid", "_parent", "_idx"):
@@ -358,11 +411,13 @@ def _fold_branches(records: list[dict], events: list[dict], active_leaf) -> list
     """
     children: dict = {}
     byu: dict = {}
-    for r in records:
+    idx_by_uuid: dict = {}
+    for i, r in enumerate(records):
         u = r.get("uuid")
         if not u:
             continue
         byu[u] = r
+        idx_by_uuid.setdefault(u, i)
         children.setdefault(r.get("parentUuid"), []).append(u)
 
     if not any(len(c) > 1 for c in children.values()):
@@ -373,6 +428,21 @@ def _fold_branches(records: list[dict], events: list[dict], active_leaf) -> list
         active_leaf = uuids[-1] if uuids else None
     if not active_leaf:
         return [_strip_event(e) for e in events]
+
+    # `last-prompt` points at the prompt's leaf, but the assistant reply (and any
+    # tool results) are appended after it as descendants. Walk down to the real
+    # tip so those trailing turns stay on the active path instead of being folded
+    # away as an abandoned branch. At a fork the active continuation is always the
+    # latest-appended child (a rewind abandons the old branch and appends a new
+    # subtree after it).
+    node, guard = active_leaf, set()
+    while node not in guard:
+        guard.add(node)
+        kids = children.get(node)
+        if not kids:
+            break
+        node = max(kids, key=lambda c: idx_by_uuid.get(c, -1))
+    active_leaf = node
 
     chain, seen, node = [], set(), active_leaf
     while node in byu and node not in seen:
@@ -501,20 +571,26 @@ def parse_cc_session(path: Path) -> dict:
         if t == "attachment":
             att = rec.get("attachment", {})
             att_type = att.get("type")
-            # A message the user queued while Claude was still working. It's a
-            # genuine user prompt, but Claude Code records it as an attachment
-            # (not a `user` record), so surface it as a user turn — otherwise it
-            # silently vanishes from the transcript and the outline.
+            # A message queued while Claude was still working, recorded as an
+            # attachment rather than a `user` record. Usually a genuine user
+            # prompt — surface it as a user turn so it doesn't vanish from the
+            # transcript and outline. But system-injected events (e.g. background
+            # task notifications) also get queued; route those to a notice so they
+            # stay out of the user outline.
             if att_type == "queued_command" and att.get("prompt"):
-                emit(
-                    {
-                        "kind": "user",
-                        "ts": ts,
-                        "blocks": [{"type": "text", "text": att["prompt"]}],
-                        "is_sidechain": is_sidechain,
-                        "queued": True,
-                    }
-                )
+                notice = _synthetic_user_notice(att["prompt"])
+                if notice:
+                    emit(_notice_event(notice, ts, is_sidechain))
+                else:
+                    emit(
+                        {
+                            "kind": "user",
+                            "ts": ts,
+                            "blocks": [{"type": "text", "text": att["prompt"]}],
+                            "is_sidechain": is_sidechain,
+                            "queued": True,
+                        }
+                    )
                 continue
             raw_content = att.get("content")
             content = raw_content if isinstance(raw_content, str) else ""
@@ -574,6 +650,15 @@ def parse_cc_session(path: Path) -> dict:
                         blocks.append({"type": "image", "data_uri": data_uri})
                         has_text = True
             if not has_text:
+                continue
+            # System-injected wrappers (task notifications, slash-command echoes,
+            # hook output, …) are recorded as `user` records but aren't real
+            # prompts. Surface them as notices so they stay out of the user
+            # outline. Messages carrying an image are always genuine user input.
+            has_image = any(b.get("type") == "image" for b in blocks)
+            notice = None if has_image else _synthetic_user_notice(_user_record_text(rec))
+            if notice:
+                emit(_notice_event(notice, ts, is_sidechain))
                 continue
             emit(
                 {
