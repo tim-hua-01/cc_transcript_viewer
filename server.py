@@ -342,7 +342,9 @@ def cc_session_summary(path: Path) -> dict:
 def _cc_session_summary_uncached(path: Path) -> dict:
     records = list(_iter_records(path))
     is_subagent = path.parent.name == "subagents"
-    title = ""
+    ai_title = ""
+    claude_title = ""
+    agent_name = ""
     cwd = ""
     git_branch = ""
     version = ""
@@ -354,7 +356,11 @@ def _cc_session_summary_uncached(path: Path) -> dict:
     for rec in records:
         t = rec.get("type")
         if t == "ai-title" and rec.get("aiTitle"):
-            title = rec["aiTitle"]
+            ai_title = rec["aiTitle"]
+        elif t == "custom-title" and rec.get("customTitle"):
+            claude_title = rec["customTitle"]
+        elif t == "agent-name" and rec.get("agentName"):
+            agent_name = rec["agentName"]
         if rec.get("cwd"):
             cwd = rec["cwd"]
         if rec.get("gitBranch"):
@@ -397,10 +403,16 @@ def _cc_session_summary_uncached(path: Path) -> dict:
         "agent": "claude",
         "id": path.stem,
         "file": str(path),
-        "title": _first_user_text(records) or title or "(untitled session)",
+        "title": claude_title
+        or (sub_meta["title"] if sub_meta else "")
+        or _first_user_text(records)
+        or ai_title
+        or "(untitled session)",
         # Latest Claude Code AI-generated session title (the one its /resume
-        # picker shows); "" if none yet. `title` holds the last ai-title record.
-        "ai_title": title,
+        # picker shows); "" if none yet.
+        "ai_title": ai_title,
+        "claude_title": claude_title,
+        "agent_name": agent_name,
         "cwd": cwd,
         "git_branch": git_branch,
         "version": version,
@@ -416,7 +428,7 @@ def _cc_session_summary_uncached(path: Path) -> dict:
         "mtime": path.stat().st_mtime,
     }
     if sub_meta:
-        summary.update(sub_meta)
+        summary.update({key: value for key, value in sub_meta.items() if key != "title"})
     return summary
 
 
@@ -598,7 +610,9 @@ def parse_cc_session(path: Path) -> dict:
                     }
 
     events = []
-    title = ""
+    ai_title = ""
+    claude_title = ""
+    agent_name = ""
     meta = {}
     active_leaf = None
 
@@ -614,7 +628,22 @@ def parse_cc_session(path: Path) -> dict:
     for rec in records:
         t = rec.get("type")
         if t == "ai-title" and rec.get("aiTitle"):
-            title = rec["aiTitle"]
+            ai_title = rec["aiTitle"]
+            continue
+        if t == "custom-title" and rec.get("customTitle"):
+            claude_title = rec["customTitle"]
+            continue
+        if t == "agent-name" and rec.get("agentName"):
+            agent_name = rec["agentName"]
+            continue
+        if t == "pr-link":
+            pr_url = rec.get("prUrl") or ""
+            if pr_url.startswith(("https://", "http://")):
+                meta["pr"] = {
+                    "number": rec.get("prNumber"),
+                    "url": pr_url,
+                    "repository": rec.get("prRepository") or "",
+                }
             continue
         if t == "last-prompt":
             # Points at the current branch tip; the latest one wins.
@@ -634,15 +663,26 @@ def parse_cc_session(path: Path) -> dict:
             meta["version"] = rec["version"]
 
         if t == "system":
-            emit(
-                {
-                    "kind": "system",
-                    "ts": ts,
-                    "subtype": rec.get("subtype"),
-                    "text": rec.get("content") or rec.get("subtype") or "",
-                    "is_sidechain": is_sidechain,
+            ev = {
+                "kind": "system",
+                "ts": ts,
+                "subtype": rec.get("subtype"),
+                "text": rec.get("content") or rec.get("subtype") or "",
+                "is_sidechain": is_sidechain,
+            }
+            compact = rec.get("compactMetadata")
+            if rec.get("subtype") == "compact_boundary" and isinstance(compact, dict):
+                preserved = compact.get("preservedMessages") or {}
+                ev["compaction"] = {
+                    "trigger": compact.get("trigger"),
+                    "pre_tokens": compact.get("preTokens"),
+                    "post_tokens": compact.get("postTokens"),
+                    "duration_ms": compact.get("durationMs"),
+                    "preserved_messages": len(preserved.get("uuids") or [])
+                    if isinstance(preserved, dict) else None,
+                    "discovered_tools": len(compact.get("preCompactDiscoveredTools") or []),
                 }
-            )
+            emit(ev)
             continue
 
         if t == "attachment":
@@ -819,12 +859,15 @@ def parse_cc_session(path: Path) -> dict:
     out = {
         "agent": "claude",
         "id": path.stem,
-        "title": (sub_meta["title"] if sub_meta else "")
+        "title": claude_title
+        or (sub_meta["title"] if sub_meta else "")
         or _first_user_text(records)
-        or title
+        or ai_title
         or "(untitled session)",
         # Latest Claude Code AI-generated title (shown under the header); "" if none.
-        "ai_title": title,
+        "ai_title": ai_title,
+        "claude_title": claude_title,
+        "agent_name": agent_name,
         "forked_from": fork_info,
         "meta": meta,
         "events": events,
@@ -1060,7 +1103,11 @@ def search_sessions(query: str) -> list[dict]:
     out = []
     for s in list_sessions():
         user, rest = session_segments(s)
-        custom = s.get("custom_title") or ""
+        priority_titles = []
+        for title in (s.get("custom_title"), s.get("claude_title")):
+            if title and title not in priority_titles:
+                priority_titles.append(title)
+        custom = "\n".join(priority_titles)
         custom_low = custom.lower()
         user_low, rest_low = user.lower(), rest.lower()
         c_custom = custom_low.count(q)

@@ -60,6 +60,7 @@ def _write_fixture_session(
     session_id: str = "11111111-1111-1111-1111-111111111111",
     prompt: str = "hello world",
     additional_prompts: tuple[str, ...] = (),
+    extra_records: tuple[dict, ...] = (),
 ) -> Path:
     """A minimal but valid Claude Code transcript so endpoints have real data."""
     proj = projects_dir / "-tmp-proj"
@@ -80,6 +81,7 @@ def _write_fixture_session(
              "message": {"role": "assistant", "model": "claude-test",
                          "content": [{"type": "text", "text": "continued reply"}]}},
         ])
+    records.extend(extra_records)
     f.write_text("\n".join(json.dumps(r) for r in records) + "\n")
     return f
 
@@ -103,6 +105,26 @@ class SecurityTest(unittest.TestCase):
             "33333333-3333-3333-3333-333333333333",
             "unrelated opening prompt",
             ("laterpromptword in a subsequent user message",),
+        )
+        cls.metadata_fixture = _write_fixture_session(
+            cls.projects_dir,
+            "44444444-4444-4444-4444-444444444444",
+            "ordinary opening prompt",
+            extra_records=(
+                {"type": "ai-title", "aiTitle": "Generated title"},
+                {"type": "custom-title", "customTitle": "nativepriority title"},
+                {"type": "agent-name", "agentName": "reviewer"},
+                {"type": "pr-link", "prNumber": 42,
+                 "prUrl": "https://example.test/org/repo/pull/42",
+                 "prRepository": "org/repo"},
+                {"type": "system", "subtype": "compact_boundary",
+                 "timestamp": "2024-01-01T00:01:00Z", "content": "Conversation compacted",
+                 "compactMetadata": {
+                     "trigger": "manual", "preTokens": 12000, "postTokens": 3500,
+                     "durationMs": 1250, "preservedMessages": {"uuids": ["a", "b"]},
+                     "preCompactDiscoveredTools": ["Read", "Edit"],
+                 }},
+            ),
         )
         server.PROJECTS_DIR = cls.projects_dir
         server.CUSTOM_NAMES_FILE = tmp / "viewer" / "names.json"
@@ -194,6 +216,27 @@ class SecurityTest(unittest.TestCase):
             item for item in matches if item["file"] == str(self.later_prompt_fixture)
         )
         self.assertEqual(match["score"], server.USER_MSG_WEIGHT)
+
+    def test_claude_native_metadata_is_exposed(self):
+        summary = server.cc_session_summary(self.metadata_fixture)
+        self.assertEqual(summary["title"], "nativepriority title")
+        self.assertEqual(summary["claude_title"], "nativepriority title")
+        self.assertEqual(summary["agent_name"], "reviewer")
+
+        data = server.load_session(str(self.metadata_fixture))
+        self.assertEqual(data["title"], "nativepriority title")
+        self.assertEqual(data["meta"]["pr"]["number"], 42)
+        compact = next(ev for ev in data["events"] if ev.get("subtype") == "compact_boundary")
+        self.assertEqual(compact["compaction"]["pre_tokens"], 12000)
+        self.assertEqual(compact["compaction"]["post_tokens"], 3500)
+        self.assertEqual(compact["compaction"]["preserved_messages"], 2)
+        self.assertEqual(compact["compaction"]["discovered_tools"], 2)
+
+        match = next(
+            item for item in server.search_sessions("nativepriority")
+            if item["file"] == str(self.metadata_fixture)
+        )
+        self.assertEqual(match["score"], server.CUSTOM_TITLE_WEIGHT)
 
     # ----- exfiltration guarantees ----------------------------------------- #
 

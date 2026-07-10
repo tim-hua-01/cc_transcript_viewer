@@ -57,8 +57,9 @@ files that actually changed — the cost doesn't grow with how many transcripts 
   (Claude / Codex / Cursor), the project path, recency, message/tool/web counts, model, and the full
   session **id** (click to copy).
 - **Titles from the first message.** Each session is titled with the first ~100 characters of its
-  first user message, so the list reads like your prompts. Use the edit button beside an open
-  transcript's title to give it a persistent custom name; clearing the name restores the derived
+  first user message unless the source has an explicit title. Claude Code `/rename`/`--name` titles
+  are respected, and distinct branch/team agent names appear as badges. Use the edit button beside
+  an open transcript's title to give it a viewer-specific name; clearing it restores the source
   title. Overrides are stored separately in `~/.config/cc_transcript_viewer/names.json`, leaving the
   agent-owned transcripts and Cursor database untouched.
 - **Search across everything.** The search box (press `/` to focus) matches session **content** —
@@ -88,7 +89,10 @@ files that actually changed — the cost doesn't grow with how many transcripts 
 - **Survives `/compact`.** After a conversation is compacted, the harness injects bookkeeping records
   that most viewers drop. This one renders them: 📎 *referenced-file* pointers (including the note the
   model is actually handed when its context is rebuilt), 📄 re-attached file reads with their full
-  content, and tool-set changes (`+N tools available via ToolSearch`).
+  content, and tool-set changes (`+N tools available via ToolSearch`). Compaction boundaries show
+  their trigger, before/after token counts, duration, and preserved message/tool counts.
+- **Pull-request links.** Claude Code sessions associated with a PR show a safe, clickable PR link in
+  the transcript header.
 - **Images & sub-agents.** Inline images in prompts/replies and Codex `view_image` are shown. Claude
   Code sub-agents (which newer versions write to their own `…/<session-id>/subagents/agent-*.jsonl`
   files) and Codex sub-agent sessions are each picked up as their own entry in the same time-sorted

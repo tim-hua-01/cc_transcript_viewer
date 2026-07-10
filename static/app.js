@@ -319,6 +319,9 @@ function renderSidebar(query) {
         el("span", { class: "badge" }, `${s.n_user || 0}💬`),
         el("span", { class: "badge" }, `${s.n_tool || 0}🔧`),
         s.n_web ? el("span", { class: "badge" }, `${s.n_web}🌐`) : null,
+        s.agent_name && s.agent_name !== s.title
+          ? el("span", { class: "badge", title: "Claude agent name" }, s.agent_name)
+          : null,
         s.model ? el("span", { class: "badge" }, shortModel(s.model)) : null
       ),
       CONTENT_MATCHES && CONTENT_MATCHES.has(s.file)
@@ -470,6 +473,22 @@ function renderTranscript(data, opts = {}) {
               )
             : el("span", { title: "Branched from session " + data.forked_from.session_id },
                 "⑂ forked from " + (data.forked_from.session_id || "").slice(0, 8) + "…"))
+        : null,
+      meta.pr && meta.pr.url
+        ? el(
+            "a",
+            {
+              class: "parent-link",
+              href: meta.pr.url,
+              target: "_blank",
+              rel: "noopener noreferrer",
+              title: meta.pr.repository || "Open pull request",
+            },
+            meta.pr.number != null ? "PR #" + meta.pr.number : "Pull request"
+          )
+        : null,
+      data.agent_name && data.agent_name !== data.title
+        ? el("span", { class: "badge", title: "Claude agent name" }, data.agent_name)
         : null,
       meta.cwd ? el("span", {}, "📁 " + meta.cwd) : null,
       meta.git_branch ? el("span", {}, "⎇ " + meta.git_branch) : null,
@@ -830,6 +849,27 @@ function renderNotice(ev) {
 }
 
 function renderSystem(ev) {
+  if (ev.subtype === "compact_boundary") {
+    const body = [];
+    const c = ev.compaction || {};
+    const stats = [];
+    if (c.trigger) stats.push(el("span", { class: "badge" }, c.trigger));
+    if (c.pre_tokens != null || c.post_tokens != null) {
+      const before = c.pre_tokens != null ? Number(c.pre_tokens).toLocaleString() : "?";
+      const after = c.post_tokens != null ? Number(c.post_tokens).toLocaleString() : "?";
+      stats.push(el("span", { class: "badge" }, before + " → " + after + " tokens"));
+    }
+    if (c.duration_ms != null) stats.push(el("span", { class: "badge" }, fmtDuration(c.duration_ms)));
+    if (c.preserved_messages != null) {
+      stats.push(el("span", { class: "badge" }, c.preserved_messages + " messages preserved"));
+    }
+    if (c.discovered_tools) stats.push(el("span", { class: "badge" }, c.discovered_tools + " tools retained"));
+    if (stats.length) body.push(el("div", { class: "compact-stats" }, stats));
+    if (ev.text && ev.text !== ev.subtype) {
+      body.push(el("div", { class: "md", html: md(ev.text) }));
+    }
+    return turnShell("system", "Compaction", ev, body);
+  }
   return turnShell("system", "System · " + (ev.subtype || ""), ev, [
     el("div", { class: "md", html: md(ev.text || "") }),
   ]);
