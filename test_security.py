@@ -113,11 +113,26 @@ def _write_guardian_sessions(codex_home: Path) -> tuple[Path, Path]:
              "thread_source": "subagent", "source": {"subagent": {"other": "guardian"}},
              "cwd": "/tmp/proj", "base_instructions": {"text": "Review actions."},
          }},
+        {"timestamp": "2026-01-01T00:00:02Z", "type": "event_msg",
+         "payload": {"type": "task_started", "turn_id": "turn-1",
+                     "model_context_window": 200000,
+                     "collaboration_mode_kind": "codex-auto-review"}},
+        {"timestamp": "2026-01-01T00:00:02Z", "type": "turn_context",
+         "payload": {"turn_id": "turn-1", "model": "guardian-test", "effort": "low",
+                     "approval_policy": "never", "sandbox_policy": {"type": "read-only"}}},
         {"timestamp": "2026-01-01T00:00:03Z", "type": "event_msg",
          "payload": {"type": "user_message",
                      "message": "Review this action.\nPlanned action JSON:\n" + json.dumps(planned)}},
         {"timestamp": "2026-01-01T00:00:04Z", "type": "event_msg",
          "payload": {"type": "agent_message", "message": '{"outcome":"allow"}'}},
+        {"timestamp": "2026-01-01T00:00:04Z", "type": "event_msg",
+         "payload": {"type": "token_count", "info": {
+             "model_context_window": 200000,
+             "total_token_usage": {"input_tokens": 1200, "output_tokens": 20},
+         }}},
+        {"timestamp": "2026-01-01T00:00:05Z", "type": "event_msg",
+         "payload": {"type": "task_complete", "turn_id": "turn-1",
+                     "duration_ms": 2000, "time_to_first_token_ms": 500}},
     ]
     parent.write_text("\n".join(json.dumps(r) for r in parent_records) + "\n")
     guardian.write_text("\n".join(json.dumps(r) for r in guardian_records) + "\n")
@@ -289,7 +304,14 @@ class SecurityTest(unittest.TestCase):
         decision = next(ev for ev in data["events"] if ev["kind"] == "guardian_decision")
         self.assertEqual(request["request"]["tool"], "exec_command")
         self.assertEqual(request["request"]["command"][-1], "python3 -m unittest test_security")
+        self.assertEqual(request["metadata"]["model"], "guardian-test")
+        self.assertEqual(request["metadata"]["duration_ms"], 2000)
+        self.assertEqual(request["metadata"]["usage"]["input_tokens"], 1200)
         self.assertEqual(decision["outcome"], "allow")
+        self.assertFalse(
+            {"status", "context", "tokens", "raw"}
+            & {event["kind"] for event in data["events"]}
+        )
 
         sessions = server.list_sessions()
         parent_index = next(

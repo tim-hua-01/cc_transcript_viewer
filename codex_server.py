@@ -192,6 +192,70 @@ def _guardian_decision(text: str) -> dict | None:
     return value
 
 
+def _guardian_turn_metadata(events: list[dict]) -> dict:
+    """Collapse generic Codex bookkeeping for one guardian review turn."""
+    meta: dict = {}
+    raw_types = []
+    for ev in events:
+        kind = ev.get("kind")
+        if kind == "context":
+            for key in ("turn_id", "model", "effort", "approval_policy", "sandbox_policy", "summary"):
+                if ev.get(key) is not None:
+                    meta[key] = ev[key]
+        elif kind == "status":
+            if ev.get("turn_id"):
+                meta["turn_id"] = ev["turn_id"]
+            for key in ("context_window", "collaboration_mode", "duration_ms", "time_to_first_token_ms"):
+                if ev.get(key) is not None:
+                    meta[key] = ev[key]
+            if ev.get("reason"):
+                meta["completion_reason"] = ev["reason"]
+        elif kind == "tokens":
+            meta["usage"] = ev.get("usage") or {}
+            if ev.get("context_window") is not None:
+                meta["context_window"] = ev["context_window"]
+            if ev.get("rate_limits") is not None:
+                meta["rate_limits"] = ev["rate_limits"]
+        elif kind == "raw" and ev.get("record_type"):
+            raw_types.append(ev["record_type"])
+    if raw_types:
+        meta["record_types"] = sorted(set(raw_types))
+    return meta
+
+
+def _fold_guardian_metadata(events: list[dict]) -> list[dict]:
+    """Attach status/context/token records to their guardian request."""
+    metadata_kinds = {"status", "context", "tokens", "raw"}
+    out = []
+    pending: list[dict] = []
+    current_request = None
+
+    def finish() -> None:
+        nonlocal current_request, pending
+        if current_request is not None:
+            metadata = _guardian_turn_metadata(pending)
+            if metadata:
+                current_request["metadata"] = metadata
+        current_request = None
+        pending = []
+
+    for ev in events:
+        if ev.get("kind") in metadata_kinds:
+            if ev.get("kind") == "status" and ev.get("status") == "started" and current_request:
+                finish()
+            pending.append(ev)
+            if ev.get("kind") == "status" and ev.get("status") in {"complete", "aborted"}:
+                finish()
+            continue
+        if ev.get("kind") == "guardian_request":
+            if current_request is not None:
+                finish()
+            current_request = ev
+        out.append(ev)
+    finish()
+    return out
+
+
 def _read_thread_rows() -> dict[str, dict]:
     if not STATE_DB.exists():
         return {}
@@ -833,6 +897,9 @@ def parse_session(path: Path) -> dict:
                     },
                 )
             )
+
+    if is_guardian:
+        events = _fold_guardian_metadata(events)
 
     title = _first_user_message(records) or title
     if is_guardian:

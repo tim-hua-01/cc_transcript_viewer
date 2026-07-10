@@ -100,9 +100,9 @@ files that actually changed — the cost doesn't grow with how many transcripts 
   matched back to the `Task`/`Agent` call that spawned it (others — e.g. compaction agents — fall back
   to their opening prompt), and its transcript view links **↑ parent session**. Older transcripts that
   inline sub-agent turns as `isSidechain` records still render those turns inline, flagged **sub-agent**.
-  Codex approval guardians are linked under their parent session and render each escalated action as
-  a compact approval request followed by its allow/deny decision; the repeated parent-transcript
-  context remains available behind a collapsed disclosure.
+  Codex approval guardians are linked under their parent session. Each received transcript snapshot
+  or delta renders as a user-style review input followed by reasoning and the allow/deny decision;
+  generic task/context/token bookkeeping is consolidated into one collapsed metadata block per turn.
 - **Jump between prompts.** A right-side **outline** lists the top-level user messages as truncated,
   clickable headings and highlights the one you're reading as you scroll. Floating **↑ / ↓** buttons
   jump to the previous/next user prompt, and **⤓ Jump to end** (in the transcript controls) skips to

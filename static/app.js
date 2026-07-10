@@ -792,6 +792,9 @@ function renderAssistant(ev) {
 function renderGuardianRequest(ev) {
   const request = ev.request || {};
   const body = [];
+  if (ev.context) {
+    body.push(el("pre", { class: "payload guardian-review-context" }, ev.context));
+  }
   const facts = [];
   if (request.tool) facts.push(el("span", { class: "badge" }, request.tool));
   if (request.sandbox_permissions) facts.push(el("span", { class: "badge" }, request.sandbox_permissions));
@@ -805,15 +808,14 @@ function renderGuardianRequest(ev) {
   }
   if (request.cwd) body.push(el("div", { class: "attach-meta" }, "cwd: " + request.cwd));
   if (request.justification) body.push(el("div", { class: "guardian-justification" }, request.justification));
-  if (ev.context) {
-    body.push(el(
-      "details",
-      { class: "guardian-context" },
-      el("summary", {}, "Review context"),
-      el("pre", { class: "payload truncatable" }, ev.context)
+  if (ev.metadata && Object.keys(ev.metadata).length) {
+    body.push(collapsibleBlock(
+      "guardian-metadata collapsed",
+      "Turn metadata",
+      [preFrom(JSON.stringify(ev.metadata, null, 2))]
     ));
   }
-  return turnShell("guardian", "Approval request", ev, body);
+  return turnShell("user", "Review input", ev, body);
 }
 
 function renderGuardianDecision(ev) {
