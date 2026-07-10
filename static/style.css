@@ -256,7 +256,15 @@ body {
   background: linear-gradient(var(--bg) 70%, transparent);
   padding: 14px 0 12px; margin-bottom: 8px;
 }
-.t-title { font-size: 19px; font-weight: 600; margin: 0 0 6px; }
+.t-title-row { display: flex; align-items: flex-start; gap: 6px; margin-bottom: 6px; }
+.t-title { min-width: 0; font-size: 19px; font-weight: 600; margin: 0; overflow-wrap: anywhere; }
+.rename-btn {
+  flex: none; width: 28px; height: 28px; padding: 0; margin-top: 1px;
+  display: inline-flex; align-items: center; justify-content: center;
+  border: 1px solid transparent; border-radius: 6px;
+  background: transparent; color: var(--muted); cursor: pointer; font-size: 17px;
+}
+.rename-btn:hover { color: var(--accent); border-color: var(--border); background: var(--bg-elev); }
 .t-aititle { font-size: 12px; color: var(--muted); font-weight: 400; margin: 0 0 8px; }
 .t-meta { display: flex; gap: 10px; flex-wrap: wrap; font-size: 12px; color: var(--muted); align-items: center; }
 .t-controls { margin-top: 10px; display: flex; gap: 8px; flex-wrap: wrap; }

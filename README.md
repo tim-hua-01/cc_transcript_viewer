@@ -37,6 +37,7 @@ python3 server.py --host 0.0.0.0         # listen on all interfaces (LAN access 
 python3 server.py --projects-dir PATH    # different Claude Code projects directory
 python3 server.py --codex-home PATH      # different Codex home (default ~/.codex)
 python3 server.py --cursor-db PATH       # different Cursor state.vscdb (or its Cursor app-support dir)
+python3 server.py --custom-names-file PATH # different custom transcript names file
 ```
 
 By default the server binds **127.0.0.1** (loopback only), so it isn't reachable from other machines
@@ -56,10 +57,15 @@ files that actually changed — the cost doesn't grow with how many transcripts 
   (Claude / Codex / Cursor), the project path, recency, message/tool/web counts, model, and the full
   session **id** (click to copy).
 - **Titles from the first message.** Each session is titled with the first ~100 characters of its
-  first user message, so the list reads like your prompts.
+  first user message, so the list reads like your prompts. Use the edit button beside an open
+  transcript's title to give it a persistent custom name; clearing the name restores the derived
+  title. Overrides are stored separately in `~/.config/cc_transcript_viewer/names.json`, leaving the
+  agent-owned transcripts and Cursor database untouched.
 - **Search across everything.** The search box (press `/` to focus) matches session **content** —
   prompts, replies, reasoning, tool commands/paths/queries/outputs — in addition to titles and
-  directories, and shows a snippet of the match. Powered by `/api/search` with an mtime-keyed cache.
+  directories, and shows a snippet of the match. Custom-title matches rank above first-message
+  matches, which rank above ordinary transcript-content matches. Powered by `/api/search` with an
+  mtime-keyed cache.
 - **Filters that compose.**
   - **All / Claude / Codex / Cursor** chips.
   - A **Model** dropdown grouped by family (Claude / GPT / Other): tick a family to select all its
@@ -116,6 +122,9 @@ This app reads your private transcripts, so it's built to keep them on your mach
   `/api/local-image` serves only
   image-typed files (it renders images referenced by a transcript, which may live anywhere on disk),
   never arbitrary file contents.
+- **Name writes are confined.** `/api/session-name` accepts only JSON, verifies that the referenced
+  transcript exists under an allowed source, and writes only the configured custom-names file using
+  an atomic replacement.
 
 These guarantees are enforced by a zero-dependency test suite — run it yourself:
 
@@ -206,7 +215,7 @@ Restart Claude Code (or run `/config` once) for the change to take effect. Note 
 
 | File | Role |
 |------|------|
-| `server.py` | The unified stdlib HTTP server. Scans both transcript roots into one time-sorted list (caching per-file summaries by mtime), parses each Claude Code session into a clean event stream (pairing tool results to calls), dispatches `/api/session` to the right parser by transcript root, and serves the JSON API (`/api/sessions`, `/api/session?file=...`, `/api/search?q=...`, `/api/local-image`) plus the static frontend. `/api/session` only serves files under the allowed roots; `/api/local-image` serves only image-typed files; and a `Host`-header allowlist guards the loopback server against DNS rebinding. |
+| `server.py` | The unified stdlib HTTP server. Scans both transcript roots into one time-sorted list (caching per-file summaries by mtime), parses each Claude Code session into a clean event stream (pairing tool results to calls), dispatches `/api/session` to the right parser by transcript root, and serves the JSON API (`/api/sessions`, `/api/session?file=...`, `/api/session-name`, `/api/search?q=...`, `/api/local-image`) plus the static frontend. `/api/session` only serves files under the allowed roots; `/api/session-name` only updates the viewer-owned names file; `/api/local-image` serves only image-typed files; and a `Host`-header allowlist guards the loopback server against DNS rebinding. |
 | `codex_server.py` | Codex parsing library (imported by `server.py`): parses rollout JSONL, reads `state_5.sqlite` metadata, pairs tool calls with outputs, and renders `apply_patch` diffs. Call `configure(codex_home)` to point it elsewhere. |
 | `cursor_server.py` | Cursor parsing library (imported by `server.py`): reads Cursor's `state.vscdb` (`composerData`/`bubbleId`/`composer.content` keys) read-only, normalizes tool names/inputs onto the canonical renderers, reconstructs `edit_file` diffs from content snapshots, and emits events in the Claude Code block shape. Sessions are addressed by the `cursordb:<id>` scheme. Call `configure(db_path)` to point it elsewhere. |
 | `static/index.html`, `static/style.css`, `static/app.js` | The single frontend (vanilla JS, no build step). `app.js` dispatches on event kind and renders the Claude Code / Cursor (block-based) and Codex (flat) shapes, and runs the live-refresh poll loop. |

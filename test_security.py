@@ -55,14 +55,18 @@ def _guard(real):
     return wrapper
 
 
-def _write_fixture_session(projects_dir: Path) -> Path:
+def _write_fixture_session(
+    projects_dir: Path,
+    session_id: str = "11111111-1111-1111-1111-111111111111",
+    prompt: str = "hello world",
+) -> Path:
     """A minimal but valid Claude Code transcript so endpoints have real data."""
     proj = projects_dir / "-tmp-proj"
     proj.mkdir(parents=True, exist_ok=True)
-    f = proj / "11111111-1111-1111-1111-111111111111.jsonl"
+    f = proj / f"{session_id}.jsonl"
     records = [
         {"type": "user", "timestamp": "2024-01-01T00:00:00Z", "cwd": "/tmp/proj",
-         "message": {"role": "user", "content": "hello world"}},
+         "message": {"role": "user", "content": prompt}},
         {"type": "assistant", "timestamp": "2024-01-01T00:00:01Z",
          "message": {"role": "assistant", "model": "claude-test",
                      "content": [{"type": "text", "text": "hi there"}]}},
@@ -80,7 +84,14 @@ class SecurityTest(unittest.TestCase):
         cls.projects_dir = tmp / "projects"
         cls.projects_dir.mkdir()
         cls.fixture = _write_fixture_session(cls.projects_dir)
+        cls.priority_fixture = _write_fixture_session(
+            cls.projects_dir,
+            "22222222-2222-2222-2222-222222222222",
+            "priorityword in the first user message",
+        )
         server.PROJECTS_DIR = cls.projects_dir
+        server.CUSTOM_NAMES_FILE = tmp / "viewer" / "names.json"
+        server._CUSTOM_NAMES_CACHE = None
         codex.configure(tmp / "codex")  # empty -> no codex sessions
         cursor.configure(tmp / "cursor")  # empty -> no cursor sessions
 
@@ -110,6 +121,57 @@ class SecurityTest(unittest.TestCase):
                 return r.status, r.headers, r.read()
         except urllib.error.HTTPError as e:
             return e.code, e.headers, e.read()
+
+    def put_json(self, path: str, payload: dict):
+        url = f"http://127.0.0.1:{self.port}{path}"
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode(),
+            method="PUT",
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=5) as r:
+                return r.status, r.headers, r.read()
+        except urllib.error.HTTPError as e:
+            return e.code, e.headers, e.read()
+
+    # ----- viewer-owned custom names -------------------------------------- #
+
+    def test_custom_name_can_be_set_and_cleared(self):
+        payload = {"file": str(self.fixture), "name": "My custom transcript"}
+        status, _, body = self.put_json("/api/session-name", payload)
+        self.assertEqual(status, 200)
+        saved = json.loads(body)
+        self.assertEqual(saved["title"], "My custom transcript")
+        self.assertEqual(saved["custom_title"], "My custom transcript")
+        self.assertEqual(saved["original_title"], "hello world")
+
+        _, _, body = self.get("/api/sessions")
+        summary = next(s for s in json.loads(body)["sessions"] if s["file"] == str(self.fixture))
+        self.assertEqual(summary["title"], "My custom transcript")
+
+        status, _, body = self.put_json(
+            "/api/session-name", {"file": str(self.fixture), "name": ""}
+        )
+        self.assertEqual(status, 200)
+        restored = json.loads(body)
+        self.assertEqual(restored["title"], "hello world")
+        self.assertEqual(restored["custom_title"], "")
+
+    def test_custom_title_search_outranks_first_message(self):
+        data = server.load_session(str(self.fixture))
+        server._set_custom_name(data, "priorityword custom name")
+        try:
+            matches = server.search_sessions("priorityword")
+            self.assertEqual(matches[0]["file"], str(self.fixture))
+            first_message_match = next(
+                match for match in matches if match["file"] == str(self.priority_fixture)
+            )
+            self.assertGreater(matches[0]["score"], first_message_match["score"])
+            self.assertGreaterEqual(matches[0]["score"], server.CUSTOM_TITLE_WEIGHT)
+        finally:
+            server._set_custom_name(data, "")
 
     # ----- exfiltration guarantees ----------------------------------------- #
 

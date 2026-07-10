@@ -17,6 +17,7 @@ import argparse
 import json
 import mimetypes
 import re
+import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -26,6 +27,9 @@ import cursor_server as cursor
 
 STATIC_DIR = Path(__file__).parent / "static"
 DEFAULT_PROJECTS_DIR = Path.home() / ".claude" / "projects"
+DEFAULT_CUSTOM_NAMES_FILE = (
+    Path.home() / ".config" / "cc_transcript_viewer" / "names.json"
+)
 # Loopback only by default: the app reads private transcripts, so it must not be
 # reachable from the network unless the user deliberately overrides --host.
 DEFAULT_HOST = "127.0.0.1"
@@ -40,6 +44,79 @@ HOST_CHECK = True
 
 # Set by main() so handlers can reach it.
 PROJECTS_DIR = DEFAULT_PROJECTS_DIR
+CUSTOM_NAMES_FILE = DEFAULT_CUSTOM_NAMES_FILE
+
+
+# ---------------------------------------------------------------------------
+# Viewer-owned custom transcript names
+# ---------------------------------------------------------------------------
+_CUSTOM_NAMES_LOCK = threading.Lock()
+_CUSTOM_NAMES_CACHE: tuple[int | None, dict[str, str]] | None = None
+
+
+def _load_custom_names() -> dict[str, str]:
+    """Load the custom-name map, refreshing when it changes on disk."""
+    global _CUSTOM_NAMES_CACHE
+    with _CUSTOM_NAMES_LOCK:
+        try:
+            mtime = CUSTOM_NAMES_FILE.stat().st_mtime_ns
+        except OSError:
+            mtime = None
+        if _CUSTOM_NAMES_CACHE and _CUSTOM_NAMES_CACHE[0] == mtime:
+            return _CUSTOM_NAMES_CACHE[1].copy()
+        try:
+            raw = json.loads(CUSTOM_NAMES_FILE.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            raw = {}
+        names = {
+            str(key): value
+            for key, value in raw.items()
+            if isinstance(value, str) and value.strip()
+        } if isinstance(raw, dict) else {}
+        _CUSTOM_NAMES_CACHE = (mtime, names)
+        return names.copy()
+
+
+def _custom_name_key(session: dict) -> str:
+    """Stable across transcript moves, including Codex archival."""
+    parts = [session.get("agent", ""), session.get("id", "")]
+    if session.get("is_subagent") and session.get("parent_id"):
+        parts.insert(1, session["parent_id"])
+    return ":".join(str(part) for part in parts)
+
+
+def _apply_custom_name(session: dict) -> dict:
+    """Add original/custom title fields and select the effective title."""
+    original = session.get("original_title") or session.get("title") or "(untitled session)"
+    custom = _load_custom_names().get(_custom_name_key(session), "")
+    session["original_title"] = original
+    session["custom_title"] = custom
+    session["title"] = custom or original
+    return session
+
+
+def _set_custom_name(session: dict, name: str) -> None:
+    """Persist one override using an atomic same-directory replacement."""
+    global _CUSTOM_NAMES_CACHE
+    key = _custom_name_key(session)
+    with _CUSTOM_NAMES_LOCK:
+        try:
+            raw = json.loads(CUSTOM_NAMES_FILE.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            raw = {}
+        names = raw if isinstance(raw, dict) else {}
+        if name:
+            names[key] = name
+        else:
+            names.pop(key, None)
+        CUSTOM_NAMES_FILE.parent.mkdir(parents=True, exist_ok=True)
+        temp = CUSTOM_NAMES_FILE.with_name(CUSTOM_NAMES_FILE.name + ".tmp")
+        temp.write_text(
+            json.dumps(names, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        temp.replace(CUSTOM_NAMES_FILE)
+        _CUSTOM_NAMES_CACHE = (CUSTOM_NAMES_FILE.stat().st_mtime_ns, names.copy())
 
 
 # ---------------------------------------------------------------------------
@@ -799,6 +876,8 @@ def list_sessions() -> list[dict]:
     except Exception:  # noqa: BLE001 — never let Cursor errors hide other sessions
         pass
 
+    for session in out:
+        _apply_custom_name(session)
     out.sort(key=lambda s: s.get("mtime") or 0, reverse=True)
 
     # Place each sub-agent directly under its parent session rather than at its
@@ -860,11 +939,13 @@ def load_session(file_id: str) -> dict | None:
         data = cursor.parse_session_by_id(file_id[len(cursor.SESSION_SCHEME):])
         if data is not None:
             data["agent"] = "cursor"
+            _apply_custom_name(data)
         return data
     target = Path(file_id).expanduser().resolve()
     if not target.exists():
         return None
-    return parse_session(target)
+    data = parse_session(target)
+    return _apply_custom_name(data) if data is not None else None
 
 
 # ---------------------------------------------------------------------------
@@ -875,6 +956,7 @@ _TEXT_CACHE: dict[str, tuple[float, str, str]] = {}
 
 # A hit inside the first user message is worth this many ordinary hits.
 FIRST_MSG_WEIGHT = 1000
+CUSTOM_TITLE_WEIGHT = 1_000_000
 
 
 def _event_text(ev: dict) -> list[str]:
@@ -969,9 +1051,8 @@ def session_segments(s: dict) -> tuple[str, str]:
 def search_sessions(query: str) -> list[dict]:
     """Return [{file, snippet, score}] for sessions whose content matches `query`.
 
-    Score = (#hits in the first user message) * FIRST_MSG_WEIGHT + (#hits elsewhere),
-    so a single first-message hit outranks many scattered ones; among equal scores,
-    an earlier first occurrence wins. Sorted best-first.
+    Custom-title hits outrank first-user-message hits, which outrank ordinary
+    transcript hits. Among equal scores, an earlier first occurrence wins.
     """
     q = (query or "").strip().lower()
     if not q:
@@ -979,22 +1060,29 @@ def search_sessions(query: str) -> list[dict]:
     out = []
     for s in list_sessions():
         first, rest = session_segments(s)
+        custom = s.get("custom_title") or ""
+        custom_low = custom.lower()
         first_low, rest_low = first.lower(), rest.lower()
+        c_custom = custom_low.count(q)
         c_first = first_low.count(q)
         c_rest = rest_low.count(q)
-        if not c_first and not c_rest:
+        if not c_custom and not c_first and not c_rest:
             continue
-        score = c_first * FIRST_MSG_WEIGHT + c_rest
-        # snippet from the earliest occurrence (first message preferred)
-        if c_first:
+        score = c_custom * CUSTOM_TITLE_WEIGHT + c_first * FIRST_MSG_WEIGHT + c_rest
+        if c_custom:
+            combined, idx = custom, custom_low.find(q)
+            pos = idx
+        elif c_first:
             combined, idx = first, first_low.find(q)
+            pos = len(custom) + idx
         else:
             combined, idx = rest, rest_low.find(q)
+            pos = len(custom) + len(first) + idx
         start = max(0, idx - 50)
         snippet = combined[start:idx + len(q) + 70].replace("\n", " ").strip()
         if start > 0:
             snippet = "…" + snippet
-        out.append({"file": s["file"], "snippet": snippet, "score": score, "pos": idx if c_first else len(first) + idx})
+        out.append({"file": s["file"], "snippet": snippet, "score": score, "pos": pos})
     out.sort(key=lambda m: (-m["score"], m["pos"]))
     return out
 
@@ -1121,14 +1209,68 @@ class Handler(BaseHTTPRequestHandler):
 
         self.send_error(404)
 
+    def do_PUT(self):
+        if HOST_CHECK and not self._host_allowed():
+            self.send_error(403, "Host not allowed")
+            return
+
+        if urlparse(self.path).path != "/api/session-name":
+            self.send_error(404)
+            return
+        if not self.headers.get("Content-Type", "").lower().startswith("application/json"):
+            self._send_json({"error": "expected application/json"}, status=415)
+            return
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            length = 0
+        if length <= 0 or length > 4096:
+            self._send_json({"error": "invalid request size"}, status=400)
+            return
+        try:
+            body = json.loads(self.rfile.read(length))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            self._send_json({"error": "invalid JSON"}, status=400)
+            return
+        file_id = body.get("file") if isinstance(body, dict) else None
+        name = body.get("name") if isinstance(body, dict) else None
+        if not isinstance(file_id, str) or not isinstance(name, str):
+            self._send_json({"error": "file and name must be strings"}, status=400)
+            return
+        name = " ".join(name.split())
+        if len(name) > 200:
+            self._send_json({"error": "name must be at most 200 characters"}, status=400)
+            return
+        try:
+            data = load_session(file_id)
+            if data is None:
+                self._send_json({"error": "session not found or forbidden"}, status=404)
+                return
+            _set_custom_name(data, name)
+            _apply_custom_name(data)
+        except Exception as e:  # noqa: BLE001
+            self._send_json({"error": str(e)}, status=500)
+            return
+        self._send_json({
+            "title": data["title"],
+            "original_title": data["original_title"],
+            "custom_title": data["custom_title"],
+        })
+
 
 def main():
-    global PROJECTS_DIR, HOST_CHECK
+    global PROJECTS_DIR, CUSTOM_NAMES_FILE, HOST_CHECK
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--port", type=int, default=3132)
     ap.add_argument("--host", default=DEFAULT_HOST)
     ap.add_argument("--projects-dir", type=Path, default=DEFAULT_PROJECTS_DIR)
     ap.add_argument("--codex-home", type=Path, default=codex.DEFAULT_CODEX_HOME)
+    ap.add_argument(
+        "--custom-names-file",
+        type=Path,
+        default=DEFAULT_CUSTOM_NAMES_FILE,
+        help="viewer-owned custom transcript names JSON file",
+    )
     ap.add_argument(
         "--cursor-db",
         type=Path,
@@ -1138,6 +1280,7 @@ def main():
     args = ap.parse_args()
 
     PROJECTS_DIR = args.projects_dir.expanduser()
+    CUSTOM_NAMES_FILE = args.custom_names_file.expanduser()
     codex.configure(args.codex_home)
     cursor.configure(args.cursor_db)
     # Enforce the Host allowlist only on the safe loopback default; if the user

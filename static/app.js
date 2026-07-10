@@ -123,6 +123,7 @@ let AGENT_FILTER = "all";
 // ---------- live auto-refresh (always on) ----------
 const POLL_MS = 1000;            // how often to rescan disk for changes
 let LAST_RENDERED_MTIME = 0;     // mtime of the open transcript as last rendered
+let LAST_RENDERED_TITLE = "";    // detects custom-name changes without transcript writes
 let LAST_SIG = "";               // cheap fingerprint of the session list
 // file -> snippet for the active content search, or null when no search is active
 let CONTENT_MATCHES = null;
@@ -144,7 +145,7 @@ async function loadSessions() {
 // removed, or rewritten (mtime bumps). Lets the poller skip needless rebuilds.
 function sessionsSignature(list) {
   let sig = list.length + "|";
-  for (const s of list) sig += s.file + ":" + (s.mtime || 0) + ";";
+  for (const s of list) sig += s.file + ":" + (s.mtime || 0) + ":" + (s.custom_title || "") + ";";
   return sig;
 }
 
@@ -274,7 +275,10 @@ function renderSidebar(query) {
     if (SELECTED_MODELS.size && !SELECTED_MODELS.has(s.model || "")) return false;
     if (SELECTED_DIRS.size && !SELECTED_DIRS.has(s.cwd || "")) return false;
     if (!q) return true;
-    const metaHit = (s.title + " " + (s.ai_title || "") + " " + (s.cwd || "") + " " + s.id + " " + s.agent).toLowerCase().includes(q);
+    const metaHit = (
+      s.title + " " + (s.original_title || "") + " " + (s.ai_title || "") + " " +
+      (s.cwd || "") + " " + s.id + " " + s.agent
+    ).toLowerCase().includes(q);
     const contentHit = CONTENT_MATCHES && CONTENT_MATCHES.has(s.file);
     return metaHit || contentHit;
   });
@@ -345,6 +349,33 @@ function copyId(e, id) {
   );
 }
 
+async function renameSession(data) {
+  const file = CURRENT_FILE;
+  const entered = window.prompt(
+    "Custom transcript name (leave blank to restore the original)",
+    data.custom_title || ""
+  );
+  if (entered === null) return;
+  try {
+    const res = await fetch("/api/session-name", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ file, name: entered }),
+    });
+    const result = await res.json();
+    if (!res.ok || result.error) throw new Error(result.error || `HTTP ${res.status}`);
+    Object.assign(data, result);
+    const summary = SESSIONS.find((s) => s.file === file);
+    if (summary) Object.assign(summary, result);
+    LAST_SIG = sessionsSignature(SESSIONS);
+    await runSearch($("#search").value);
+    markActive();
+    if (CURRENT_FILE === file) renderTranscript(data, { keepScroll: true });
+  } catch (e) {
+    window.alert("Could not save transcript name: " + String(e));
+  }
+}
+
 // ---------- session view ----------
 async function openSession(file, itemEl) {
   CURRENT_FILE = file;
@@ -378,6 +409,7 @@ function renderTranscript(data, opts = {}) {
   const t = $("#transcript");
   t.innerHTML = "";
   CURRENT_AGENT = data.agent || "claude";
+  LAST_RENDERED_TITLE = data.title || "";
   const isCodex = CURRENT_AGENT === "codex";
 
   const meta = data.meta || {};
@@ -385,15 +417,28 @@ function renderTranscript(data, opts = {}) {
     "div",
     { class: "t-header" },
     el(
-      "h1",
-      { class: "t-title" },
-      el("span", { class: "agent-tag agent-" + data.agent }, agentLabel(data.agent)),
-      data.is_subagent ? el("span", { class: "sidechain-tag" }, "sub-agent") : null,
-      " " + (data.title || "(untitled session)")
+      "div",
+      { class: "t-title-row" },
+      el(
+        "h1",
+        { class: "t-title" },
+        el("span", { class: "agent-tag agent-" + data.agent }, agentLabel(data.agent)),
+        data.is_subagent ? el("span", { class: "sidechain-tag" }, "sub-agent") : null,
+        " " + (data.title || "(untitled session)")
+      ),
+      el("button", {
+        class: "rename-btn",
+        title: "Rename transcript",
+        "aria-label": "Rename transcript",
+        onclick: () => renameSession(data),
+      }, "✎")
     ),
+    data.custom_title && data.original_title
+      ? el("div", { class: "t-aititle", title: "Title derived from the transcript" }, "Original title: " + data.original_title)
+      : null,
     // The agent's own AI-generated session title (Claude Code's /resume label),
     // shown as a muted subtitle when present and not identical to the prompt title.
-    data.ai_title && data.ai_title !== data.title
+    data.ai_title && data.ai_title !== data.original_title
       ? el("div", { class: "t-aititle", title: "AI-generated session title" }, "Short title: " + data.ai_title)
       : null,
     el(
@@ -1339,7 +1384,9 @@ async function poll() {
     // Re-render the open transcript only when its file actually grew/changed.
     if (CURRENT_FILE) {
       const cur = next.find((s) => s.file === CURRENT_FILE);
-      if (cur && (cur.mtime || 0) > LAST_RENDERED_MTIME) await refreshOpenTranscript();
+      if (cur && (
+        (cur.mtime || 0) > LAST_RENDERED_MTIME || (cur.title || "") !== LAST_RENDERED_TITLE
+      )) await refreshOpenTranscript();
     }
   } finally {
     polling = false;
