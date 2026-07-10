@@ -317,7 +317,10 @@ body {
 .guardian-decision { width: fit-content; font-size: 12px; font-weight: 700; padding: 3px 8px; border-radius: 5px; }
 .guardian-allow { color: var(--tool); background: rgba(31,122,69,.09); border: 1px solid rgba(31,122,69,.24); }
 .guardian-deny { color: var(--tool-err); background: rgba(209,36,47,.08); border: 1px solid rgba(209,36,47,.22); }
-.turn-metadata { margin-top: 10px; border: 1px solid var(--border); border-radius: 7px; overflow: hidden; }
+.turn-metadata { margin-top: 8px; border-top: 1px solid var(--border); color: var(--muted); }
+.turn-metadata .tool-head { padding: 7px 0 2px; background: transparent; color: var(--muted); }
+.turn-metadata .tool-name { font-family: var(--sans); font-weight: 500; }
+.turn-metadata .tool-body { padding: 8px 0 0; border-top: 0; }
 .turn-metadata.collapsed .chev { transform: rotate(-90deg); }
 .turn-metadata.collapsed .tool-body { display: none; }
 pre.guardian-review-context { max-height: 640px; margin: 8px 0 12px; }
