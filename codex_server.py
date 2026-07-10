@@ -293,8 +293,8 @@ def _guardian_decision(text: str) -> dict | None:
     return value
 
 
-def _guardian_turn_metadata(events: list[dict]) -> dict:
-    """Collapse generic Codex bookkeeping for one guardian review turn."""
+def _turn_metadata(events: list[dict]) -> dict:
+    """Collapse generic Codex bookkeeping for one model turn."""
     meta: dict = {}
     raw_types = []
     for ev in events:
@@ -324,34 +324,40 @@ def _guardian_turn_metadata(events: list[dict]) -> dict:
     return meta
 
 
-def _fold_guardian_metadata(events: list[dict]) -> list[dict]:
-    """Attach status/context/token records to their guardian request."""
-    metadata_kinds = {"status", "context", "tokens", "raw"}
+def _fold_turn_metadata(
+    events: list[dict],
+    *,
+    anchor_kinds: set[str],
+    metadata_kinds: set[str] | None = None,
+    prefer_first: bool = False,
+    field: str = "turn_metadata",
+) -> list[dict]:
+    """Attach turn bookkeeping to a semantic event instead of separate cards."""
+    metadata_kinds = metadata_kinds or {"status", "context", "tokens"}
     out = []
     pending: list[dict] = []
-    current_request = None
+    anchors: list[dict] = []
 
     def finish() -> None:
-        nonlocal current_request, pending
-        if current_request is not None:
-            metadata = _guardian_turn_metadata(pending)
+        nonlocal anchors, pending
+        if anchors:
+            metadata = _turn_metadata(pending)
             if metadata:
-                current_request["metadata"] = metadata
-        current_request = None
+                target = anchors[0] if prefer_first else anchors[-1]
+                target[field] = metadata
+        anchors = []
         pending = []
 
     for ev in events:
         if ev.get("kind") in metadata_kinds:
-            if ev.get("kind") == "status" and ev.get("status") == "started" and current_request:
+            if ev.get("kind") == "status" and ev.get("status") == "started" and anchors:
                 finish()
             pending.append(ev)
             if ev.get("kind") == "status" and ev.get("status") in {"complete", "aborted"}:
                 finish()
             continue
-        if ev.get("kind") == "guardian_request":
-            if current_request is not None:
-                finish()
-            current_request = ev
+        if ev.get("kind") in anchor_kinds:
+            anchors.append(ev)
         out.append(ev)
     finish()
     return out
@@ -624,8 +630,31 @@ def _local_image_payload(path_value) -> dict | None:
     }
 
 
+def _unwrap_exec_text(text: str) -> dict | None:
+    candidate = text.rpartition("Output:")[2].strip() if "Output:" in text else text.strip()
+    try:
+        inner = json.loads(candidate)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(inner, dict) or "output" not in inner:
+        return None
+    metadata = {
+        key: inner[key]
+        for key in (
+            "session_id", "chunk_id", "exit_code", "wall_time_seconds",
+            "original_token_count", "output_hint",
+        )
+        if inner.get(key) is not None
+    }
+    return {
+        "text": str(inner.get("output") or ""),
+        "metadata": metadata,
+        "is_error": bool(inner.get("exit_code") is not None and inner.get("exit_code") != 0),
+    }
+
+
 def _normalize_tool_output(output, name: str = "", args=None) -> dict:
-    normalized = {"text": "", "images": [], "raw": None}
+    normalized = {"text": "", "images": [], "raw": None, "metadata": {}, "is_error": False}
     args = args if isinstance(args, dict) else {}
     local_image = None
     if name == "view_image":
@@ -636,6 +665,11 @@ def _normalize_tool_output(output, name: str = "", args=None) -> dict:
     if output is None:
         return normalized
     if isinstance(output, str):
+        if name == "exec":
+            unwrapped = _unwrap_exec_text(output)
+            if unwrapped:
+                normalized.update(unwrapped)
+                return normalized
         normalized["text"] = output
         return normalized
     if isinstance(output, list):
@@ -662,6 +696,10 @@ def _normalize_tool_output(output, name: str = "", args=None) -> dict:
                 raw_remainder.append(item)
         normalized["text"] = "\n".join(t for t in texts if t)
         normalized["images"] = images
+        if name == "exec":
+            unwrapped = _unwrap_exec_text(normalized["text"])
+            if unwrapped:
+                normalized.update(unwrapped)
         if raw_remainder:
             normalized["raw"] = raw_remainder
         return normalized
@@ -746,7 +784,8 @@ def parse_session(path: Path) -> dict:
                     "output": normalized["text"] or (existing or {}).get("output", ""),
                     "images": normalized["images"],
                     "raw": raw,
-                    "is_error": bool(payload.get("is_error")),
+                    "metadata": normalized.get("metadata") or {},
+                    "is_error": bool(payload.get("is_error")) or normalized.get("is_error", False),
                 }
         elif rec.get("type") == "event_msg" and payload.get("type") == "patch_apply_end":
             call_id = payload.get("call_id")
@@ -1038,7 +1077,15 @@ def parse_session(path: Path) -> dict:
             )
 
     if is_guardian:
-        events = _fold_guardian_metadata(events)
+        events = _fold_turn_metadata(
+            events,
+            anchor_kinds={"guardian_request"},
+            metadata_kinds={"status", "context", "tokens", "raw"},
+            prefer_first=True,
+            field="metadata",
+        )
+    else:
+        events = _fold_turn_metadata(events, anchor_kinds={"user", "assistant"})
 
     title = _first_user_message(records) or title
     if is_guardian:

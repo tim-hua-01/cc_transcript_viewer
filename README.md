@@ -82,12 +82,14 @@ files that actually changed — the cost doesn't grow with how many transcripts 
     - Codex: `function_call`, `custom_tool_call`, `apply_patch` (rendered as a colored diff),
       `exec_command`/`shell`, `write_stdin`, `view_image`, web search, plus fallback JSON. Newer
       orchestration-style `exec` calls are unpacked into their underlying commands or patches, with
-      the generated JavaScript kept in a secondary disclosure.
+      the generated JavaScript kept in a secondary disclosure. Wrapper results are reduced to actual
+      stdout plus exit/session/timing metadata.
     - Cursor: tool calls **with their outputs** — `run_terminal_command` (stdout + exit code),
       `read_file` (contents), `edit_file` (reconstructed before/after diff), `ripgrep`, `glob`,
       `read_lints`, `todo_write`, `delete_file`, semantic/web search. Names/inputs are normalized onto
       the same renderers as Claude Code, so a Cursor `edit_file` shows the same colorized diff.
-  - Codex status/context and token-usage events (tokens hidden by default — **Toggle tokens**).
+  - Codex task/context/token bookkeeping consolidated into one **Turn metadata** disclosure at the
+    end of the final assistant response.
 - **Survives `/compact`.** After a conversation is compacted, the harness injects bookkeeping records
   that most viewers drop. This one renders them: 📎 *referenced-file* pointers (including the note the
   model is actually handed when its context is rebuilt), 📄 re-attached file reads with their full

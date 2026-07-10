@@ -121,6 +121,24 @@ def _write_guardian_sessions(codex_home: Path) -> tuple[Path, Path, Path]:
         {"timestamp": "2026-01-01T00:00:01Z", "type": "event_msg",
          "payload": {"type": "user_message", "message": "missing image",
                      "images": [], "local_images": ["/missing.png"]}},
+        {"timestamp": "2026-01-01T00:00:02Z", "type": "event_msg",
+         "payload": {"type": "task_started", "turn_id": "parent-turn",
+                     "model_context_window": 300000, "collaboration_mode_kind": "default"}},
+        {"timestamp": "2026-01-01T00:00:02Z", "type": "turn_context",
+         "payload": {"turn_id": "parent-turn", "model": "codex-test", "effort": "medium",
+                     "approval_policy": "on-request", "sandbox_policy": {"type": "workspace-write"}}},
+        {"timestamp": "2026-01-01T00:00:03Z", "type": "event_msg",
+         "payload": {"type": "user_message", "message": "metadata turn"}},
+        {"timestamp": "2026-01-01T00:00:04Z", "type": "event_msg",
+         "payload": {"type": "agent_message", "message": "metadata answer"}},
+        {"timestamp": "2026-01-01T00:00:04Z", "type": "event_msg",
+         "payload": {"type": "token_count", "info": {
+             "model_context_window": 300000,
+             "total_token_usage": {"input_tokens": 100, "output_tokens": 10},
+         }}},
+        {"timestamp": "2026-01-01T00:00:05Z", "type": "event_msg",
+         "payload": {"type": "task_complete", "turn_id": "parent-turn",
+                     "duration_ms": 3000, "time_to_first_token_ms": 700}},
     ]
     planned = {
         "command": ["/bin/zsh", "-lc", "python3 -m unittest test_security"],
@@ -360,6 +378,16 @@ class SecurityTest(unittest.TestCase):
         self.assertEqual(patch["calls"][0]["name"], "apply_patch")
         self.assertIn("*** Update File: a", patch["calls"][0]["input"])
 
+        wrapped = (
+            'Script completed\nWall time 0.1 seconds\nOutput:\n\n'
+            '{"chunk_id":"abc","wall_time_seconds":0.25,"exit_code":0,'
+            '"output":"actual stdout\\n"}'
+        )
+        result = codex._normalize_tool_output(wrapped, name="exec", args=command)
+        self.assertEqual(result["text"], "actual stdout\n")
+        self.assertEqual(result["metadata"]["exit_code"], 0)
+        self.assertEqual(result["metadata"]["chunk_id"], "abc")
+
     def test_codex_user_images_prefer_local_and_fallback_inline(self):
         data = codex.parse_session(self.codex_parent)
         local = next(ev for ev in data["events"] if ev.get("text") == "look at this")
@@ -368,6 +396,16 @@ class SecurityTest(unittest.TestCase):
         self.assertIn(quote(str(self.codex_image.resolve()), safe=""), local["images"][0]["src"])
         self.assertEqual(fallback["images"][0]["kind"], "inline")
         self.assertTrue(fallback["images"][0]["src"].startswith("data:image/png;base64,"))
+
+    def test_codex_turn_metadata_attaches_to_final_answer(self):
+        data = codex.parse_session(self.codex_parent)
+        answer = next(ev for ev in data["events"] if ev.get("text") == "metadata answer")
+        self.assertEqual(answer["turn_metadata"]["model"], "codex-test")
+        self.assertEqual(answer["turn_metadata"]["duration_ms"], 3000)
+        self.assertEqual(answer["turn_metadata"]["usage"]["input_tokens"], 100)
+        self.assertFalse(
+            {"status", "context", "tokens"} & {event["kind"] for event in data["events"]}
+        )
 
     # ----- exfiltration guarantees ----------------------------------------- #
 

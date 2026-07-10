@@ -415,7 +415,6 @@ function renderTranscript(data, opts = {}) {
   t.innerHTML = "";
   CURRENT_AGENT = data.agent || "claude";
   LAST_RENDERED_TITLE = data.title || "";
-  const isCodex = CURRENT_AGENT === "codex";
 
   const meta = data.meta || {};
   const header = el(
@@ -510,9 +509,6 @@ function renderTranscript(data, opts = {}) {
       el("button", { class: "btn", onclick: () => setAll(".thinking-block", false) }, "Expand thinking"),
       el("button", { class: "btn", onclick: () => setAll(".tool-block", true) }, "Collapse tools"),
       el("button", { class: "btn", onclick: () => setAll(".tool-block", false) }, "Expand tools"),
-      isCodex ? el("button", { class: "btn", onclick: () => setAll(".status-block", true) }, "Collapse status") : null,
-      isCodex ? el("button", { class: "btn", onclick: () => setAll(".status-block", false) }, "Expand status") : null,
-      isCodex ? el("button", { class: "btn", onclick: () => document.body.classList.toggle("show-tokens") }, "Toggle tokens") : null,
       el("button", { class: "btn", onclick: scrollToEnd }, "⤓ Jump to end")
     )
   );
@@ -771,6 +767,7 @@ function renderUser(ev) {
     for (const img of ev.images || []) body.push(renderImagePayload(img));
     for (const img of ev.local_images || []) body.push(el("div", { class: "attach-meta" }, "local image: " + img));
   }
+  if (ev.turn_metadata) body.push(renderTurnMetadata(ev.turn_metadata));
   return turnShell("user", ev.queued ? "User · queued" : "User", ev, body);
 }
 
@@ -783,10 +780,21 @@ function renderAssistant(ev) {
       else if (b.type === "thinking") body.push(renderThinking(b));
       else if (b.type === "tool_use") body.push(renderTool(b));
     }
+    if (ev.turn_metadata) body.push(renderTurnMetadata(ev.turn_metadata));
     return turnShell("assistant", agentLabel(CURRENT_AGENT), ev, body);
   }
   // Codex shape (flat text; reasoning/tools are separate events)
-  return turnShell("assistant", "Codex", ev, [el("div", { class: "md", html: md(ev.text || "") })]);
+  const body = [el("div", { class: "md", html: md(ev.text || "") })];
+  if (ev.turn_metadata) body.push(renderTurnMetadata(ev.turn_metadata));
+  return turnShell("assistant", "Codex", ev, body);
+}
+
+function renderTurnMetadata(metadata) {
+  return collapsibleBlock(
+    "turn-metadata collapsed",
+    "Turn metadata",
+    [preFrom(JSON.stringify(metadata, null, 2))]
+  );
 }
 
 function renderGuardianRequest(ev) {
@@ -809,11 +817,7 @@ function renderGuardianRequest(ev) {
   if (request.cwd) body.push(el("div", { class: "attach-meta" }, "cwd: " + request.cwd));
   if (request.justification) body.push(el("div", { class: "guardian-justification" }, request.justification));
   if (ev.metadata && Object.keys(ev.metadata).length) {
-    body.push(collapsibleBlock(
-      "guardian-metadata collapsed",
-      "Turn metadata",
-      [preFrom(JSON.stringify(ev.metadata, null, 2))]
-    ));
+    body.push(renderTurnMetadata(ev.metadata));
   }
   return turnShell("user", "Review input", ev, body);
 }
@@ -1177,6 +1181,17 @@ function renderCodexTool(ev) {
   bodyKids.push(formatToolInput(name, ev.input).inputNode);
   if (ev.result) {
     bodyKids.push(el("div", { class: "tool-section-label" }, isErr ? "Error" : "Result"));
+    const resultMeta = ev.result.metadata || {};
+    const resultFacts = [
+      resultMeta.exit_code != null ? "exit " + resultMeta.exit_code : "",
+      resultMeta.wall_time_seconds != null ? fmtDuration(resultMeta.wall_time_seconds * 1000) : "",
+      resultMeta.session_id != null ? "session " + resultMeta.session_id : "",
+      resultMeta.chunk_id ? "chunk " + resultMeta.chunk_id : "",
+      resultMeta.original_token_count ? resultMeta.original_token_count + " tokens" : "",
+    ].filter(Boolean);
+    if (resultFacts.length) {
+      bodyKids.push(el("div", { class: "tool-result-meta" }, resultFacts.map((fact) => el("span", { class: "badge" }, fact))));
+    }
     if (ev.result.output) {
       bodyKids.push(preFrom(ev.result.output, "payload truncatable" + (isErr ? " result-error" : "")));
     }
@@ -1185,7 +1200,7 @@ function renderCodexTool(ev) {
       if (ev.result.raw.changes) bodyKids.push(renderChanges(ev.result.raw.changes));
       else bodyKids.push(preFrom(JSON.stringify(ev.result.raw, null, 2), "payload truncatable"));
     }
-    if (!ev.result.output && !(ev.result.images || []).length && !ev.result.raw) {
+    if (!ev.result.output && !(ev.result.images || []).length && !ev.result.raw && !resultFacts.length) {
       bodyKids.push(preFrom("(no output)", "payload truncatable"));
     }
   } else {
@@ -1284,8 +1299,12 @@ function formatToolInput(name, input) {
     if (value.max_output_tokens) meta.push("max tokens: " + value.max_output_tokens);
     const node = el("div", {},
       el("div", { class: "attach-meta", style: "margin-bottom:6px" }, meta.join("  ·  ")),
-      chars
-        ? preFrom(chars, "payload")
+      chars === "\u0003"
+        ? el("div", { class: "attach-meta" }, "sent: Ctrl-C")
+        : chars === "\u0004"
+          ? el("div", { class: "attach-meta" }, "sent: Ctrl-D")
+          : chars
+            ? preFrom(chars, "payload")
         : el("div", { class: "attach-meta", style: "font-style:italic" }, "(no input — polling process for more output)")
     );
     return { summary: "session " + (value.session_id ?? ""), inputNode: node };
