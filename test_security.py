@@ -86,6 +86,44 @@ def _write_fixture_session(
     return f
 
 
+def _write_guardian_sessions(codex_home: Path) -> tuple[Path, Path]:
+    sessions = codex_home / "sessions" / "2026" / "01" / "01"
+    sessions.mkdir(parents=True)
+    parent_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    guardian_id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+    parent = sessions / f"rollout-2026-01-01T00-00-00-{parent_id}.jsonl"
+    guardian = sessions / f"rollout-2026-01-01T00-00-01-{guardian_id}.jsonl"
+    parent_records = [
+        {"timestamp": "2026-01-01T00:00:00Z", "type": "session_meta",
+         "payload": {"id": parent_id, "cwd": "/tmp/proj"}},
+        {"timestamp": "2026-01-01T00:00:01Z", "type": "event_msg",
+         "payload": {"type": "user_message", "message": "parent task"}},
+    ]
+    planned = {
+        "command": ["/bin/zsh", "-lc", "python3 -m unittest test_security"],
+        "cwd": "/tmp/proj",
+        "justification": "Run local tests?",
+        "sandbox_permissions": "require_escalated",
+        "tool": "exec_command",
+    }
+    guardian_records = [
+        {"timestamp": "2026-01-01T00:00:02Z", "type": "session_meta",
+         "payload": {
+             "id": guardian_id, "parent_thread_id": parent_id,
+             "thread_source": "subagent", "source": {"subagent": {"other": "guardian"}},
+             "cwd": "/tmp/proj", "base_instructions": {"text": "Review actions."},
+         }},
+        {"timestamp": "2026-01-01T00:00:03Z", "type": "event_msg",
+         "payload": {"type": "user_message",
+                     "message": "Review this action.\nPlanned action JSON:\n" + json.dumps(planned)}},
+        {"timestamp": "2026-01-01T00:00:04Z", "type": "event_msg",
+         "payload": {"type": "agent_message", "message": '{"outcome":"allow"}'}},
+    ]
+    parent.write_text("\n".join(json.dumps(r) for r in parent_records) + "\n")
+    guardian.write_text("\n".join(json.dumps(r) for r in guardian_records) + "\n")
+    return parent, guardian
+
+
 class SecurityTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -129,7 +167,8 @@ class SecurityTest(unittest.TestCase):
         server.PROJECTS_DIR = cls.projects_dir
         server.CUSTOM_NAMES_FILE = tmp / "viewer" / "names.json"
         server._CUSTOM_NAMES_CACHE = None
-        codex.configure(tmp / "codex")  # empty -> no codex sessions
+        cls.codex_parent, cls.codex_guardian = _write_guardian_sessions(tmp / "codex")
+        codex.configure(tmp / "codex")
         cursor.configure(tmp / "cursor")  # empty -> no cursor sessions
 
         # Install the outbound-connection guard for the whole class.
@@ -237,6 +276,26 @@ class SecurityTest(unittest.TestCase):
             if item["file"] == str(self.metadata_fixture)
         )
         self.assertEqual(match["score"], server.CUSTOM_TITLE_WEIGHT)
+
+    def test_guardian_is_grouped_and_structured(self):
+        summary = codex.session_summary(self.codex_guardian)
+        self.assertTrue(summary["is_subagent"])
+        self.assertEqual(summary["subagent_type"], "guardian")
+        self.assertEqual(summary["parent_file"], str(self.codex_parent.resolve()))
+        self.assertEqual(summary["title"], "Approval reviews")
+
+        data = codex.parse_session(self.codex_guardian)
+        request = next(ev for ev in data["events"] if ev["kind"] == "guardian_request")
+        decision = next(ev for ev in data["events"] if ev["kind"] == "guardian_decision")
+        self.assertEqual(request["request"]["tool"], "exec_command")
+        self.assertEqual(request["request"]["command"][-1], "python3 -m unittest test_security")
+        self.assertEqual(decision["outcome"], "allow")
+
+        sessions = server.list_sessions()
+        parent_index = next(
+            i for i, s in enumerate(sessions) if s["file"] == str(self.codex_parent.resolve())
+        )
+        self.assertEqual(sessions[parent_index + 1]["file"], str(self.codex_guardian.resolve()))
 
     # ----- exfiltration guarantees ----------------------------------------- #
 

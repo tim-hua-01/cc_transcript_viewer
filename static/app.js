@@ -308,7 +308,9 @@ function renderSidebar(query) {
         "div",
         { class: "session-toprow" },
         el("span", { class: "agent-tag agent-" + s.agent }, agentLabel(s.agent)),
-        s.is_subagent ? el("span", { class: "sidechain-tag" }, "sub-agent") : null,
+        s.is_subagent
+          ? el("span", { class: "sidechain-tag" }, s.subagent_type === "guardian" ? "guardian" : "sub-agent")
+          : null,
         el("span", { class: "session-title" }, s.title)
       ),
       s.cwd ? el("div", { class: "session-cwd", title: s.cwd }, shortPath(s.cwd)) : null,
@@ -426,7 +428,9 @@ function renderTranscript(data, opts = {}) {
         "h1",
         { class: "t-title" },
         el("span", { class: "agent-tag agent-" + data.agent }, agentLabel(data.agent)),
-        data.is_subagent ? el("span", { class: "sidechain-tag" }, "sub-agent") : null,
+        data.is_subagent
+          ? el("span", { class: "sidechain-tag" }, data.subagent_type === "guardian" ? "guardian" : "sub-agent")
+          : null,
         " " + (data.title || "(untitled session)")
       ),
       el("button", {
@@ -494,7 +498,7 @@ function renderTranscript(data, opts = {}) {
       meta.git_branch ? el("span", {}, "⎇ " + meta.git_branch) : null,
       meta.model ? el("span", {}, shortModel(meta.model)) : null,
       meta.reasoning_effort ? el("span", {}, "effort: " + meta.reasoning_effort) : null,
-      meta.source ? el("span", {}, "source: " + meta.source) : null,
+      typeof meta.source === "string" ? el("span", {}, "source: " + meta.source) : null,
       meta.version ? el("span", {}, "v" + meta.version) : null,
       el("span", {}, data.events.length + " events"),
       el("span", { class: "session-id", style: "margin:0", title: "Click to copy", onclick: (e) => copyId(e, data.id) }, "id: " + data.id)
@@ -719,6 +723,8 @@ function renderEvent(ev) {
     case "system": return renderSystem(ev);
     case "notice": return renderNotice(ev);
     case "attachment": return renderAttachment(ev);
+    case "guardian_request": return renderGuardianRequest(ev);
+    case "guardian_decision": return renderGuardianDecision(ev);
     case "reasoning": return turnShell("reasoning", "Reasoning", ev, [renderReasoning(ev)]);
     case "tool": return turnShell("tool", "Tool · " + (ev.name || "tool"), ev, [renderCodexTool(ev)]);
     case "web_search":
@@ -781,6 +787,44 @@ function renderAssistant(ev) {
   }
   // Codex shape (flat text; reasoning/tools are separate events)
   return turnShell("assistant", "Codex", ev, [el("div", { class: "md", html: md(ev.text || "") })]);
+}
+
+function renderGuardianRequest(ev) {
+  const request = ev.request || {};
+  const body = [];
+  const facts = [];
+  if (request.tool) facts.push(el("span", { class: "badge" }, request.tool));
+  if (request.sandbox_permissions) facts.push(el("span", { class: "badge" }, request.sandbox_permissions));
+  if (facts.length) body.push(el("div", { class: "guardian-facts" }, facts));
+  if (request.command) {
+    let command = request.command;
+    if (Array.isArray(command)) {
+      command = command.length >= 3 && command[1] === "-lc" ? command[2] : command.join(" ");
+    }
+    body.push(el("pre", { class: "payload" }, String(command)));
+  }
+  if (request.cwd) body.push(el("div", { class: "attach-meta" }, "cwd: " + request.cwd));
+  if (request.justification) body.push(el("div", { class: "guardian-justification" }, request.justification));
+  if (ev.context) {
+    body.push(el(
+      "details",
+      { class: "guardian-context" },
+      el("summary", {}, "Review context"),
+      el("pre", { class: "payload truncatable" }, ev.context)
+    ));
+  }
+  return turnShell("guardian", "Approval request", ev, body);
+}
+
+function renderGuardianDecision(ev) {
+  const outcome = ev.outcome === "deny" ? "deny" : "allow";
+  const body = [
+    el("div", { class: "guardian-decision guardian-" + outcome }, outcome.toUpperCase()),
+  ];
+  const facts = [ev.risk_level, ev.user_authorization].filter(Boolean);
+  if (facts.length) body.push(el("div", { class: "guardian-facts" }, facts.map((x) => el("span", { class: "badge" }, x))));
+  if (ev.rationale) body.push(el("div", { class: "guardian-rationale" }, ev.rationale));
+  return turnShell("guardian", "Decision", ev, body);
 }
 
 function renderThinking(b) {

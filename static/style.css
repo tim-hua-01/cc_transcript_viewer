@@ -303,6 +303,7 @@ body {
 }
 .turn-user .turn-head { color: var(--user); background: rgba(31,111,235,.055); border-color: rgba(31,111,235,.16); }
 .turn-assistant .turn-head { color: var(--assistant); background: rgba(192,73,42,.055); border-color: rgba(192,73,42,.16); }
+.turn-guardian .turn-head { color: var(--thinking); background: rgba(107,79,187,.055); border-color: rgba(107,79,187,.16); }
 .turn-system .turn-head, .turn-attachment .turn-head, .turn-notice .turn-head { color: var(--muted); background: var(--bg-alt); }
 .turn-notice .turn-body { color: var(--muted); font-size: 13px; }
 .turn-body { padding: 4px 14px 12px; }
@@ -311,6 +312,14 @@ body {
   font-size: 9px; text-transform: uppercase; letter-spacing: .05em;
   padding: 1px 6px; border-radius: 4px; background: var(--bg-elev); color: var(--muted);
 }
+.guardian-facts { display: flex; gap: 6px; flex-wrap: wrap; margin: 4px 0 8px; }
+.guardian-justification, .guardian-rationale { margin: 8px 0; }
+.guardian-decision { width: fit-content; font-size: 12px; font-weight: 700; padding: 3px 8px; border-radius: 5px; }
+.guardian-allow { color: var(--tool); background: rgba(31,122,69,.09); border: 1px solid rgba(31,122,69,.24); }
+.guardian-deny { color: var(--tool-err); background: rgba(209,36,47,.08); border: 1px solid rgba(209,36,47,.22); }
+.guardian-context { margin-top: 10px; color: var(--muted); }
+.guardian-context summary { cursor: pointer; font-size: 12px; }
+.guardian-context[open] summary { margin-bottom: 8px; }
 
 /* Markdown body */
 .md { overflow-wrap: anywhere; }

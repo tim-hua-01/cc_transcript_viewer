@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import mimetypes
+import re
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -119,6 +120,11 @@ def _first_user_message(records: list[dict]) -> str:
     return ""
 
 
+def _short_title(text: str, n: int = 100) -> str:
+    text = " ".join((text or "").split())
+    return text[:n] + ("…" if len(text) > n else "")
+
+
 def _thread_id_from_path(path: Path) -> str:
     stem = path.stem
     if stem.startswith("rollout-"):
@@ -126,6 +132,64 @@ def _thread_id_from_path(path: Path) -> str:
         if len(parts) >= 8:
             return "-".join(parts[-5:])
     return stem
+
+
+def _subagent_fields(meta: dict) -> dict:
+    """Normalize Codex subagent identity and parent linkage from session_meta."""
+    source = meta.get("source")
+    if isinstance(source, str):
+        source = _parse_json_string(source)
+    subagent = source.get("subagent") if isinstance(source, dict) else None
+    if meta.get("thread_source") != "subagent" and not subagent:
+        return {}
+    subtype = ""
+    if isinstance(subagent, str):
+        subtype = subagent
+    elif isinstance(subagent, dict):
+        subtype = subagent.get("other") or subagent.get("type") or subagent.get("name") or ""
+    parent_id = meta.get("parent_thread_id") or meta.get("parent_id") or ""
+    parent_file = ""
+    if parent_id and re.fullmatch(r"[A-Za-z0-9-]+", str(parent_id)):
+        for root in (SESSIONS_DIR, ARCHIVED_SESSIONS_DIR):
+            try:
+                match = next(root.glob(f"**/rollout-*{parent_id}.jsonl"), None)
+            except OSError:
+                match = None
+            if match:
+                parent_file = str(match.resolve())
+                break
+    return {
+        "is_subagent": True,
+        "subagent_type": subtype or "subagent",
+        "parent_id": parent_id,
+        "parent_file": parent_file,
+    }
+
+
+def _guardian_request(text: str) -> dict | None:
+    """Extract the structured planned action from a guardian review prompt."""
+    marker = "Planned action JSON:"
+    start = text.rfind(marker)
+    if start < 0:
+        return None
+    start = text.find("{", start + len(marker))
+    if start < 0:
+        return None
+    try:
+        value, _ = json.JSONDecoder().raw_decode(text[start:])
+    except json.JSONDecodeError:
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _guardian_decision(text: str) -> dict | None:
+    try:
+        value = json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(value, dict) or value.get("outcome") not in {"allow", "deny"}:
+        return None
+    return value
 
 
 def _read_thread_rows() -> dict[str, dict]:
@@ -208,7 +272,13 @@ def session_summary(path: Path, thread_row: dict | None = None) -> dict:
     updated_ms = row.get("updated_at_ms") or (row.get("updated_at") * 1000 if row.get("updated_at") else None)
     created_ms = row.get("created_at_ms") or (row.get("created_at") * 1000 if row.get("created_at") else None)
 
-    return {
+    subagent_fields = _subagent_fields(meta)
+    if subagent_fields.get("subagent_type") == "guardian":
+        title = "Approval reviews"
+    elif subagent_fields:
+        title = _short_title(f"[{subagent_fields['subagent_type']}] {title}")
+
+    summary = {
         "id": row.get("id") or meta.get("id") or _thread_id_from_path(path),
         "file": str(path),
         "title": title,
@@ -231,6 +301,8 @@ def session_summary(path: Path, thread_row: dict | None = None) -> dict:
         "mtime": st.st_mtime if st else 0,
         "archived": bool(row.get("archived", 0)),
     }
+    summary.update(subagent_fields)
+    return summary
 
 
 def list_sessions() -> list[dict]:
@@ -525,6 +597,8 @@ def parse_session(path: Path) -> dict:
             }
         )
 
+    subagent_fields = _subagent_fields(meta)
+    is_guardian = subagent_fields.get("subagent_type") == "guardian"
     events = []
     recent_reasoning: list[tuple[str, str]] = []
 
@@ -584,30 +658,46 @@ def parse_session(path: Path) -> dict:
         if typ == "event_msg":
             pt = payload.get("type")
             if pt == "user_message":
-                events.append(
-                    _event_payload(
-                        "user",
-                        ts,
-                        {
-                            "text": payload.get("message") or "",
-                            "images": _safe_images(payload.get("images") or []),
-                            "local_images": payload.get("local_images") or [],
-                            "text_elements": payload.get("text_elements") or [],
-                        },
+                text = payload.get("message") or ""
+                request = _guardian_request(text) if is_guardian else None
+                if request is not None:
+                    events.append(
+                        _event_payload(
+                            "guardian_request",
+                            ts,
+                            {"request": request, "context": text},
+                        )
                     )
-                )
+                else:
+                    events.append(
+                        _event_payload(
+                            "user",
+                            ts,
+                            {
+                                "text": text,
+                                "images": _safe_images(payload.get("images") or []),
+                                "local_images": payload.get("local_images") or [],
+                                "text_elements": payload.get("text_elements") or [],
+                            },
+                        )
+                    )
             elif pt == "agent_message":
-                events.append(
-                    _event_payload(
-                        "assistant",
-                        ts,
-                        {
-                            "text": payload.get("message") or "",
-                            "phase": payload.get("phase"),
-                            "memory_citation": payload.get("memory_citation"),
-                        },
+                text = payload.get("message") or ""
+                decision = _guardian_decision(text) if is_guardian else None
+                if decision is not None:
+                    events.append(_event_payload("guardian_decision", ts, decision))
+                else:
+                    events.append(
+                        _event_payload(
+                            "assistant",
+                            ts,
+                            {
+                                "text": text,
+                                "phase": payload.get("phase"),
+                                "memory_citation": payload.get("memory_citation"),
+                            },
+                        )
                     )
-                )
             elif pt == "agent_reasoning":
                 append_reasoning(ts, payload.get("text") or "", False)
             elif pt == "task_started":
@@ -745,12 +835,18 @@ def parse_session(path: Path) -> dict:
             )
 
     title = _first_user_message(records) or title
+    if is_guardian:
+        title = "Approval reviews"
+    elif subagent_fields:
+        title = _short_title(f"[{subagent_fields['subagent_type']}] {title}")
     meta.pop("base_instructions", None)  # surfaced as an instructions event instead
 
-    return {
+    data = {
         "id": meta.get("id") or _thread_id_from_path(path),
         "title": title or "(untitled session)",
         "meta": meta,
         "events": events,
         "n_records": len(records),
     }
+    data.update(subagent_fields)
+    return data

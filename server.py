@@ -1039,6 +1039,17 @@ def _event_text(ev: dict) -> list[str]:
         if isinstance(act, dict):
             for q in act.get("queries") or []:
                 add(q)
+        request = ev.get("request")
+        if isinstance(request, dict):
+            add(request.get("tool"))
+            add(request.get("cwd"))
+            add(request.get("justification"))
+            command = request.get("command")
+            if isinstance(command, str):
+                add(command)
+            elif isinstance(command, list):
+                for part in command:
+                    add(part)
     return parts
 
 
