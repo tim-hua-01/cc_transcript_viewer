@@ -63,9 +63,9 @@ files that actually changed — the cost doesn't grow with how many transcripts 
   agent-owned transcripts and Cursor database untouched.
 - **Search across everything.** The search box (press `/` to focus) matches session **content** —
   prompts, replies, reasoning, tool commands/paths/queries/outputs — in addition to titles and
-  directories, and shows a snippet of the match. Custom-title matches rank above first-message
-  matches, which rank above ordinary transcript-content matches. Powered by `/api/search` with an
-  mtime-keyed cache.
+  directories, and shows a snippet of the match. Custom-title matches receive `10,000×` weight,
+  every user-message match receives `50×`, and ordinary transcript-content matches receive `1×`.
+  Powered by `/api/search` with an mtime-keyed cache.
 - **Filters that compose.**
   - **All / Claude / Codex / Cursor** chips.
   - A **Model** dropdown grouped by family (Claude / GPT / Other): tick a family to select all its

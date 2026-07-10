@@ -951,12 +951,13 @@ def load_session(file_id: str) -> dict | None:
 # ---------------------------------------------------------------------------
 # Full-text search across transcript content
 # ---------------------------------------------------------------------------
-# Cache: path -> (mtime, first_user_message_text, rest_of_text)
+# Cache: path -> (mtime, all_user_message_text, rest_of_text)
 _TEXT_CACHE: dict[str, tuple[float, str, str]] = {}
 
-# A hit inside the first user message is worth this many ordinary hits.
-FIRST_MSG_WEIGHT = 1000
-CUSTOM_TITLE_WEIGHT = 1_000_000
+# User prompts should outrank generated/tool output without overwhelming a
+# custom title selected specifically to identify the transcript.
+USER_MSG_WEIGHT = 50
+CUSTOM_TITLE_WEIGHT = 10_000
 
 
 def _event_text(ev: dict) -> list[str]:
@@ -999,37 +1000,36 @@ def _event_text(ev: dict) -> list[str]:
 
 
 def _session_segments(data: dict) -> tuple[str, str]:
-    """Split a parsed session into (first user message, everything else).
+    """Split a parsed session into (all user messages, everything else).
 
-    The first user message is scored heavily; the rest is searchable too, but
-    weighted as ordinary content. Image blobs are skipped throughout.
+    User messages are scored above generated/tool content. Image blobs are
+    skipped throughout.
     """
-    first = ""
+    user: list[str] = []
     rest: list[str] = []
     cwd = (data.get("meta") or {}).get("cwd")
     if cwd:
         rest.append(cwd)
     if data.get("ai_title"):
         rest.append(data["ai_title"])
-    seen_first = False
-    for ev in data.get("events", []) or []:
-        # Abandoned branches are folded into a `branch` event; index their text
-        # too so rewound content stays searchable.
+
+    def add_event(ev: dict) -> None:
         if ev.get("kind") == "branch":
             for group in ev.get("groups", []) or []:
                 for ge in group:
-                    rest.extend(_event_text(ge))
-            continue
-        if not seen_first and ev.get("kind") == "user":
-            seen_first = True
-            first = " ".join(_event_text(ev))
-            continue
-        rest.extend(_event_text(ev))
-    return first, "\n".join(rest)
+                    add_event(ge)
+        elif ev.get("kind") == "user":
+            user.extend(_event_text(ev))
+        else:
+            rest.extend(_event_text(ev))
+
+    for ev in data.get("events", []) or []:
+        add_event(ev)
+    return "\n".join(user), "\n".join(rest)
 
 
 def session_segments(s: dict) -> tuple[str, str]:
-    """(first message, rest) for one session, cached by its mtime.
+    """(user messages, rest) for one session, cached by its mtime.
 
     Works for both real transcript files and synthetic-id sessions (Cursor's
     `cursordb:` scheme); the session summary already carries a stable mtime.
@@ -1043,15 +1043,15 @@ def session_segments(s: dict) -> tuple[str, str]:
         data = load_session(key)
     except Exception:  # noqa: BLE001
         data = None
-    first, rest = _session_segments(data) if data else ("", "")
-    _TEXT_CACHE[key] = (mtime, first, rest)
-    return first, rest
+    user, rest = _session_segments(data) if data else ("", "")
+    _TEXT_CACHE[key] = (mtime, user, rest)
+    return user, rest
 
 
 def search_sessions(query: str) -> list[dict]:
     """Return [{file, snippet, score}] for sessions whose content matches `query`.
 
-    Custom-title hits outrank first-user-message hits, which outrank ordinary
+    Custom-title hits outrank user-message hits, which outrank ordinary
     transcript hits. Among equal scores, an earlier first occurrence wins.
     """
     q = (query or "").strip().lower()
@@ -1059,25 +1059,25 @@ def search_sessions(query: str) -> list[dict]:
         return []
     out = []
     for s in list_sessions():
-        first, rest = session_segments(s)
+        user, rest = session_segments(s)
         custom = s.get("custom_title") or ""
         custom_low = custom.lower()
-        first_low, rest_low = first.lower(), rest.lower()
+        user_low, rest_low = user.lower(), rest.lower()
         c_custom = custom_low.count(q)
-        c_first = first_low.count(q)
+        c_user = user_low.count(q)
         c_rest = rest_low.count(q)
-        if not c_custom and not c_first and not c_rest:
+        if not c_custom and not c_user and not c_rest:
             continue
-        score = c_custom * CUSTOM_TITLE_WEIGHT + c_first * FIRST_MSG_WEIGHT + c_rest
+        score = c_custom * CUSTOM_TITLE_WEIGHT + c_user * USER_MSG_WEIGHT + c_rest
         if c_custom:
             combined, idx = custom, custom_low.find(q)
             pos = idx
-        elif c_first:
-            combined, idx = first, first_low.find(q)
+        elif c_user:
+            combined, idx = user, user_low.find(q)
             pos = len(custom) + idx
         else:
             combined, idx = rest, rest_low.find(q)
-            pos = len(custom) + len(first) + idx
+            pos = len(custom) + len(user) + idx
         start = max(0, idx - 50)
         snippet = combined[start:idx + len(q) + 70].replace("\n", " ").strip()
         if start > 0:

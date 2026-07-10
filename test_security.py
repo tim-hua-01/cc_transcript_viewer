@@ -59,6 +59,7 @@ def _write_fixture_session(
     projects_dir: Path,
     session_id: str = "11111111-1111-1111-1111-111111111111",
     prompt: str = "hello world",
+    additional_prompts: tuple[str, ...] = (),
 ) -> Path:
     """A minimal but valid Claude Code transcript so endpoints have real data."""
     proj = projects_dir / "-tmp-proj"
@@ -71,6 +72,14 @@ def _write_fixture_session(
          "message": {"role": "assistant", "model": "claude-test",
                      "content": [{"type": "text", "text": "hi there"}]}},
     ]
+    for i, extra_prompt in enumerate(additional_prompts, start=2):
+        records.extend([
+            {"type": "user", "timestamp": f"2024-01-01T00:00:{i:02d}Z",
+             "message": {"role": "user", "content": extra_prompt}},
+            {"type": "assistant", "timestamp": f"2024-01-01T00:00:{i + 1:02d}Z",
+             "message": {"role": "assistant", "model": "claude-test",
+                         "content": [{"type": "text", "text": "continued reply"}]}},
+        ])
     f.write_text("\n".join(json.dumps(r) for r in records) + "\n")
     return f
 
@@ -88,6 +97,12 @@ class SecurityTest(unittest.TestCase):
             cls.projects_dir,
             "22222222-2222-2222-2222-222222222222",
             "priorityword in the first user message",
+        )
+        cls.later_prompt_fixture = _write_fixture_session(
+            cls.projects_dir,
+            "33333333-3333-3333-3333-333333333333",
+            "unrelated opening prompt",
+            ("laterpromptword in a subsequent user message",),
         )
         server.PROJECTS_DIR = cls.projects_dir
         server.CUSTOM_NAMES_FILE = tmp / "viewer" / "names.json"
@@ -159,19 +174,26 @@ class SecurityTest(unittest.TestCase):
         self.assertEqual(restored["title"], "hello world")
         self.assertEqual(restored["custom_title"], "")
 
-    def test_custom_title_search_outranks_first_message(self):
+    def test_custom_title_search_outranks_user_message(self):
         data = server.load_session(str(self.fixture))
         server._set_custom_name(data, "priorityword custom name")
         try:
             matches = server.search_sessions("priorityword")
             self.assertEqual(matches[0]["file"], str(self.fixture))
-            first_message_match = next(
+            user_message_match = next(
                 match for match in matches if match["file"] == str(self.priority_fixture)
             )
-            self.assertGreater(matches[0]["score"], first_message_match["score"])
+            self.assertGreater(matches[0]["score"], user_message_match["score"])
             self.assertGreaterEqual(matches[0]["score"], server.CUSTOM_TITLE_WEIGHT)
         finally:
             server._set_custom_name(data, "")
+
+    def test_later_user_message_receives_user_weight(self):
+        matches = server.search_sessions("laterpromptword")
+        match = next(
+            item for item in matches if item["file"] == str(self.later_prompt_fixture)
+        )
+        self.assertEqual(match["score"], server.USER_MSG_WEIGHT)
 
     # ----- exfiltration guarantees ----------------------------------------- #
 

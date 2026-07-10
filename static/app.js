@@ -283,8 +283,8 @@ function renderSidebar(query) {
     return metaHit || contentHit;
   });
 
-  // With an active query, order by relevance score (first-message hits weigh
-  // most); otherwise keep the server's newest-first ordering.
+  // With an active query, order by relevance score; otherwise keep the
+  // server's newest-first ordering.
   if (q) {
     const scoreOf = (s) => {
       const cm = CONTENT_MATCHES && CONTENT_MATCHES.get(s.file);
