@@ -371,6 +371,9 @@ pre.guardian-review-context { max-height: 640px; margin: 8px 0 12px; }
 .tool-body { padding: 10px 12px; border-top: 1px solid var(--border); }
 .tool-section-label { font-size: 10px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 8px 0 4px; }
 .tool-section-label:first-child { margin-top: 0; }
+.orchestration-source { margin-top: 10px; color: var(--muted); }
+.orchestration-source summary { cursor: pointer; font-size: 12px; }
+.orchestration-source[open] summary { margin-bottom: 8px; }
 
 pre.payload {
   background: var(--code-bg); border: 1px solid var(--border);

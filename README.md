@@ -80,7 +80,9 @@ files that actually changed — the cost doesn't grow with how many transcripts 
     - Claude Code: `Bash`, `Read`, `Edit`/`Write`/`MultiEdit` (colorized diffs), `Grep`/`Glob`,
       `Task`/`Agent` (sub-agent turns flagged), `TodoWrite`, and pretty-printed JSON for the rest.
     - Codex: `function_call`, `custom_tool_call`, `apply_patch` (rendered as a colored diff),
-      `exec_command`/`shell`, `write_stdin`, `view_image`, web search, plus fallback JSON.
+      `exec_command`/`shell`, `write_stdin`, `view_image`, web search, plus fallback JSON. Newer
+      orchestration-style `exec` calls are unpacked into their underlying commands or patches, with
+      the generated JavaScript kept in a secondary disclosure.
     - Cursor: tool calls **with their outputs** — `run_terminal_command` (stdout + exit code),
       `read_file` (contents), `edit_file` (reconstructed before/after diff), `ripgrep`, `glob`,
       `read_lints`, `todo_write`, `delete_file`, semantic/web search. Names/inputs are normalized onto
@@ -93,7 +95,9 @@ files that actually changed — the cost doesn't grow with how many transcripts 
   their trigger, before/after token counts, duration, and preserved message/tool counts.
 - **Pull-request links.** Claude Code sessions associated with a PR show a safe, clickable PR link in
   the transcript header.
-- **Images & sub-agents.** Inline images in prompts/replies and Codex `view_image` are shown. Claude
+- **Images & sub-agents.** Inline images in prompts/replies and Codex `view_image` are shown. For
+  Codex user prompts, the viewer prefers the original `local_images` file and falls back to the
+  embedded `input_image` data URL if the file is gone. Claude
   Code sub-agents (which newer versions write to their own `…/<session-id>/subagents/agent-*.jsonl`
   files) and Codex sub-agent sessions are each picked up as their own entry in the same time-sorted
   list, indented and flagged **sub-agent**. A sub-agent is titled `[type] description` when it can be

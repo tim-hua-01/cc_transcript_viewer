@@ -66,6 +66,107 @@ def _parse_json_string(value):
         return {"raw": value}
 
 
+def _mask_js_literals(source: str) -> str:
+    """Blank JS strings/comments while preserving offsets for structural scans."""
+    chars = list(source)
+    i = 0
+    quote = None
+    while i < len(chars):
+        ch = chars[i]
+        nxt = chars[i + 1] if i + 1 < len(chars) else ""
+        if quote:
+            chars[i] = " "
+            if ch == "\\":
+                if i + 1 < len(chars):
+                    chars[i + 1] = " "
+                    i += 2
+                    continue
+            elif ch == quote:
+                quote = None
+            i += 1
+            continue
+        if ch in {'"', "'", "`"}:
+            quote = ch
+            chars[i] = " "
+            i += 1
+            continue
+        if ch == "/" and nxt == "/":
+            while i < len(chars) and chars[i] != "\n":
+                chars[i] = " "
+                i += 1
+            continue
+        if ch == "/" and nxt == "*":
+            chars[i] = chars[i + 1] = " "
+            i += 2
+            while i < len(chars):
+                if chars[i] == "*" and i + 1 < len(chars) and chars[i + 1] == "/":
+                    chars[i] = chars[i + 1] = " "
+                    i += 2
+                    break
+                chars[i] = " "
+                i += 1
+            continue
+        i += 1
+    return "".join(chars)
+
+
+def _exec_orchestration(source: str) -> dict:
+    """Recover generated `tools.name(JSON)` calls from a Codex exec program."""
+    masked = _mask_js_literals(source)
+    decoder = json.JSONDecoder()
+    constants = {}
+    for match in re.finditer(r"\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=", masked):
+        start = match.end()
+        while start < len(source) and source[start].isspace():
+            start += 1
+        try:
+            value, _ = decoder.raw_decode(source[start:].lstrip())
+        except json.JSONDecodeError:
+            continue
+        constants[match.group(1)] = value
+
+    calls = []
+    for match in re.finditer(r"\btools\.([A-Za-z_$][\w$]*)\s*\(", masked):
+        start = match.end()
+        while start < len(source) and source[start].isspace():
+            start += 1
+        tail = source[start:]
+        try:
+            value, _ = decoder.raw_decode(tail)
+        except json.JSONDecodeError:
+            ident = re.match(r"([A-Za-z_$][\w$]*)", masked[start:])
+            value = constants.get(ident.group(1)) if ident else None
+        calls.append({"name": match.group(1), "input": value})
+    return {"code": source, "calls": calls}
+
+
+def _normalize_tool_input(name: str, raw_value):
+    parsed = _parse_json_string(raw_value)
+    if name != "exec":
+        return parsed
+    source = parsed.get("raw") if isinstance(parsed, dict) else None
+    return _exec_orchestration(source) if isinstance(source, str) else parsed
+
+
+def _response_user_media(payload: dict) -> tuple[str, list[str]]:
+    """Visible prompt text and embedded image URLs from a response_item message."""
+    texts = []
+    images = []
+    for block in payload.get("content") or []:
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") == "input_image" and block.get("image_url"):
+            images.append(block["image_url"])
+        elif block.get("type") in {"input_text", "text"}:
+            text = block.get("text") or ""
+            stripped = text.strip()
+            if stripped == "</image>" or (stripped.startswith("<image ") and stripped.endswith(">")):
+                continue
+            if text:
+                texts.append(text)
+    return "\n".join(texts), images
+
+
 def _extract_text_content(content) -> str:
     if isinstance(content, str):
         return content
@@ -446,6 +547,10 @@ def _tool_summary(name: str, args) -> str:
     if name == "apply_patch":
         files = _patch_files(_patch_text(args))
         return ", ".join(files)[:200] if files else "patch"
+    if name == "exec" and isinstance(args, dict):
+        calls = args.get("calls") or []
+        names = [call.get("name") for call in calls if isinstance(call, dict) and call.get("name")]
+        return " · ".join(names)[:200] if names else "orchestration code"
     if not isinstance(args, dict):
         return str(args)[:200]
     if name in {"exec_command", "shell"}:
@@ -586,6 +691,7 @@ def parse_session(path: Path) -> dict:
     # tell injected context (environment_context, AGENTS.md) apart from the prompt
     # when a `message` response_item repeats the user's turn.
     user_event_texts: set[str] = set()
+    user_image_fallbacks: dict[str, list[list[dict]]] = {}
 
     for rec in records:
         payload = rec.get("payload") or {}
@@ -599,13 +705,25 @@ def parse_session(path: Path) -> dict:
             turn_id = payload.get("turn_id")
             if turn_id:
                 turn_contexts[turn_id] = payload
+        elif (
+            rec.get("type") == "response_item"
+            and payload.get("type") == "message"
+            and payload.get("role") == "user"
+        ):
+            visible_text, image_urls = _response_user_media(payload)
+            if image_urls:
+                key = " ".join(visible_text.split())
+                user_image_fallbacks.setdefault(key, []).append(
+                    _safe_images(image_urls, allow_large=True)
+                )
         elif rec.get("type") == "response_item" and payload.get("type") in {"function_call", "custom_tool_call"}:
             call_id = payload.get("call_id")
             if call_id:
                 raw_args = payload.get("arguments") if payload.get("type") == "function_call" else payload.get("input")
+                name = payload.get("name") or "tool"
                 tool_calls[call_id] = {
-                    "name": payload.get("name") or "tool",
-                    "input": _parse_json_string(raw_args),
+                    "name": name,
+                    "input": _normalize_tool_input(name, raw_args),
                     "status": payload.get("status"),
                     "type": payload.get("type"),
                 }
@@ -733,14 +851,32 @@ def parse_session(path: Path) -> dict:
                         )
                     )
                 else:
+                    key = " ".join(text.split())
+                    fallback_groups = user_image_fallbacks.get(key) or []
+                    fallback_images = fallback_groups.pop(0) if fallback_groups else []
+                    local_paths = payload.get("local_images") or []
+                    images = []
+                    unavailable_paths = []
+                    if local_paths:
+                        for i, local_path in enumerate(local_paths):
+                            local = _local_image_payload(local_path)
+                            if local:
+                                images.append(local)
+                            elif i < len(fallback_images):
+                                images.append(fallback_images[i])
+                            else:
+                                unavailable_paths.append(local_path)
+                        images.extend(fallback_images[len(local_paths):])
+                    else:
+                        images = _safe_images(payload.get("images") or []) or fallback_images
                     events.append(
                         _event_payload(
                             "user",
                             ts,
                             {
                                 "text": text,
-                                "images": _safe_images(payload.get("images") or []),
-                                "local_images": payload.get("local_images") or [],
+                                "images": images,
+                                "local_images": unavailable_paths,
                                 "text_elements": payload.get("text_elements") or [],
                             },
                         )
@@ -844,7 +980,10 @@ def parse_session(path: Path) -> dict:
             append_reasoning(ts, text, bool(payload.get("encrypted_content")))
         elif pt in {"function_call", "custom_tool_call"}:
             name = payload.get("name") or "tool"
-            args = _parse_json_string(payload.get("arguments") if pt == "function_call" else payload.get("input"))
+            args = _normalize_tool_input(
+                name,
+                payload.get("arguments") if pt == "function_call" else payload.get("input"),
+            )
             if name == "apply_patch":
                 args = _patch_text(args) or args
             call_id = payload.get("call_id")

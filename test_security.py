@@ -86,18 +86,41 @@ def _write_fixture_session(
     return f
 
 
-def _write_guardian_sessions(codex_home: Path) -> tuple[Path, Path]:
+def _write_guardian_sessions(codex_home: Path) -> tuple[Path, Path, Path]:
     sessions = codex_home / "sessions" / "2026" / "01" / "01"
     sessions.mkdir(parents=True)
     parent_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
     guardian_id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
     parent = sessions / f"rollout-2026-01-01T00-00-00-{parent_id}.jsonl"
     guardian = sessions / f"rollout-2026-01-01T00-00-01-{guardian_id}.jsonl"
+    image = sessions / "fixture.png"
+    image.write_bytes(b"\x89PNG\r\n\x1a\n")
+    inline_image = "data:image/png;base64,iVBORw0KGgo="
     parent_records = [
         {"timestamp": "2026-01-01T00:00:00Z", "type": "session_meta",
          "payload": {"id": parent_id, "cwd": "/tmp/proj"}},
         {"timestamp": "2026-01-01T00:00:01Z", "type": "event_msg",
          "payload": {"type": "user_message", "message": "parent task"}},
+        {"timestamp": "2026-01-01T00:00:01Z", "type": "response_item",
+         "payload": {"type": "message", "role": "user", "content": [
+             {"type": "input_text", "text": f'<image name=[Image #1] path="{image}">'},
+             {"type": "input_image", "image_url": inline_image},
+             {"type": "input_text", "text": "</image>"},
+             {"type": "input_text", "text": "look at this"},
+         ]}},
+        {"timestamp": "2026-01-01T00:00:01Z", "type": "event_msg",
+         "payload": {"type": "user_message", "message": "look at this",
+                     "images": [], "local_images": [str(image)]}},
+        {"timestamp": "2026-01-01T00:00:01Z", "type": "response_item",
+         "payload": {"type": "message", "role": "user", "content": [
+             {"type": "input_text", "text": '<image name=[Image #1] path="/missing.png">'},
+             {"type": "input_image", "image_url": inline_image},
+             {"type": "input_text", "text": "</image>"},
+             {"type": "input_text", "text": "missing image"},
+         ]}},
+        {"timestamp": "2026-01-01T00:00:01Z", "type": "event_msg",
+         "payload": {"type": "user_message", "message": "missing image",
+                     "images": [], "local_images": ["/missing.png"]}},
     ]
     planned = {
         "command": ["/bin/zsh", "-lc", "python3 -m unittest test_security"],
@@ -136,7 +159,7 @@ def _write_guardian_sessions(codex_home: Path) -> tuple[Path, Path]:
     ]
     parent.write_text("\n".join(json.dumps(r) for r in parent_records) + "\n")
     guardian.write_text("\n".join(json.dumps(r) for r in guardian_records) + "\n")
-    return parent, guardian
+    return parent, guardian, image
 
 
 class SecurityTest(unittest.TestCase):
@@ -182,7 +205,7 @@ class SecurityTest(unittest.TestCase):
         server.PROJECTS_DIR = cls.projects_dir
         server.CUSTOM_NAMES_FILE = tmp / "viewer" / "names.json"
         server._CUSTOM_NAMES_CACHE = None
-        cls.codex_parent, cls.codex_guardian = _write_guardian_sessions(tmp / "codex")
+        cls.codex_parent, cls.codex_guardian, cls.codex_image = _write_guardian_sessions(tmp / "codex")
         codex.configure(tmp / "codex")
         cursor.configure(tmp / "cursor")  # empty -> no cursor sessions
 
@@ -318,6 +341,33 @@ class SecurityTest(unittest.TestCase):
             i for i, s in enumerate(sessions) if s["file"] == str(self.codex_parent.resolve())
         )
         self.assertEqual(sessions[parent_index + 1]["file"], str(self.codex_guardian.resolve()))
+
+    def test_codex_exec_orchestration_is_structured(self):
+        command_source = (
+            'const r = await tools.exec_command({"cmd":"git status --short",'
+            '"workdir":"/tmp"}); text(r.output);'
+        )
+        command = codex._normalize_tool_input("exec", command_source)
+        self.assertEqual(command["calls"][0]["name"], "exec_command")
+        self.assertEqual(command["calls"][0]["input"]["cmd"], "git status --short")
+        self.assertIn("git status --short", server._event_text({"input": command}))
+
+        patch_source = (
+            'const patch = "*** Begin Patch\\n*** Update File: a\\n@@\\n-x\\n+y\\n*** End Patch";'
+            " text(await tools.apply_patch(patch));"
+        )
+        patch = codex._normalize_tool_input("exec", patch_source)
+        self.assertEqual(patch["calls"][0]["name"], "apply_patch")
+        self.assertIn("*** Update File: a", patch["calls"][0]["input"])
+
+    def test_codex_user_images_prefer_local_and_fallback_inline(self):
+        data = codex.parse_session(self.codex_parent)
+        local = next(ev for ev in data["events"] if ev.get("text") == "look at this")
+        fallback = next(ev for ev in data["events"] if ev.get("text") == "missing image")
+        self.assertEqual(local["images"][0]["kind"], "local")
+        self.assertIn(quote(str(self.codex_image.resolve()), safe=""), local["images"][0]["src"])
+        self.assertEqual(fallback["images"][0]["kind"], "inline")
+        self.assertTrue(fallback["images"][0]["src"].startswith("data:image/png;base64,"))
 
     # ----- exfiltration guarantees ----------------------------------------- #
 

@@ -1032,6 +1032,13 @@ def _event_text(ev: dict) -> list[str]:
         elif isinstance(inp, dict):
             for k in ("cmd", "command", "file_path", "query", "prompt"):
                 add(inp.get(k))
+            for call in inp.get("calls") or []:
+                nested = call.get("input") if isinstance(call, dict) else None
+                if isinstance(nested, str):
+                    add(nested)
+                elif isinstance(nested, dict):
+                    for k in ("cmd", "command", "file_path", "query", "prompt"):
+                        add(nested.get(k))
         res = ev.get("result")
         if isinstance(res, dict):
             add(res.get("output"))

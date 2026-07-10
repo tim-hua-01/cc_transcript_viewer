@@ -1243,6 +1243,25 @@ function formatToolInput(name, input) {
   const value = input == null ? {} : input;
 
   // ----- Codex tools -----
+  if (n === "exec" && typeof value === "object" && value.code) {
+    const calls = Array.isArray(value.calls) ? value.calls : [];
+    const wrap = el("div", {});
+    calls.forEach((call, i) => {
+      const callName = call.name || "tool";
+      wrap.append(el("div", { class: "tool-section-label" }, `call ${i + 1} · ${callName}`));
+      if (call.input != null) wrap.append(formatToolInput(callName, call.input).inputNode);
+      else wrap.append(el("div", { class: "attach-meta" }, "Arguments generated at runtime"));
+    });
+    const source = el(
+      "details",
+      { class: "orchestration-source" },
+      el("summary", {}, "Orchestration source"),
+      preFrom(value.code, "payload")
+    );
+    wrap.append(source);
+    const summary = calls.map((call) => call.name).filter(Boolean).join(" · ") || "orchestration code";
+    return { summary, inputNode: wrap };
+  }
   if (n === "apply_patch") {
     const text = typeof value === "string" ? value : (value.raw || value.input || value.patch || JSON.stringify(value, null, 2));
     return { summary: "patch", inputNode: renderPatch(text) };
