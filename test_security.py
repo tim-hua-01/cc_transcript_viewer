@@ -331,7 +331,29 @@ class SecurityTest(unittest.TestCase):
             item for item in server.search_sessions("nativepriority")
             if item["file"] == str(self.metadata_fixture)
         )
-        self.assertEqual(match["score"], server.CUSTOM_TITLE_WEIGHT)
+        self.assertEqual(match["score"], server.NATIVE_TITLE_WEIGHT)
+
+    def test_claude_and_cursor_native_titles_have_half_custom_weight(self):
+        claude = {
+            "agent": "claude",
+            "custom_title": "",
+            "original_title": "Original Claude title",
+            "claude_title": "Original Claude title",
+            "ai_title": "Short Claude title",
+        }
+        cursor = {
+            "agent": "cursor",
+            "custom_title": "",
+            "original_title": "Short Cursor title",
+        }
+        custom, native = server._search_title_segments(claude)
+        self.assertEqual(custom, "")
+        self.assertEqual(native.count("Original Claude title"), 1)
+        self.assertIn("Short Claude title", native)
+        self.assertEqual(
+            server._search_title_segments(cursor),
+            ("", "Short Cursor title"),
+        )
 
     def test_guardian_is_grouped_and_structured(self):
         summary = codex.session_summary(self.codex_guardian)

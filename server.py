@@ -1112,6 +1112,7 @@ _TEXT_CACHE: dict[str, tuple[float, str, str]] = {}
 # custom title selected specifically to identify the transcript.
 USER_MSG_WEIGHT = 50
 CUSTOM_TITLE_WEIGHT = 10_000
+NATIVE_TITLE_WEIGHT = CUSTOM_TITLE_WEIGHT // 2
 
 
 def _event_text(ev: dict) -> list[str]:
@@ -1182,8 +1183,6 @@ def _session_segments(data: dict) -> tuple[str, str]:
     cwd = (data.get("meta") or {}).get("cwd")
     if cwd:
         rest.append(cwd)
-    if data.get("ai_title"):
-        rest.append(data["ai_title"])
 
     def add_event(ev: dict) -> None:
         if ev.get("kind") == "branch":
@@ -1220,11 +1219,27 @@ def session_segments(s: dict) -> tuple[str, str]:
     return user, rest
 
 
+def _search_title_segments(session: dict) -> tuple[str, str]:
+    """Return viewer-custom and native-title text as distinct score tiers."""
+    custom = session.get("custom_title") or ""
+    native_titles = []
+    if session.get("agent") in {"claude", "cursor"}:
+        for title in (
+            session.get("original_title"),
+            session.get("claude_title"),
+            session.get("ai_title"),
+        ):
+            if title and title != custom and title not in native_titles:
+                native_titles.append(title)
+    return custom, "\n".join(native_titles)
+
+
 def search_sessions(query: str) -> list[dict]:
     """Return [{file, snippet, score}] for sessions whose content matches `query`.
 
-    Custom-title hits outrank user-message hits, which outrank ordinary
-    transcript hits. Among equal scores, an earlier first occurrence wins.
+    Viewer custom-title hits rank first. Claude/Cursor native titles receive
+    half that weight, followed by user messages and ordinary transcript text.
+    Among equal scores, an earlier first occurrence wins.
     """
     q = (query or "").strip().lower()
     if not q:
@@ -1232,28 +1247,33 @@ def search_sessions(query: str) -> list[dict]:
     out = []
     for s in list_sessions():
         user, rest = session_segments(s)
-        priority_titles = []
-        for title in (s.get("custom_title"), s.get("claude_title")):
-            if title and title not in priority_titles:
-                priority_titles.append(title)
-        custom = "\n".join(priority_titles)
+        custom, native = _search_title_segments(s)
         custom_low = custom.lower()
-        user_low, rest_low = user.lower(), rest.lower()
+        native_low, user_low, rest_low = native.lower(), user.lower(), rest.lower()
         c_custom = custom_low.count(q)
+        c_native = native_low.count(q)
         c_user = user_low.count(q)
         c_rest = rest_low.count(q)
-        if not c_custom and not c_user and not c_rest:
+        if not c_custom and not c_native and not c_user and not c_rest:
             continue
-        score = c_custom * CUSTOM_TITLE_WEIGHT + c_user * USER_MSG_WEIGHT + c_rest
+        score = (
+            c_custom * CUSTOM_TITLE_WEIGHT
+            + c_native * NATIVE_TITLE_WEIGHT
+            + c_user * USER_MSG_WEIGHT
+            + c_rest
+        )
         if c_custom:
             combined, idx = custom, custom_low.find(q)
             pos = idx
+        elif c_native:
+            combined, idx = native, native_low.find(q)
+            pos = len(custom) + idx
         elif c_user:
             combined, idx = user, user_low.find(q)
-            pos = len(custom) + idx
+            pos = len(custom) + len(native) + idx
         else:
             combined, idx = rest, rest_low.find(q)
-            pos = len(custom) + len(user) + idx
+            pos = len(custom) + len(native) + len(user) + idx
         start = max(0, idx - 50)
         snippet = combined[start:idx + len(q) + 70].replace("\n", " ").strip()
         if start > 0:
