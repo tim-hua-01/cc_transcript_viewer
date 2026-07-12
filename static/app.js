@@ -117,6 +117,7 @@ function fmtDuration(ms) {
 
 // ---------- state ----------
 let SESSIONS = [];
+let SESSIONS_LOADED = false;
 let CURRENT_FILE = null;
 let CURRENT_AGENT = "claude";
 let AGENT_FILTER = "all";
@@ -136,6 +137,7 @@ async function loadSessions() {
   const res = await fetch("/api/sessions");
   const data = await res.json();
   SESSIONS = data.sessions || [];
+  SESSIONS_LOADED = true;
   LAST_SIG = sessionsSignature(SESSIONS);
   buildFilters();
   renderSidebar($("#search").value || "");
@@ -340,7 +342,12 @@ function renderSidebar(query) {
   }
 
   if (!list.children.length) {
-    list.append(el("div", { class: "empty-note" }, q ? "No matching sessions." : "No transcripts found."));
+    const message = q
+      ? "No matching sessions."
+      : SESSIONS_LOADED
+        ? "No transcripts found."
+        : "Loading sessions…";
+    list.append(el("div", { class: "empty-note" }, message));
   }
 }
 
@@ -375,7 +382,7 @@ async function renameSession(data) {
     LAST_SIG = sessionsSignature(SESSIONS);
     await runSearch($("#search").value);
     markActive();
-    if (CURRENT_FILE === file) renderTranscript(data, { keepScroll: true });
+    if (CURRENT_FILE === file) await renderTranscript(data, { keepScroll: true });
   } catch (e) {
     window.alert("Could not save transcript name: " + String(e));
   }
@@ -402,13 +409,16 @@ async function openSession(file, itemEl) {
   try {
     const res = await fetch("/api/session?file=" + encodeURIComponent(file));
     const data = await res.json();
+    if (CURRENT_FILE !== file) return;
     if (data.error) { t.innerHTML = `<div class="empty-note">Error: ${esc(data.error)}</div>`; return; }
-    renderTranscript(data);
-    LAST_RENDERED_MTIME = sessionMtime(file);
+    const rendered = await renderTranscript(data);
+    if (rendered && CURRENT_FILE === file) LAST_RENDERED_MTIME = sessionMtime(file);
   } catch (e) {
     t.innerHTML = `<div class="empty-note">Failed to load: ${esc(String(e))}</div>`;
   }
 }
+
+let RENDER_GENERATION = 0;
 
 function renderTranscript(data, opts = {}) {
   const t = $("#transcript");
@@ -514,13 +524,54 @@ function renderTranscript(data, opts = {}) {
   );
   t.append(header);
 
-  for (const ev of data.events) {
-    const node = renderEvent(ev);
-    if (node) t.append(node);
-  }
-  groupTurnRuns(t);
-  if (!opts.keepScroll) $("#main").scrollTop = 0;
-  buildOutline();
+  const events = data.events || [];
+  const progressFill = el("div", { class: "render-progress-fill" });
+  const progress = el(
+    "div",
+    {
+      class: "render-progress",
+      role: "progressbar",
+      "aria-label": "Rendering transcript",
+      "aria-valuemin": "0",
+      "aria-valuemax": String(events.length),
+      "aria-valuenow": "0",
+    },
+    progressFill
+  );
+  if (events.length > 100) t.append(progress);
+
+  const generation = ++RENDER_GENERATION;
+  return new Promise((resolve) => {
+    let index = 0;
+    function renderBatch(budgetMs) {
+      if (generation !== RENDER_GENERATION) {
+        resolve(false);
+        return;
+      }
+      const fragment = document.createDocumentFragment();
+      const started = performance.now();
+      while (index < events.length && performance.now() - started < budgetMs) {
+        const node = renderEvent(events[index++]);
+        if (node) fragment.append(node);
+      }
+      t.append(fragment);
+      if (progress.isConnected) {
+        const percent = events.length ? (index / events.length) * 100 : 100;
+        progressFill.style.width = percent + "%";
+        progress.setAttribute("aria-valuenow", String(index));
+      }
+      if (index < events.length) {
+        requestAnimationFrame(() => renderBatch(9));
+        return;
+      }
+      progress.remove();
+      groupTurnRuns(t);
+      if (!opts.keepScroll) $("#main").scrollTop = 0;
+      buildOutline();
+      resolve(true);
+    }
+    renderBatch(30);
+  });
 }
 
 // Collapse consecutive turns that share a header (same author/model) into one
@@ -590,8 +641,8 @@ async function refreshOpenTranscript() {
     const res = await fetch("/api/session?file=" + encodeURIComponent(CURRENT_FILE));
     const data = await res.json();
     if (data.error) return;
-    renderTranscript(data, { keepScroll: true });
-    restoreView(view);
+    const rendered = await renderTranscript(data, { keepScroll: true });
+    if (rendered) restoreView(view);
     LAST_RENDERED_MTIME = sessionMtime(CURRENT_FILE);
   } catch (e) { /* transient; try again next poll */ }
 }

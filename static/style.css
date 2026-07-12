@@ -175,6 +175,15 @@ body {
 /* ---------- Main ---------- */
 #main { flex: 1; overflow-y: auto; position: relative; }
 
+.render-progress {
+  position: sticky; top: 0; z-index: 8; height: 3px;
+  background: var(--border); overflow: hidden;
+}
+.render-progress-fill {
+  width: 0; height: 100%; background: var(--accent);
+  transition: width 80ms linear;
+}
+
 /* ---------- Outline (user-message table of contents) ---------- */
 #outline {
   width: 240px;
