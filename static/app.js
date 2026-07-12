@@ -119,6 +119,7 @@ function fmtDuration(ms) {
 let SESSIONS = [];
 let SESSIONS_LOADED = false;
 let CURRENT_FILE = null;
+let CURRENT_DATA = null;
 let CURRENT_AGENT = "claude";
 let AGENT_FILTER = "all";
 // ---------- live auto-refresh (always on) ----------
@@ -361,6 +362,131 @@ function copyId(e, id) {
   );
 }
 
+function appendCopyEvent(lines, ev, branchLabel = "") {
+  if (ev.kind === "branch") {
+    (ev.groups || []).forEach((group, index) => {
+      lines.push(`## Abandoned branch ${index + 1}`);
+      for (const child of group) appendCopyEvent(lines, child, "abandoned branch");
+    });
+    return;
+  }
+
+  const labels = {
+    user: "User", assistant: "Assistant", reasoning: "Reasoning",
+    tool: "Tool", web_search: "Web search", web_call: "Web search",
+    instructions: "Instructions", system: "System", notice: "Notice",
+    attachment: "Attachment", guardian_request: "Review input",
+    guardian_decision: "Review decision", status: "Status", context: "Context",
+    tokens: "Token usage", raw: "Raw event",
+  };
+  const details = [ev.model, ev.phase, ev.status, branchLabel].filter(Boolean);
+  lines.push("## " + (labels[ev.kind] || ev.kind || "Event") + (details.length ? " · " + details.join(" · ") : ""));
+
+  if (Array.isArray(ev.blocks)) {
+    for (const block of ev.blocks) {
+      if (block.type === "text" || block.type === "thinking") {
+        if (block.type === "thinking") lines.push("<thinking>");
+        lines.push(block.text || "");
+        if (block.type === "thinking") lines.push("</thinking>");
+      } else if (block.type === "image") {
+        lines.push("[image]");
+      } else if (block.type === "tool_use") {
+        lines.push(`Tool: ${block.name || "tool"}`);
+        lines.push("Input: " + JSON.stringify(block.input ?? {}, null, 2));
+        if (block.result) {
+          if (block.result.text) lines.push("Result:\n" + block.result.text);
+          for (const _image of block.result.images || []) lines.push("[tool result image]");
+          if (!block.result.text && !(block.result.images || []).length) lines.push("Result: (no output)");
+        } else {
+          lines.push("Result: (not recorded)");
+        }
+      }
+    }
+  } else if (ev.text) {
+    lines.push(ev.text);
+  }
+
+  if (ev.kind === "tool") {
+    lines.push(`Tool: ${ev.name || "tool"}`);
+    lines.push("Input: " + JSON.stringify(ev.input ?? {}, null, 2));
+    if (ev.result) {
+      if (ev.result.output) lines.push("Result:\n" + ev.result.output);
+      if (ev.result.raw) lines.push("Result data:\n" + JSON.stringify(ev.result.raw, null, 2));
+      for (const _image of ev.result.images || []) lines.push("[tool result image]");
+    }
+  } else if (ev.kind === "guardian_request") {
+    if (ev.context) lines.push(ev.context);
+    lines.push(JSON.stringify(ev.request || {}, null, 2));
+  } else if (ev.kind === "guardian_decision") {
+    lines.push([String(ev.outcome || "").toUpperCase(), ev.risk_level, ev.user_authorization].filter(Boolean).join(" · "));
+    if (ev.rationale) lines.push(ev.rationale);
+  } else if (ev.kind === "web_search" || ev.kind === "web_call") {
+    const queries = ev.action && Array.isArray(ev.action.queries) ? ev.action.queries : [ev.query || ev.action?.query].filter(Boolean);
+    lines.push(...queries);
+  } else if (ev.kind === "attachment") {
+    const name = ev.display_path || ev.filename;
+    if (name) lines.push(name);
+    if (ev.command) lines.push("$ " + ev.command);
+    lines.push(...[ev.content, ev.stdout, ev.stderr].filter(Boolean));
+  } else if (["status", "context", "tokens", "raw"].includes(ev.kind)) {
+    const payload = ev.kind === "raw" ? ev.payload : ev;
+    lines.push(JSON.stringify(payload || {}, null, 2));
+  }
+  for (const _image of ev.images || []) lines.push("[image]");
+  for (const image of ev.local_images || []) lines.push("[local image: " + image + "]");
+  if (ev.turn_metadata) lines.push("Turn metadata:\n" + JSON.stringify(ev.turn_metadata, null, 2));
+  lines.push("");
+}
+
+function transcriptToText(data) {
+  const meta = data.meta || {};
+  const lines = ["# " + (data.title || "(untitled session)")];
+  if (meta.cwd) lines.push("Project: " + meta.cwd);
+  if (meta.model) lines.push("Model: " + meta.model);
+  if (data.id) lines.push("Session: " + data.id);
+  lines.push("");
+  for (const ev of data.events || []) appendCopyEvent(lines, ev);
+  return lines.join("\n").trimEnd() + "\n";
+}
+
+async function writeClipboard(text) {
+  if (navigator.clipboard?.writeText) return navigator.clipboard.writeText(text);
+  const area = el("textarea", { style: "position:fixed;left:-9999px;top:0" });
+  area.value = text;
+  document.body.append(area);
+  area.select();
+  const copied = document.execCommand("copy");
+  area.remove();
+  if (!copied) throw new Error("Clipboard access unavailable");
+}
+
+async function copyAll(e) {
+  const button = e.currentTarget;
+  const original = button.textContent;
+  try {
+    await writeClipboard(transcriptToText(CURRENT_DATA || {}));
+    button.textContent = "Copied";
+  } catch (_error) {
+    button.textContent = "Copy failed";
+  }
+  setTimeout(() => { button.textContent = original; }, 1200);
+}
+
+function setPanelCollapsed(panel, collapsed) {
+  document.body.classList.toggle(panel + "-collapsed", collapsed);
+  try { localStorage.setItem("transcript-viewer:" + panel + "-collapsed", collapsed ? "1" : "0"); } catch (_error) {}
+}
+
+function wirePanelToggles() {
+  for (const panel of ["sidebar", "outline"]) {
+    let collapsed = false;
+    try { collapsed = localStorage.getItem("transcript-viewer:" + panel + "-collapsed") === "1"; } catch (_error) {}
+    setPanelCollapsed(panel, collapsed);
+    $("#collapse-" + panel).addEventListener("click", () => setPanelCollapsed(panel, true));
+    $("#show-" + panel).addEventListener("click", () => setPanelCollapsed(panel, false));
+  }
+}
+
 async function renameSession(data) {
   const file = CURRENT_FILE;
   const entered = window.prompt(
@@ -425,6 +551,7 @@ function renderTranscript(data, opts = {}) {
   t.innerHTML = "";
   CURRENT_AGENT = data.agent || "claude";
   LAST_RENDERED_TITLE = data.title || "";
+  CURRENT_DATA = data;
 
   const meta = data.meta || {};
   const header = el(
@@ -519,6 +646,7 @@ function renderTranscript(data, opts = {}) {
       el("button", { class: "btn", onclick: () => setAll(".thinking-block", false) }, "Expand thinking"),
       el("button", { class: "btn", onclick: () => setAll(".tool-block", true) }, "Collapse tools"),
       el("button", { class: "btn", onclick: () => setAll(".tool-block", false) }, "Expand tools"),
+      el("button", { class: "btn", onclick: copyAll, title: "Copy transcript as plain text" }, "⧉ Copy all"),
       el("button", { class: "btn", onclick: scrollToEnd }, "⤓ Jump to end")
     )
   );
@@ -704,10 +832,12 @@ function buildOutline() {
   if (!USER_TURNS.length) {
     outline.hidden = true;
     nav.hidden = true;
+    document.body.classList.remove("has-outline");
     return;
   }
   outline.hidden = false;
   nav.hidden = false;
+  document.body.classList.add("has-outline");
 
   // Walk user prompts and abandoned-branch markers together in document order so
   // branches appear in the outline at the point they occur. Branch entries use a
@@ -1581,6 +1711,7 @@ document.addEventListener("keydown", (e) => {
 $("#nav-prev").addEventListener("click", () => jumpUser(-1));
 $("#nav-next").addEventListener("click", () => jumpUser(1));
 $("#nav-end").addEventListener("click", scrollToEnd);
+wirePanelToggles();
 
 let outlineRaf = 0;
 $("#main").addEventListener("scroll", () => {

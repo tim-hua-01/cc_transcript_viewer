@@ -19,6 +19,7 @@
         <div class="brand">
           <span class="brand-mark"></span>
           <span class="brand-name">Transcript Viewer</span>
+          <button id="collapse-sidebar" class="panel-toggle" title="Hide sessions" aria-label="Hide sessions">«</button>
         </div>
         <input id="search" type="search" placeholder="Search title, project, or id…" autocomplete="off" />
         <div id="filter-row">
@@ -54,9 +55,15 @@
     </main>
 
     <aside id="outline" hidden>
-      <div id="outline-header">User messages</div>
+      <div id="outline-header">
+        <span>User messages</span>
+        <button id="collapse-outline" class="panel-toggle" title="Hide outline" aria-label="Hide outline">»</button>
+      </div>
       <div id="outline-list"></div>
     </aside>
+
+    <button id="show-sidebar" class="edge-toggle edge-toggle-left" title="Show sessions" aria-label="Show sessions">»</button>
+    <button id="show-outline" class="edge-toggle edge-toggle-right" title="Show outline" aria-label="Show outline">«</button>
   </div>
   <script src="/app.js"></script>
 </body>
