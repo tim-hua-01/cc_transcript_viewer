@@ -15,6 +15,7 @@ import json
 import mimetypes
 import re
 import sqlite3
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote
@@ -27,15 +28,68 @@ SESSIONS_DIR = DEFAULT_CODEX_HOME / "sessions"
 ARCHIVED_SESSIONS_DIR = DEFAULT_CODEX_HOME / "archived_sessions"
 STATE_DB = DEFAULT_CODEX_HOME / "state_5.sqlite"
 MAX_INLINE_IMAGE_CHARS = 2_000_000
+_SUMMARY_CACHE: dict[str, tuple[int, int, str, dict]] = {}
+_SUMMARY_CACHE_LOCK = threading.RLock()
+_SUMMARY_CACHE_DIRTY = False
+_SUMMARY_CACHE_GENERATION = 0
 
 
 def configure(codex_home: Path) -> None:
     """Point the module at a Codex home directory."""
-    global CODEX_HOME, SESSIONS_DIR, ARCHIVED_SESSIONS_DIR, STATE_DB
+    global CODEX_HOME, SESSIONS_DIR, ARCHIVED_SESSIONS_DIR, STATE_DB, _SUMMARY_CACHE_DIRTY, _SUMMARY_CACHE_GENERATION
     CODEX_HOME = Path(codex_home).expanduser()
     SESSIONS_DIR = CODEX_HOME / "sessions"
     ARCHIVED_SESSIONS_DIR = CODEX_HOME / "archived_sessions"
     STATE_DB = CODEX_HOME / "state_5.sqlite"
+    with _SUMMARY_CACHE_LOCK:
+        _SUMMARY_CACHE.clear()
+        _SUMMARY_CACHE_DIRTY = False
+        _SUMMARY_CACHE_GENERATION = 0
+
+
+def _thread_signature(thread_row: dict | None) -> str:
+    """Stable fingerprint for SQLite metadata that can change without the JSONL."""
+    row = thread_row or {}
+    fields = (
+        "id", "title", "preview", "cwd", "updated_at", "updated_at_ms",
+        "created_at", "created_at_ms", "archived", "model", "reasoning_effort",
+        "tokens_used", "source", "thread_source", "cli_version", "model_provider",
+    )
+    return json.dumps([row.get(field) for field in fields], sort_keys=True, default=str)
+
+
+def load_summary_cache(data: dict) -> None:
+    global _SUMMARY_CACHE_DIRTY, _SUMMARY_CACHE_GENERATION
+    with _SUMMARY_CACHE_LOCK:
+        for key, value in (data or {}).items():
+            try:
+                _SUMMARY_CACHE[key] = (int(value[0]), int(value[1]), str(value[2]), value[3])
+            except (TypeError, ValueError, IndexError):
+                continue
+        _SUMMARY_CACHE_DIRTY = False
+        _SUMMARY_CACHE_GENERATION = 0
+
+
+def dump_summary_cache() -> dict:
+    with _SUMMARY_CACHE_LOCK:
+        return {key: [mtime, size, signature, summary] for key, (mtime, size, signature, summary) in _SUMMARY_CACHE.items()}
+
+
+def summary_cache_dirty() -> bool:
+    with _SUMMARY_CACHE_LOCK:
+        return _SUMMARY_CACHE_DIRTY
+
+
+def summary_cache_generation() -> int:
+    with _SUMMARY_CACHE_LOCK:
+        return _SUMMARY_CACHE_GENERATION
+
+
+def mark_summary_cache_saved(generation: int) -> None:
+    global _SUMMARY_CACHE_DIRTY
+    with _SUMMARY_CACHE_LOCK:
+        if _SUMMARY_CACHE_GENERATION == generation:
+            _SUMMARY_CACHE_DIRTY = False
 
 
 def _iter_records(path: Path):
@@ -399,6 +453,24 @@ def _iso_from_ms(ms) -> str:
 
 
 def session_summary(path: Path, thread_row: dict | None = None) -> dict:
+    global _SUMMARY_CACHE_DIRTY, _SUMMARY_CACHE_GENERATION
+    st = _safe_stat(path)
+    identity = (st.st_mtime_ns, st.st_size) if st else (0, 0)
+    signature = _thread_signature(thread_row)
+    with _SUMMARY_CACHE_LOCK:
+        cached = _SUMMARY_CACHE.get(str(path))
+    if cached and cached[:3] == (identity[0], identity[1], signature):
+        return cached[3]
+
+    summary = _session_summary_uncached(path, thread_row)
+    with _SUMMARY_CACHE_LOCK:
+        _SUMMARY_CACHE[str(path)] = (identity[0], identity[1], signature, summary)
+        _SUMMARY_CACHE_DIRTY = True
+        _SUMMARY_CACHE_GENERATION += 1
+    return summary
+
+
+def _session_summary_uncached(path: Path, thread_row: dict | None = None) -> dict:
     records = list(_iter_records(path))
     meta = {}
     first_ts = None

@@ -16,8 +16,11 @@ from __future__ import annotations
 import argparse
 import json
 import mimetypes
+import multiprocessing
+import os
 import re
 import threading
+from concurrent.futures import ProcessPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -45,6 +48,7 @@ HOST_CHECK = True
 # Set by main() so handlers can reach it.
 PROJECTS_DIR = DEFAULT_PROJECTS_DIR
 CUSTOM_NAMES_FILE = DEFAULT_CUSTOM_NAMES_FILE
+CACHE_FILE = Path.home() / ".cache" / "transcript_viewer" / "summaries.json"
 
 
 # ---------------------------------------------------------------------------
@@ -315,27 +319,132 @@ def _subagent_meta(path: Path, records: list[dict]) -> dict | None:
     }
 
 
-# Cache: file path -> (mtime, summary dict). Keeps the /api/sessions poll from
+# Cache: file path -> (mtime_ns, size, summary dict). Keeps the /api/sessions poll from
 # re-reading and re-parsing every transcript on every request; only files whose
-# mtime moved are rebuilt.
-_SUMMARY_CACHE: dict[str, tuple[float, dict]] = {}
+# identity moved are rebuilt. The cache is persisted so restarts stay cheap.
+_SUMMARY_CACHE: dict[str, tuple[int, int, dict]] = {}
+_SUMMARY_CACHE_LOCK = threading.RLock()
+_CACHE_LOADED = False
+_SUMMARY_CACHE_DIRTY = False
+_SUMMARY_CACHE_GENERATION = 0
+_CACHE_VERSION = 1
+_PARALLEL_SCAN_THRESHOLD = 32
+
+
+def _file_identity(path: Path) -> tuple[int, int] | None:
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    return st.st_mtime_ns, st.st_size
+
+
+def _summary_worker(path_str: str) -> tuple[str, int, int, dict | None]:
+    """Parse one Claude transcript in an isolated cold-scan worker."""
+    path = Path(path_str)
+    identity = _file_identity(path)
+    if identity is None:
+        return path_str, 0, 0, None
+    try:
+        summary = _cc_session_summary_uncached(path)
+    except (OSError, ValueError):
+        return path_str, identity[0], identity[1], None
+    return path_str, identity[0], identity[1], summary
+
+
+def load_summary_caches() -> None:
+    """Load viewer-owned sidebar summaries from disk once, best effort."""
+    global _CACHE_LOADED, _SUMMARY_CACHE_DIRTY, _SUMMARY_CACHE_GENERATION
+    with _SUMMARY_CACHE_LOCK:
+        if _CACHE_LOADED:
+            return
+        _CACHE_LOADED = True
+        try:
+            payload = json.loads(CACHE_FILE.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return
+        if payload.get("version") != _CACHE_VERSION:
+            return
+        for key, value in (payload.get("claude") or {}).items():
+            try:
+                _SUMMARY_CACHE[key] = (int(value[0]), int(value[1]), value[2])
+            except (TypeError, ValueError, IndexError):
+                continue
+        codex.load_summary_cache(payload.get("codex") or {})
+        _SUMMARY_CACHE_DIRTY = False
+        _SUMMARY_CACHE_GENERATION = 0
+
+
+def save_summary_caches() -> None:
+    """Atomically persist a snapshot of both summary caches, best effort."""
+    global _SUMMARY_CACHE_DIRTY
+    with _SUMMARY_CACHE_LOCK:
+        if not _SUMMARY_CACHE_DIRTY and not codex.summary_cache_dirty():
+            return
+        claude_generation = _SUMMARY_CACHE_GENERATION
+        codex_generation = codex.summary_cache_generation()
+        claude = {key: [mtime, size, summary] for key, (mtime, size, summary) in _SUMMARY_CACHE.items()}
+        payload = {
+            "version": _CACHE_VERSION,
+            "claude": claude,
+            "codex": codex.dump_summary_cache(),
+        }
+    try:
+        CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        temp = CACHE_FILE.with_name(CACHE_FILE.name + ".tmp")
+        temp.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
+        temp.replace(CACHE_FILE)
+        with _SUMMARY_CACHE_LOCK:
+            if _SUMMARY_CACHE_GENERATION == claude_generation:
+                _SUMMARY_CACHE_DIRTY = False
+            codex.mark_summary_cache_saved(codex_generation)
+    except OSError:
+        pass
+
+
+def _prefill_cc_summaries(files: list[Path]) -> None:
+    """Populate stale summaries, using processes only for a large cold batch."""
+    global _SUMMARY_CACHE_DIRTY, _SUMMARY_CACHE_GENERATION
+    stale = []
+    with _SUMMARY_CACHE_LOCK:
+        for path in files:
+            identity = _file_identity(path)
+            cached = _SUMMARY_CACHE.get(str(path))
+            if identity is not None and (not cached or cached[:2] != identity):
+                stale.append(str(path))
+    if len(stale) < _PARALLEL_SCAN_THRESHOLD or (os.cpu_count() or 1) < 2:
+        return
+    try:
+        context = multiprocessing.get_context("spawn")
+        with ProcessPoolExecutor(max_workers=min(os.cpu_count() or 1, 8), mp_context=context) as pool:
+            results = pool.map(_summary_worker, stale, chunksize=8)
+            with _SUMMARY_CACHE_LOCK:
+                for key, mtime, size, summary in results:
+                    if summary is not None:
+                        _SUMMARY_CACHE[key] = (mtime, size, summary)
+                        _SUMMARY_CACHE_DIRTY = True
+                        _SUMMARY_CACHE_GENERATION += 1
+    except Exception:  # noqa: BLE001 - serial calls below remain the fallback
+        return
 
 
 def cc_session_summary(path: Path) -> dict:
     """Lightweight metadata for a Claude Code session, cached by file mtime."""
+    global _SUMMARY_CACHE_DIRTY, _SUMMARY_CACHE_GENERATION
     key = str(path)
-    try:
-        mtime = path.stat().st_mtime
-    except OSError:
-        mtime = None
-    if mtime is not None:
-        cached = _SUMMARY_CACHE.get(key)
-        if cached and cached[0] == mtime:
-            return cached[1]
+    identity = _file_identity(path)
+    if identity is not None:
+        with _SUMMARY_CACHE_LOCK:
+            cached = _SUMMARY_CACHE.get(key)
+        if cached and cached[:2] == identity:
+            return cached[2]
 
     summary = _cc_session_summary_uncached(path)
-    if mtime is not None:
-        _SUMMARY_CACHE[key] = (mtime, summary)
+    if identity is not None:
+        with _SUMMARY_CACHE_LOCK:
+            _SUMMARY_CACHE[key] = (identity[0], identity[1], summary)
+            _SUMMARY_CACHE_DIRTY = True
+            _SUMMARY_CACHE_GENERATION += 1
     return summary
 
 
@@ -885,23 +994,23 @@ def parse_cc_session(path: Path) -> dict:
 # ---------------------------------------------------------------------------
 def list_sessions() -> list[dict]:
     """Flat list of every Claude Code and Codex session, newest first."""
+    load_summary_caches()
     out: list[dict] = []
 
     if PROJECTS_DIR.exists():
+        cc_files: list[Path] = []
         for proj_dir in sorted(PROJECTS_DIR.iterdir()):
             if not proj_dir.is_dir():
                 continue
-            for f in proj_dir.glob("*.jsonl"):
-                try:
-                    out.append(cc_session_summary(f))
-                except (OSError, ValueError):
-                    continue
+            cc_files.extend(proj_dir.glob("*.jsonl"))
             # Sub-agents live one level down: <session-id>/subagents/agent-*.jsonl
-            for sub in proj_dir.glob("*/subagents/*.jsonl"):
-                try:
-                    out.append(cc_session_summary(sub))
-                except (OSError, ValueError):
-                    continue
+            cc_files.extend(proj_dir.glob("*/subagents/*.jsonl"))
+        _prefill_cc_summaries(cc_files)
+        for path in cc_files:
+            try:
+                out.append(cc_session_summary(path))
+            except (OSError, ValueError):
+                continue
 
     try:
         for group in codex.list_sessions():
@@ -918,6 +1027,8 @@ def list_sessions() -> list[dict]:
                 out.append(s)
     except Exception:  # noqa: BLE001 — never let Cursor errors hide other sessions
         pass
+
+    save_summary_caches()
 
     for session in out:
         _apply_custom_name(session)
