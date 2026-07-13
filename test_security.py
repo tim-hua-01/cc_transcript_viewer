@@ -139,6 +139,23 @@ def _write_guardian_sessions(codex_home: Path) -> tuple[Path, Path, Path]:
         {"timestamp": "2026-01-01T00:00:05Z", "type": "event_msg",
          "payload": {"type": "task_complete", "turn_id": "parent-turn",
                      "duration_ms": 3000, "time_to_first_token_ms": 700}},
+        {"timestamp": "2026-01-01T00:00:06Z", "type": "compacted",
+         "payload": {
+             "window_number": 1,
+             "previous_window_id": "window-old",
+             "window_id": "window-new",
+             "message": "",
+             "replacement_history": [
+                 {"type": "message", "role": "user", "content": [
+                     {"type": "input_text", "text": "retained prompt"},
+                 ]},
+                 {"type": "compaction", "id": "cmp-test", "encrypted_content": "ciphertext"},
+             ],
+         }},
+        {"timestamp": "2026-01-01T00:00:06Z", "type": "world_state",
+         "payload": {"full": True, "state": {"environments": {"local": {"shell": "zsh"}}}}},
+        {"timestamp": "2026-01-01T00:00:06Z", "type": "event_msg",
+         "payload": {"type": "context_compacted"}},
     ]
     planned = {
         "command": ["/bin/zsh", "-lc", "python3 -m unittest test_security"],
@@ -410,6 +427,19 @@ class SecurityTest(unittest.TestCase):
         self.assertEqual(result["metadata"]["exit_code"], 0)
         self.assertEqual(result["metadata"]["chunk_id"], "abc")
 
+        javascript_object = r'''const r = await tools.exec_command({
+          cmd: "find output -type f \\\\( -name '*.json' -o -name \"*.txt\" \\\\) -delete",
+          workdir: "/tmp/project",
+          yield_time_ms: 10000,
+          max_output_tokens: 2000,
+        }); text(r.output);'''
+        parsed = codex._normalize_tool_input("exec", javascript_object)
+        call = parsed["calls"][0]
+        self.assertEqual(call["name"], "exec_command")
+        self.assertEqual(call["input"]["workdir"], "/tmp/project")
+        self.assertEqual(call["input"]["yield_time_ms"], 10000)
+        self.assertIn("-name '*.json'", call["input"]["cmd"])
+
     def test_codex_user_images_prefer_local_and_fallback_inline(self):
         data = codex.parse_session(self.codex_parent)
         local = next(ev for ev in data["events"] if ev.get("text") == "look at this")
@@ -427,6 +457,25 @@ class SecurityTest(unittest.TestCase):
         self.assertEqual(answer["turn_metadata"]["usage"]["input_tokens"], 100)
         self.assertFalse(
             {"status", "context", "tokens"} & {event["kind"] for event in data["events"]}
+        )
+
+    def test_codex_compaction_is_a_visible_boundary(self):
+        data = codex.parse_session(self.codex_parent)
+        compact = next(
+            ev for ev in data["events"]
+            if ev.get("kind") == "system" and ev.get("subtype") == "compact_boundary"
+        )
+        self.assertEqual(compact["compaction"]["source"], "codex")
+        self.assertEqual(compact["compaction"]["window_number"], 1)
+        self.assertEqual(compact["compaction"]["replacement_items"], 2)
+        self.assertTrue(compact["compaction"]["summary_encrypted"])
+        self.assertEqual(compact["text"], "")
+        self.assertEqual(
+            compact["metadata"]["world_state"]["state"]["environments"]["local"]["shell"],
+            "zsh",
+        )
+        self.assertFalse(
+            any(ev.get("record_type") == "world_state" for ev in data["events"])
         )
 
     # ----- exfiltration guarantees ----------------------------------------- #

@@ -164,30 +164,162 @@ def _mask_js_literals(source: str) -> str:
     return "".join(chars)
 
 
+class _JSLiteralParser:
+    """Parse the JSON-like literal subset used in generated tool calls."""
+
+    def __init__(self, source: str, start: int = 0):
+        self.source = source
+        self.pos = start
+
+    def parse(self):
+        self._space()
+        value = self._value()
+        return value, self.pos
+
+    def _space(self) -> None:
+        while self.pos < len(self.source):
+            if self.source[self.pos].isspace():
+                self.pos += 1
+                continue
+            if self.source.startswith("//", self.pos):
+                end = self.source.find("\n", self.pos + 2)
+                self.pos = len(self.source) if end < 0 else end + 1
+                continue
+            if self.source.startswith("/*", self.pos):
+                end = self.source.find("*/", self.pos + 2)
+                if end < 0:
+                    raise ValueError("unterminated comment")
+                self.pos = end + 2
+                continue
+            break
+
+    def _value(self):
+        self._space()
+        if self.pos >= len(self.source):
+            raise ValueError("missing value")
+        ch = self.source[self.pos]
+        if ch == "{":
+            return self._object()
+        if ch == "[":
+            return self._array()
+        if ch in {'"', "'", "`"}:
+            return self._string()
+        number = re.match(r"-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?", self.source[self.pos:])
+        if number:
+            raw = number.group(0)
+            self.pos += len(raw)
+            return float(raw) if any(c in raw for c in ".eE") else int(raw)
+        ident = self._identifier()
+        if ident == "true":
+            return True
+        if ident == "false":
+            return False
+        if ident in {"null", "undefined"}:
+            return None
+        raise ValueError("non-literal expression")
+
+    def _identifier(self) -> str:
+        match = re.match(r"[A-Za-z_$][\w$]*", self.source[self.pos:])
+        if not match:
+            raise ValueError("expected identifier")
+        value = match.group(0)
+        self.pos += len(value)
+        return value
+
+    def _string(self) -> str:
+        quote_char = self.source[self.pos]
+        self.pos += 1
+        out = []
+        escapes = {"b": "\b", "f": "\f", "n": "\n", "r": "\r", "t": "\t", "v": "\v", "0": "\0"}
+        while self.pos < len(self.source):
+            ch = self.source[self.pos]
+            self.pos += 1
+            if ch == quote_char:
+                return "".join(out)
+            if quote_char == "`" and ch == "$" and self.source.startswith("{", self.pos):
+                raise ValueError("template expression")
+            if ch != "\\":
+                out.append(ch)
+                continue
+            if self.pos >= len(self.source):
+                raise ValueError("unterminated escape")
+            escaped = self.source[self.pos]
+            self.pos += 1
+            if escaped in escapes:
+                out.append(escapes[escaped])
+            elif escaped == "x" and self.pos + 2 <= len(self.source):
+                out.append(chr(int(self.source[self.pos:self.pos + 2], 16)))
+                self.pos += 2
+            elif escaped == "u" and self.pos + 4 <= len(self.source):
+                out.append(chr(int(self.source[self.pos:self.pos + 4], 16)))
+                self.pos += 4
+            elif escaped in "\r\n":
+                if escaped == "\r" and self.pos < len(self.source) and self.source[self.pos] == "\n":
+                    self.pos += 1
+            else:
+                out.append(escaped)
+        raise ValueError("unterminated string")
+
+    def _object(self) -> dict:
+        self.pos += 1
+        value = {}
+        while True:
+            self._space()
+            if self.pos < len(self.source) and self.source[self.pos] == "}":
+                self.pos += 1
+                return value
+            key = self._string() if self.source[self.pos] in {'"', "'", "`"} else self._identifier()
+            self._space()
+            if self.pos >= len(self.source) or self.source[self.pos] != ":":
+                raise ValueError("expected colon")
+            self.pos += 1
+            value[key] = self._value()
+            self._space()
+            if self.pos < len(self.source) and self.source[self.pos] == ",":
+                self.pos += 1
+                continue
+            if self.pos >= len(self.source) or self.source[self.pos] != "}":
+                raise ValueError("expected object end")
+
+    def _array(self) -> list:
+        self.pos += 1
+        value = []
+        while True:
+            self._space()
+            if self.pos < len(self.source) and self.source[self.pos] == "]":
+                self.pos += 1
+                return value
+            value.append(self._value())
+            self._space()
+            if self.pos < len(self.source) and self.source[self.pos] == ",":
+                self.pos += 1
+                continue
+            if self.pos >= len(self.source) or self.source[self.pos] != "]":
+                raise ValueError("expected array end")
+
+
+def _parse_js_literal(source: str, start: int):
+    return _JSLiteralParser(source, start).parse()
+
+
 def _exec_orchestration(source: str) -> dict:
     """Recover generated `tools.name(JSON)` calls from a Codex exec program."""
     masked = _mask_js_literals(source)
-    decoder = json.JSONDecoder()
     constants = {}
     for match in re.finditer(r"\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=", masked):
         start = match.end()
-        while start < len(source) and source[start].isspace():
-            start += 1
         try:
-            value, _ = decoder.raw_decode(source[start:].lstrip())
-        except json.JSONDecodeError:
+            value, _ = _parse_js_literal(source, start)
+        except (ValueError, TypeError):
             continue
         constants[match.group(1)] = value
 
     calls = []
     for match in re.finditer(r"\btools\.([A-Za-z_$][\w$]*)\s*\(", masked):
         start = match.end()
-        while start < len(source) and source[start].isspace():
-            start += 1
-        tail = source[start:]
         try:
-            value, _ = decoder.raw_decode(tail)
-        except json.JSONDecodeError:
+            value, _ = _parse_js_literal(source, start)
+        except (ValueError, TypeError):
             ident = re.match(r"([A-Za-z_$][\w$]*)", masked[start:])
             value = constants.get(ident.group(1)) if ident else None
         calls.append({"name": match.group(1), "input": value})
@@ -947,6 +1079,53 @@ def parse_session(path: Path) -> dict:
                 )
             )
             continue
+
+        if typ == "compacted":
+            replacement = payload.get("replacement_history") or []
+            compaction_items = [
+                item for item in replacement
+                if isinstance(item, dict) and item.get("type") == "compaction"
+            ]
+            readable_summary = payload.get("message") or ""
+            if not readable_summary:
+                readable_summary = "\n\n".join(
+                    text for text in (
+                        _extract_text_content(item.get("content"))
+                        or _summary_text(item.get("summary"))
+                        for item in compaction_items
+                    )
+                    if text
+                )
+            events.append(
+                _event_payload(
+                    "system",
+                    ts,
+                    {
+                        "subtype": "compact_boundary",
+                        "text": readable_summary,
+                        "compaction": {
+                            "source": "codex",
+                            "window_number": payload.get("window_number"),
+                            "previous_window_id": payload.get("previous_window_id"),
+                            "window_id": payload.get("window_id"),
+                            "replacement_items": len(replacement),
+                            "summary_encrypted": bool(compaction_items)
+                            and not bool(readable_summary)
+                            and any(item.get("encrypted_content") for item in compaction_items),
+                        },
+                    },
+                )
+            )
+            continue
+
+        if typ == "world_state":
+            if (
+                events
+                and events[-1].get("kind") == "system"
+                and events[-1].get("subtype") == "compact_boundary"
+            ):
+                events[-1]["metadata"] = {"world_state": payload}
+                continue
 
         if typ == "event_msg":
             pt = payload.get("type")

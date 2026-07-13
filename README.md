@@ -11,9 +11,9 @@ It reads:
   `~/Library/Application Support/Cursor/User/globalStorage/state.vscdb` (not the lossy
   `~/.cursor/projects/.../agent-transcripts/` JSONL export — see [Notes on Cursor](#notes-on-cursor-conversations))
 
-Nothing is uploaded anywhere; it's a read-only local web app that listens on loopback only. The
-server contains no outbound-network code at all, and a [test suite](#privacy--security) verifies it —
-so you can check that claim rather than take it on faith.
+Nothing is uploaded anywhere. Transcript sources are opened read-only; the only write is the
+viewer-owned custom-names file. The app listens on loopback only, contains no outbound-network code,
+and has a [test suite](#privacy--security) that verifies those guarantees.
 
 > [!WARNING]
 > **This is vibe-coded.** It was built quickly and iteratively with an AI coding agent, so expect
@@ -56,7 +56,7 @@ files that actually changed — the cost doesn't grow with how many transcripts 
   newest (most recently modified) first — no per-project grouping. Each entry shows an **agent tag**
   (Claude / Codex / Cursor), the project path, recency, message/tool/web counts, model, and the full
   session **id** (click to copy).
-- **Titles from the first message.** Each session is titled with the first ~100 characters of its
+- **Readable and custom titles.** Each session is titled with the first ~100 characters of its
   first user message unless the source has an explicit title. Claude Code `/rename`/`--name` titles
   are respected, and distinct branch/team agent names appear as badges. Use the edit button beside
   an open transcript's title to give it a viewer-specific name; clearing it restores the source
@@ -64,16 +64,18 @@ files that actually changed — the cost doesn't grow with how many transcripts 
   agent-owned transcripts and Cursor database untouched.
 - **Search across everything.** The search box (press `/` to focus) matches session **content** —
   prompts, replies, reasoning, tool commands/paths/queries/outputs — in addition to titles and
-  directories, and shows a snippet of the match. Custom-title matches receive `10,000×` weight,
-  every user-message match receives `50×`, and ordinary transcript-content matches receive `1×`.
-  Powered by `/api/search` with an mtime-keyed cache.
+  directories, and shows a snippet of the match. Viewer custom-title matches receive `10,000×`
+  weight, native Claude/Cursor titles receive `5,000×`, every user-message match receives `50×`,
+  and ordinary transcript-content matches receive `1×`. Powered by `/api/search` with an
+  mtime-keyed cache.
 - **Filters that compose.**
   - **All / Claude / Codex / Cursor** chips.
   - A **Model** dropdown grouped by family (Claude / GPT / Other): tick a family to select all its
     models, or pick individual ones (e.g. only Sonnet). The family box shows an indeterminate state
     on partial selection.
   - A **Directory** dropdown to narrow to specific project paths.
-- **Transcript view** — a chronological, color-coded conversation that renders both agents' formats:
+- **Transcript view** — a chronological, color-coded conversation that renders all three agents'
+  formats:
   - User prompts and assistant replies as Markdown, **with LaTeX math** (KaTeX) and inline images.
   - **Thinking / reasoning** blocks (collapsed by default).
   - **Tool calls** with tool-specific formatting and results paired inline:
@@ -94,21 +96,25 @@ files that actually changed — the cost doesn't grow with how many transcripts 
   that most viewers drop. This one renders them: 📎 *referenced-file* pointers (including the note the
   model is actually handed when its context is rebuilt), 📄 re-attached file reads with their full
   content, and tool-set changes (`+N tools available via ToolSearch`). Compaction boundaries show
-  their trigger, before/after token counts, duration, and preserved message/tool counts.
+  their trigger, before/after token counts, duration, and preserved message/tool counts. Codex
+  boundaries show the context-window number, replacement-item count, and whether the replacement
+  summary is encrypted and therefore unreadable from the transcript.
 - **Pull-request links.** Claude Code sessions associated with a PR show a safe, clickable PR link in
   the transcript header.
-- **Images & sub-agents.** Inline images in prompts/replies and Codex `view_image` are shown. For
+- **Images.** Inline images in prompts/replies and Codex `view_image` are shown. For
   Codex user prompts, the viewer prefers the original `local_images` file and falls back to the
-  embedded `input_image` data URL if the file is gone. Claude
-  Code sub-agents (which newer versions write to their own `…/<session-id>/subagents/agent-*.jsonl`
+  embedded `input_image` data URL if the file is gone.
+- **Sub-agents & guardians.** Claude Code sub-agents (which newer versions write to their own
+  `…/<session-id>/subagents/agent-*.jsonl`
   files) and Codex sub-agent sessions are each picked up as their own entry in the same time-sorted
   list, indented and flagged **sub-agent**. A sub-agent is titled `[type] description` when it can be
-  matched back to the `Task`/`Agent` call that spawned it (others — e.g. compaction agents — fall back
-  to their opening prompt), and its transcript view links **↑ parent session**. Older transcripts that
-  inline sub-agent turns as `isSidechain` records still render those turns inline, flagged **sub-agent**.
-  Codex approval guardians are linked under their parent session. Each received transcript snapshot
-  or delta renders as a user-style review input followed by reasoning and the allow/deny decision;
-  generic task/context/token bookkeeping is consolidated into one collapsed metadata block per turn.
+  matched back to a Claude `Task`/`Agent` call that spawned it (others — e.g. compaction agents —
+  fall back to their opening prompt), and its transcript view links **↑ parent session**. Older Claude
+  transcripts that inline sub-agent turns as `isSidechain` records still render those turns inline,
+  flagged **sub-agent**. Codex approval guardians are linked under their parent session and labeled
+  **guardian**. Each received transcript snapshot or delta renders as a user-style review input,
+  followed by reasoning and the allow/deny decision; generic task/context/token bookkeeping is
+  consolidated into one collapsed metadata block per turn.
 - **Jump between prompts.** A right-side **outline** lists the top-level user messages as truncated,
   clickable headings and highlights the one you're reading as you scroll. Floating **↑ / ↓** buttons
   jump to the previous/next user prompt, and **⤓ Jump to end** (in the transcript controls) skips to
@@ -166,9 +172,12 @@ the default bind is loopback.
 - **Web search results aren't stored.** Codex records only the search *queries* it issued (the viewer
   lists all of them); the fetched pages are sent to the model but never written to the rollout. The
   findings survive only as the assistant's prose, with citation links.
-- **Images.** `view_image` prefers serving the original local file via `/api/local-image`; if the file
-  is gone it falls back to the (often large) base64 payload embedded in the JSONL. It also reads
-  `~/.codex/state_5.sqlite` for thread metadata (cwd, model) when available.
+- **Images.** Codex may record a prompt image twice: as an embedded `input_image` data URL in a
+  `response_item/message`, and as a path in the corresponding `event_msg/user_message`'s
+  `local_images` list. The viewer correlates those records, prefers the original file through
+  `/api/local-image`, and falls back to the embedded data URL if the file is gone. `view_image` uses
+  the same local-file-first behavior. The parser also reads `~/.codex/state_5.sqlite` for thread
+  metadata (cwd, model) when available.
 
 ## Notes on Cursor conversations
 
@@ -229,7 +238,7 @@ Restart Claude Code (or run `/config` once) for the change to take effect. Note 
 | File | Role |
 |------|------|
 | `server.py` | The unified stdlib HTTP server. Scans both transcript roots into one time-sorted list (caching per-file summaries by mtime), parses each Claude Code session into a clean event stream (pairing tool results to calls), dispatches `/api/session` to the right parser by transcript root, and serves the JSON API (`/api/sessions`, `/api/session?file=...`, `/api/session-name`, `/api/search?q=...`, `/api/local-image`) plus the static frontend. `/api/session` only serves files under the allowed roots; `/api/session-name` only updates the viewer-owned names file; `/api/local-image` serves only image-typed files; and a `Host`-header allowlist guards the loopback server against DNS rebinding. |
-| `codex_server.py` | Codex parsing library (imported by `server.py`): parses rollout JSONL, reads `state_5.sqlite` metadata, pairs tool calls with outputs, and renders `apply_patch` diffs. Call `configure(codex_home)` to point it elsewhere. |
+| `codex_server.py` | Codex parsing library (imported by `server.py`): parses rollout JSONL, reads `state_5.sqlite` metadata, pairs tool calls with outputs, unpacks orchestration-style `exec` calls, correlates local and embedded prompt images, consolidates per-turn bookkeeping, recognizes guardian/sub-agent relationships, and renders `apply_patch` diffs. Call `configure(codex_home)` to point it elsewhere. |
 | `cursor_server.py` | Cursor parsing library (imported by `server.py`): reads Cursor's `state.vscdb` (`composerData`/`bubbleId`/`composer.content` keys) read-only, normalizes tool names/inputs onto the canonical renderers, reconstructs `edit_file` diffs from content snapshots, and emits events in the Claude Code block shape. Sessions are addressed by the `cursordb:<id>` scheme. Call `configure(db_path)` to point it elsewhere. |
 | `static/index.html`, `static/style.css`, `static/app.js` | The single frontend (vanilla JS, no build step). `app.js` dispatches on event kind and renders the Claude Code / Cursor (block-based) and Codex (flat) shapes, and runs the live-refresh poll loop. |
 | `test_security.py` | Zero-dependency security tests (`python3 -m unittest test_security`): asserts no outbound connections at runtime, no network-client imports, loopback default bind, the `Host`-header rebinding guard, and that `/api/session` is confined to the transcript roots while `/api/local-image` serves images only. |
@@ -242,13 +251,20 @@ Claude Code stores each session as a JSONL file at
 - `user` / `assistant` messages, whose `message.content` is a list of typed blocks
   (`text`, `thinking`, `tool_use` on the assistant side; `text`, `tool_result`, `image` on the user
   side — tool results are paired to calls by `tool_use_id`).
-- Metadata lines: `ai-title`, `system`, `attachment` (hook output), and a few others the viewer
-  ignores.
+- Metadata lines include `ai-title`, `custom-title`, `agent-name`, `pr-link`, `attachment` (hook
+  output), and `system` records such as compaction boundaries and `compactMetadata`. Some other
+  operational records are ignored.
 
 Codex stores each session as a rollout JSONL file at
 `~/.codex/sessions/YYYY/MM/DD/rollout-<timestamp>-<thread-id>.jsonl` (and under
-`~/.codex/archived_sessions/`), with `session_meta`, `turn_context`, `response_item`, and `event_msg`
-records.
+`~/.codex/archived_sessions/`), primarily using these record types:
+
+- `session_meta` — session identity, working directory, base instructions, and sub-agent provenance.
+- `turn_context` — per-turn model, effort, sandbox, approval, and working-directory metadata.
+- `response_item` — structured messages, reasoning, tool calls/results, and embedded `input_image`
+  content.
+- `event_msg` — the user/assistant event stream plus status, token, compaction, and `local_images`
+  bookkeeping. The viewer merges duplicate representations into one chronological transcript.
 
 Cursor stores conversations in a SQLite DB at
 `~/Library/Application Support/Cursor/User/globalStorage/state.vscdb` (table `cursorDiskKV`):

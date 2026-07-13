@@ -970,10 +970,10 @@ function renderAssistant(ev) {
   return turnShell("assistant", "Codex", ev, body);
 }
 
-function renderTurnMetadata(metadata) {
+function renderTurnMetadata(metadata, label = "Turn metadata") {
   return collapsibleBlock(
     "turn-metadata collapsed",
-    "Turn metadata",
+    label,
     [preFrom(JSON.stringify(metadata, null, 2))]
   );
 }
@@ -1095,10 +1095,18 @@ function renderSystem(ev) {
       stats.push(el("span", { class: "badge" }, c.preserved_messages + " messages preserved"));
     }
     if (c.discovered_tools) stats.push(el("span", { class: "badge" }, c.discovered_tools + " tools retained"));
+    if (c.window_number != null) stats.push(el("span", { class: "badge" }, "window " + c.window_number));
+    if (c.replacement_items != null) {
+      stats.push(el("span", { class: "badge" }, c.replacement_items + " replacement items"));
+    }
+    if (c.summary_encrypted) stats.push(el("span", { class: "badge" }, "summary encrypted"));
     if (stats.length) body.push(el("div", { class: "compact-stats" }, stats));
     if (ev.text && ev.text !== ev.subtype) {
       body.push(el("div", { class: "md", html: md(ev.text) }));
+    } else if (c.summary_encrypted) {
+      body.push(el("div", { class: "attach-meta" }, "Compaction summary is not readable from the transcript."));
     }
+    if (ev.metadata) body.push(renderTurnMetadata(ev.metadata, "Compaction metadata"));
     return turnShell("system", "Compaction", ev, body);
   }
   return turnShell("system", "System · " + (ev.subtype || ""), ev, [
