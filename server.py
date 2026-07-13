@@ -3,12 +3,14 @@
 
 A zero-dependency local web app for browsing Claude Code session transcripts
 (under ~/.claude/projects), Codex session transcripts (under ~/.codex/sessions),
-and Cursor agent conversations (from Cursor's state.vscdb) in a single,
+Cursor IDE conversations (from Cursor's state.vscdb), and Cursor CLI agent
+transcripts (under ~/.cursor/projects/.../agent-transcripts) in a single,
 time-sorted sidebar. Run it and open the printed URL.
 
 Usage:
     python server.py [--port 3132] [--projects-dir PATH] [--codex-home PATH]
-                     [--cursor-db PATH]
+                     [--cursor-db PATH] [--cursor-projects-dir PATH]
+                     [--cursor-chats-dir PATH]
 """
 
 from __future__ import annotations
@@ -1079,18 +1081,29 @@ def parse_session(target: Path) -> dict | None:
         data = codex.parse_session(target)
         data["agent"] = "codex"
         return data
+    if cursor.is_cli_transcript(target):
+        data = cursor.parse_cli_session(target)
+        if data is not None:
+            data["agent"] = "cursor"
+        return data
     return None
 
 
 def load_session(file_id: str) -> dict | None:
     """Resolve a session id to parsed data, for both `/api/session` and search.
 
-    Cursor sessions are addressed by the synthetic `cursordb:<composerId>` scheme
-    (they live in a SQLite DB, not a file); everything else is a real transcript
+    Cursor IDE sessions use ``cursordb:<composerId>``; Cursor CLI store.db
+    sessions use ``cursorcli:<sessionId>``. Everything else is a real transcript
     path that must resolve under an allowed root.
     """
     if file_id.startswith(cursor.SESSION_SCHEME):
         data = cursor.parse_session_by_id(file_id[len(cursor.SESSION_SCHEME):])
+        if data is not None:
+            data["agent"] = "cursor"
+            _apply_custom_name(data)
+        return data
+    if file_id.startswith(cursor.CLI_SESSION_SCHEME):
+        data = cursor.parse_cli_store_by_id(file_id[len(cursor.CLI_SESSION_SCHEME):])
         if data is not None:
             data["agent"] = "cursor"
             _apply_custom_name(data)
@@ -1385,9 +1398,12 @@ class Handler(BaseHTTPRequestHandler):
             if not file_arg:
                 self._send_json({"error": "missing file param"}, status=400)
                 return
-            # Cursor sessions use the `cursordb:<id>` scheme (no file on disk);
+            # Cursor IDE/CLI sessions use synthetic schemes (no path on disk);
             # everything else is a real path confined to an allowed root.
-            if not file_arg.startswith(cursor.SESSION_SCHEME):
+            if not (
+                file_arg.startswith(cursor.SESSION_SCHEME)
+                or file_arg.startswith(cursor.CLI_SESSION_SCHEME)
+            ):
                 target = Path(file_arg).expanduser().resolve()
                 if not target.exists():
                     self._send_json({"error": "not found"}, status=404)
@@ -1473,12 +1489,28 @@ def main():
         default=cursor.DEFAULT_DB_PATH,
         help="Cursor state.vscdb (or its Cursor app-support dir)",
     )
+    ap.add_argument(
+        "--cursor-projects-dir",
+        type=Path,
+        default=cursor.DEFAULT_PROJECTS_DIR,
+        help="Cursor projects dir containing agent-transcripts (default ~/.cursor/projects)",
+    )
+    ap.add_argument(
+        "--cursor-chats-dir",
+        type=Path,
+        default=cursor.DEFAULT_CHATS_DIR,
+        help="Cursor chats dir containing per-session store.db (default ~/.cursor/chats)",
+    )
     args = ap.parse_args()
 
     PROJECTS_DIR = args.projects_dir.expanduser()
     CUSTOM_NAMES_FILE = args.custom_names_file.expanduser()
     codex.configure(args.codex_home)
-    cursor.configure(args.cursor_db)
+    cursor.configure(
+        args.cursor_db,
+        projects_dir=args.cursor_projects_dir,
+        chats_dir=args.cursor_chats_dir,
+    )
     # Enforce the Host allowlist only on the safe loopback default; if the user
     # deliberately binds elsewhere for LAN access, step aside so it still works.
     HOST_CHECK = args.host in LOOPBACK_HOSTS
@@ -1489,6 +1521,8 @@ def main():
     print(f"  claude projects: {PROJECTS_DIR}")
     print(f"  codex sessions:  {codex.SESSIONS_DIR}")
     print(f"  cursor db:       {cursor.DB_PATH}")
+    print(f"  cursor projects: {cursor.PROJECTS_DIR}")
+    print(f"  cursor chats:    {cursor.CHATS_DIR}")
     print(f"  serving at:      {url}")
     print("  (Ctrl-C to stop)")
     try:

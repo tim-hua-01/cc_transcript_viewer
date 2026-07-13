@@ -314,6 +314,9 @@ function renderSidebar(query) {
         s.is_subagent
           ? el("span", { class: "sidechain-tag" }, s.subagent_type === "guardian" ? "guardian" : "sub-agent")
           : null,
+        s.cursor_source && String(s.cursor_source).startsWith("cli") && !s.is_subagent
+          ? el("span", { class: "sidechain-tag", title: "Cursor CLI agent transcript" }, "CLI")
+          : null,
         el("span", { class: "session-title" }, s.title)
       ),
       s.cwd ? el("div", { class: "session-cwd", title: s.cwd }, shortPath(s.cwd)) : null,
@@ -362,6 +365,8 @@ function copyId(e, id) {
   );
 }
 
+const COPY_ALLOWED_KINDS = new Set(["user", "assistant", "reasoning", "tool"]);
+
 function appendCopyEvent(lines, ev, branchLabel = "") {
   if (ev.kind === "branch") {
     (ev.groups || []).forEach((group, index) => {
@@ -370,6 +375,10 @@ function appendCopyEvent(lines, ev, branchLabel = "") {
     });
     return;
   }
+
+  // Only copy user/model messages, reasoning, and tool calls (with diffs).
+  // Skip system messages, tool results, and other non-conversational noise.
+  if (!COPY_ALLOWED_KINDS.has(ev.kind)) return;
 
   const labels = {
     user: "User", assistant: "Assistant", reasoning: "Reasoning",
@@ -391,15 +400,8 @@ function appendCopyEvent(lines, ev, branchLabel = "") {
       } else if (block.type === "image") {
         lines.push("[image]");
       } else if (block.type === "tool_use") {
-        lines.push(`Tool: ${block.name || "tool"}`);
-        lines.push("Input: " + JSON.stringify(block.input ?? {}, null, 2));
-        if (block.result) {
-          if (block.result.text) lines.push("Result:\n" + block.result.text);
-          for (const _image of block.result.images || []) lines.push("[tool result image]");
-          if (!block.result.text && !(block.result.images || []).length) lines.push("Result: (no output)");
-        } else {
-          lines.push("Result: (not recorded)");
-        }
+        lines.push("Tool: " + (block.name || "tool"));
+        lines.push(...toolCallToText(block.name, block.input));
       }
     }
   } else if (ev.text) {
@@ -407,13 +409,8 @@ function appendCopyEvent(lines, ev, branchLabel = "") {
   }
 
   if (ev.kind === "tool") {
-    lines.push(`Tool: ${ev.name || "tool"}`);
-    lines.push("Input: " + JSON.stringify(ev.input ?? {}, null, 2));
-    if (ev.result) {
-      if (ev.result.output) lines.push("Result:\n" + ev.result.output);
-      if (ev.result.raw) lines.push("Result data:\n" + JSON.stringify(ev.result.raw, null, 2));
-      for (const _image of ev.result.images || []) lines.push("[tool result image]");
-    }
+    lines.push("Tool: " + (ev.name || "tool"));
+    lines.push(...toolCallToText(ev.name, ev.input));
   } else if (ev.kind === "guardian_request") {
     if (ev.context) lines.push(ev.context);
     lines.push(JSON.stringify(ev.request || {}, null, 2));
@@ -434,7 +431,6 @@ function appendCopyEvent(lines, ev, branchLabel = "") {
   }
   for (const _image of ev.images || []) lines.push("[image]");
   for (const image of ev.local_images || []) lines.push("[local image: " + image + "]");
-  if (ev.turn_metadata) lines.push("Turn metadata:\n" + JSON.stringify(ev.turn_metadata, null, 2));
   lines.push("");
 }
 
@@ -567,6 +563,9 @@ function renderTranscript(data, opts = {}) {
         data.is_subagent
           ? el("span", { class: "sidechain-tag" }, data.subagent_type === "guardian" ? "guardian" : "sub-agent")
           : null,
+        data.cursor_source && String(data.cursor_source).startsWith("cli") && !data.is_subagent
+          ? el("span", { class: "sidechain-tag", title: "Cursor CLI agent transcript" }, "CLI")
+          : null,
         " " + (data.title || "(untitled session)")
       ),
       el("button", {
@@ -646,7 +645,7 @@ function renderTranscript(data, opts = {}) {
       el("button", { class: "btn", onclick: () => setAll(".thinking-block", false) }, "Expand thinking"),
       el("button", { class: "btn", onclick: () => setAll(".tool-block", true) }, "Collapse tools"),
       el("button", { class: "btn", onclick: () => setAll(".tool-block", false) }, "Expand tools"),
-      el("button", { class: "btn", onclick: copyAll, title: "Copy transcript as plain text" }, "⧉ Copy all"),
+      el("button", { class: "btn", onclick: copyAll, title: "Copy transcript as plain text" }, "Copy all text"),
       el("button", { class: "btn", onclick: scrollToEnd }, "⤓ Jump to end")
     )
   );
@@ -1337,10 +1336,14 @@ function renderTool(b) {
   bodyKids.push(fmt.inputNode);
   if (b.result) {
     const imgs = b.result.images || [];
-    const txt = b.result.text || (imgs.length ? "" : "(no output)");
-    bodyKids.push(el("div", { class: "tool-section-label" }, isErr ? "Error" : "Result"));
-    if (txt) bodyKids.push(el("pre", { class: "payload truncatable" + (isErr ? " result-error" : "") }, txt));
-    for (const uri of imgs) bodyKids.push(el("img", { src: uri, class: "tool-image", loading: "lazy" }));
+    if (b.result.missing && !b.result.text && !imgs.length) {
+      bodyKids.push(el("div", { class: "tool-section-label muted" }, "No result recorded (CLI transcript)"));
+    } else {
+      const txt = b.result.text || (imgs.length ? "" : "(no output)");
+      bodyKids.push(el("div", { class: "tool-section-label" }, isErr ? "Error" : "Result"));
+      if (txt) bodyKids.push(el("pre", { class: "payload truncatable" + (isErr ? " result-error" : "") }, txt));
+      for (const uri of imgs) bodyKids.push(el("img", { src: uri, class: "tool-image", loading: "lazy" }));
+    }
   } else {
     bodyKids.push(el("div", { class: "tool-section-label muted" }, "No result recorded"));
   }
@@ -1608,6 +1611,90 @@ function formatToolInput(name, input) {
   // Fallback: pretty JSON (or raw string)
   const text = typeof value === "string" ? value : JSON.stringify(value, null, 2);
   return { summary: typeof value === "string" ? firstLine(value) : oneLineJson(value), inputNode: preFrom(text, "payload truncatable") };
+}
+
+// Compact plain-text rendering of a tool call for "Copy all". Mirrors the
+// per-tool branches in formatToolInput but emits minimal text instead of DOM,
+// dropping redundant wrappers (e.g. Codex exec orchestration `code`) so the
+// copied transcript uses as few tokens as possible.
+function toolCallToText(name, input) {
+  const n = (name || "").toLowerCase();
+  const v = input == null ? {} : input;
+  const out = [];
+
+  if (n === "exec" && typeof v === "object") {
+    const calls = Array.isArray(v.calls) ? v.calls : [];
+    if (calls.length) {
+      calls.forEach((call) => out.push(...toolCallToText(call.name, call.input)));
+      return out;
+    }
+    if (v.code) { out.push("$ " + v.code); return out; }
+  }
+  if (n === "exec_command" || n === "bash") {
+    const cmd = v.command || v.cmd || "";
+    if (v.description) out.push("# " + v.description);
+    if (v.workdir) out.push("(in " + v.workdir + ")");
+    if (cmd) out.push("$ " + cmd);
+    if (v.run_in_background) out.push("(background)");
+    return out;
+  }
+  if (n === "read") {
+    const extra = [v.offset ? "offset " + v.offset : "", v.limit ? "limit " + v.limit : "", v.pages ? "pages " + v.pages : ""].filter(Boolean).join(", ");
+    out.push("read " + (v.file_path || "") + (extra ? "  (" + extra + ")" : ""));
+    return out;
+  }
+  if (n === "edit") {
+    out.push("edit " + (v.file_path || "") + (v.replace_all ? "  (replace all)" : ""));
+    if (v.patch != null) out.push(String(v.patch));
+    else {
+      if (v.old_string != null) String(v.old_string).split("\n").forEach((l) => out.push("- " + l));
+      if (v.new_string != null) String(v.new_string).split("\n").forEach((l) => out.push("+ " + l));
+    }
+    return out;
+  }
+  if (n === "multiedit") {
+    out.push("multi-edit " + (v.file_path || "") + "  (" + (v.edits || []).length + " edits)");
+    (v.edits || []).forEach((e) => {
+      if (e.old_string != null) String(e.old_string).split("\n").forEach((l) => out.push("- " + l));
+      if (e.new_string != null) String(e.new_string).split("\n").forEach((l) => out.push("+ " + l));
+    });
+    return out;
+  }
+  if (n === "write") {
+    out.push("write " + (v.file_path || ""));
+    if (v.content) out.push(String(v.content));
+    return out;
+  }
+  if (n === "grep" || n === "glob") {
+    const pat = v.pattern || v.query || "";
+    const where = v.path || v.glob || "";
+    out.push(n + " " + pat + (where ? "  in " + where : ""));
+    return out;
+  }
+  if (n === "task" || n === "agent") {
+    const sub = v.subagent_type || v.agentType || "";
+    out.push("task" + (sub ? " [" + sub + "]" : "") + ": " + (v.description || ""));
+    if (v.prompt) out.push(String(v.prompt));
+    return out;
+  }
+  if (n === "todowrite") {
+    (v.todos || []).forEach((td) => out.push("- [" + (td.status || "?") + "] " + (td.content || td.activeForm || "")));
+    return out;
+  }
+  if (n === "webfetch") {
+    out.push("webfetch " + (v.url || ""));
+    if (v.prompt) out.push(String(v.prompt));
+    return out;
+  }
+  if (n === "websearch") {
+    out.push("websearch " + (v.query || v.search_term || ""));
+    return out;
+  }
+  if (n === "delete" && v.path) { out.push("delete " + v.path); return out; }
+
+  // Fallback: compact single-line JSON.
+  out.push(n + " " + JSON.stringify(v));
+  return out;
 }
 
 function firstLine(s) { return (s || "").split("\n")[0].slice(0, 200); }

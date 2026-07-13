@@ -15,6 +15,7 @@ from __future__ import annotations
 import ast
 import json
 import socket
+import sqlite3
 import tempfile
 import threading
 import unittest
@@ -84,6 +85,145 @@ def _write_fixture_session(
     records.extend(extra_records)
     f.write_text("\n".join(json.dumps(r) for r in records) + "\n")
     return f
+
+
+def _write_cli_store(
+    chats_dir: Path,
+    session_id: str = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+    cwd: str = "/Users/test/demo",
+) -> Path:
+    """Minimal Cursor CLI store.db with a tool call + result."""
+    sess = chats_dir / "deadbeefcafebabe" / session_id
+    sess.mkdir(parents=True)
+    (sess / "meta.json").write_text(
+        json.dumps({
+            "schemaVersion": 1,
+            "createdAtMs": 1_700_000_000_000,
+            "updatedAtMs": 1_700_000_100_000,
+            "hasConversation": True,
+            "title": "Store db session",
+            "cwd": cwd,
+        }),
+        encoding="utf-8",
+    )
+    db = sess / "store.db"
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)")
+    conn.execute("CREATE TABLE blobs (id TEXT PRIMARY KEY, data BLOB)")
+    meta = {
+        "agentId": session_id,
+        "latestRootBlobId": "0" * 64,
+        "name": "Store db session",
+        "mode": "default",
+        "createdAt": 1_700_000_000_000,
+        "lastUsedModel": "grok-test",
+    }
+    conn.execute(
+        "INSERT INTO meta(key, value) VALUES ('0', ?)",
+        (json.dumps(meta).encode("utf-8").hex(),),
+    )
+    blobs = [
+        ("a" * 64, json.dumps({
+            "role": "user",
+            "content": [{
+                "type": "text",
+                "text": "<user_query>\nhello from store db\n</user_query>",
+            }],
+        }).encode()),
+        ("b" * 64, json.dumps({
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": "Running a command."},
+                {
+                    "type": "tool-call",
+                    "toolCallId": "call-1",
+                    "toolName": "Shell",
+                    "args": {"command": "echo hi", "description": "say hi"},
+                },
+            ],
+        }).encode()),
+        ("c" * 64, json.dumps({
+            "role": "tool",
+            "content": [{
+                "type": "tool-result",
+                "toolCallId": "call-1",
+                "toolName": "Shell",
+                "result": "Exit code: 0\n\nhi\n",
+            }],
+        }).encode()),
+        ("d" * 64, json.dumps({
+            "role": "assistant",
+            "content": [{"type": "text", "text": "Done."}],
+        }).encode()),
+    ]
+    for bid, data in blobs:
+        conn.execute("INSERT INTO blobs(id, data) VALUES (?, ?)", (bid, data))
+    conn.commit()
+    conn.close()
+    return db
+
+
+def _write_cli_session(
+    projects_dir: Path,
+    session_id: str = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+    project_slug: str = "Users-test-demo",
+    user_text: str = "hello from cursor cli",
+) -> Path:
+    """Minimal Cursor CLI agent-transcripts JSONL under a fake projects dir."""
+    session_dir = projects_dir / project_slug / "agent-transcripts" / session_id
+    session_dir.mkdir(parents=True)
+    path = session_dir / f"{session_id}.jsonl"
+    records = [
+        {
+            "role": "user",
+            "message": {
+                "content": [{
+                    "type": "text",
+                    "text": (
+                        f"<timestamp>Monday, Jan 1, 2024</timestamp>\n"
+                        f"<user_query>\n{user_text}\n</user_query>"
+                    ),
+                }],
+            },
+        },
+        {
+            "role": "assistant",
+            "message": {
+                "content": [
+                    {"type": "text", "text": "Looking into it."},
+                    {
+                        "type": "tool_use",
+                        "name": "Shell",
+                        "input": {
+                            "command": "echo hi",
+                            "description": "say hi",
+                            "working_directory": "/Users/test/demo",
+                        },
+                    },
+                ],
+            },
+        },
+        {
+            "role": "assistant",
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "name": "StrReplace",
+                        "input": {
+                            "path": "/Users/test/demo/a.py",
+                            "old_string": "x = 1",
+                            "new_string": "x = 2",
+                        },
+                    },
+                ],
+            },
+        },
+    ]
+    with path.open("w", encoding="utf-8") as fh:
+        for rec in records:
+            fh.write(json.dumps(rec) + "\n")
+    return path
 
 
 def _write_guardian_sessions(codex_home: Path) -> tuple[Path, Path, Path]:
@@ -242,7 +382,15 @@ class SecurityTest(unittest.TestCase):
         server._CUSTOM_NAMES_CACHE = None
         cls.codex_parent, cls.codex_guardian, cls.codex_image = _write_guardian_sessions(tmp / "codex")
         codex.configure(tmp / "codex")
-        cursor.configure(tmp / "cursor")  # empty -> no cursor sessions
+        cls.cursor_projects = tmp / "cursor-projects"
+        cls.cli_fixture = _write_cli_session(cls.cursor_projects)
+        cls.cursor_chats = tmp / "cursor-chats"
+        cls.cli_store_fixture = _write_cli_store(cls.cursor_chats)
+        cursor.configure(
+            tmp / "cursor",
+            projects_dir=cls.cursor_projects,
+            chats_dir=cls.cursor_chats,
+        )
 
         # Install the outbound-connection guard for the whole class.
         socket.socket.connect = _guard(_real_connect)
@@ -528,6 +676,61 @@ class SecurityTest(unittest.TestCase):
             "/api/session?file=" + quote(str(self.fixture)))
         self.assertEqual(status, 200)
         self.assertNotIn(b"forbidden", body)
+
+    def test_cursor_cli_session_lists_and_parses(self):
+        """CLI agent-transcripts under ~/.cursor/projects are visible and readable."""
+        _, _, body = self.get("/api/sessions")
+        sessions = json.loads(body)["sessions"]
+        match = next(s for s in sessions if s["file"] == str(self.cli_fixture.resolve()))
+        self.assertEqual(match["agent"], "cursor")
+        self.assertEqual(match["cursor_source"], "cli-jsonl")
+        self.assertEqual(match["title"], "hello from cursor cli")
+        self.assertEqual(match["cwd"], "/Users/test/demo")
+        self.assertGreaterEqual(match["n_tool"], 2)
+
+        status, _, body = self.get(
+            "/api/session?file=" + quote(str(self.cli_fixture.resolve())))
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertEqual(data["agent"], "cursor")
+        self.assertEqual(data["cursor_source"], "cli-jsonl")
+        kinds = [ev["kind"] for ev in data["events"]]
+        self.assertIn("user", kinds)
+        self.assertIn("assistant", kinds)
+        tools = [
+            b for ev in data["events"] for b in ev.get("blocks") or []
+            if b.get("type") == "tool_use"
+        ]
+        names = {t["name"] for t in tools}
+        self.assertIn("Shell", names)
+        self.assertIn("Edit", names)  # StrReplace normalized
+        self.assertTrue(all(t.get("result", {}).get("missing") for t in tools))
+
+    def test_cursor_cli_store_db_includes_tool_results(self):
+        """CLI store.db sessions are preferred and include tool outputs."""
+        store_id = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+        file_id = cursor.CLI_SESSION_SCHEME + store_id
+        _, _, body = self.get("/api/sessions")
+        sessions = json.loads(body)["sessions"]
+        match = next(s for s in sessions if s["file"] == file_id)
+        self.assertEqual(match["agent"], "cursor")
+        self.assertEqual(match["cursor_source"], "cli")
+        self.assertEqual(match["title"], "Store db session")
+        self.assertEqual(match["cwd"], "/Users/test/demo")
+        self.assertEqual(match["model"], "grok-test")
+
+        status, _, body = self.get("/api/session?file=" + quote(file_id))
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertEqual(data["cursor_source"], "cli")
+        tools = [
+            b for ev in data["events"] for b in ev.get("blocks") or []
+            if b.get("type") == "tool_use"
+        ]
+        self.assertEqual(len(tools), 1)
+        self.assertEqual(tools[0]["name"], "Shell")
+        self.assertIn("hi", tools[0]["result"]["text"])
+        self.assertFalse(tools[0]["result"].get("missing"))
 
     def test_local_image_serves_image_from_any_path(self):
         """Images are served from anywhere (transcripts reference original paths)."""
