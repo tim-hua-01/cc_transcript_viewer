@@ -149,6 +149,35 @@ body.outline-collapsed #nav-buttons { right: 24px; }
   border-top-left-radius: 0;
   border-bottom-left-radius: 0;
 }
+
+.ctx-menu {
+  position: fixed;
+  z-index: 1000;
+  min-width: 160px;
+  padding: 4px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(28, 24, 19, 0.12);
+}
+.ctx-menu-item {
+  display: block;
+  width: 100%;
+  margin: 0;
+  padding: 7px 10px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.ctx-menu-item:hover,
+.ctx-menu-item:focus {
+  background: var(--bg-elev);
+  outline: none;
+}
 .parent-link { color: var(--accent); text-decoration: none; font-weight: 500; }
 .parent-link:hover { text-decoration: underline; }
 .session-toprow { display: flex; align-items: flex-start; gap: 6px; }

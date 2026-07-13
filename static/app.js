@@ -342,6 +342,7 @@ function renderSidebar(query) {
       )
     );
     item.addEventListener("click", () => openSession(s.file, item));
+    item.addEventListener("contextmenu", (e) => showSessionContextMenu(e, s.file));
     list.append(item);
   }
 
@@ -511,6 +512,52 @@ async function renameSession(data) {
 }
 
 // ---------- session view ----------
+function sessionHashUrl(file) {
+  return location.pathname + location.search + "#file=" + encodeURIComponent(file);
+}
+
+function openSessionInNewTab(file) {
+  window.open(sessionHashUrl(file), "_blank", "noopener,noreferrer");
+}
+
+let SESSION_CTX_MENU = null;
+function hideSessionContextMenu() {
+  if (SESSION_CTX_MENU) {
+    SESSION_CTX_MENU.remove();
+    SESSION_CTX_MENU = null;
+  }
+}
+
+function showSessionContextMenu(e, file) {
+  e.preventDefault();
+  e.stopPropagation();
+  hideSessionContextMenu();
+  const menu = el(
+    "div",
+    { class: "ctx-menu", role: "menu" },
+    el("button", {
+      class: "ctx-menu-item",
+      type: "button",
+      role: "menuitem",
+      onclick: () => {
+        hideSessionContextMenu();
+        openSessionInNewTab(file);
+      },
+    }, "Open in new tab")
+  );
+  document.body.append(menu);
+  SESSION_CTX_MENU = menu;
+
+  const pad = 6;
+  const rect = menu.getBoundingClientRect();
+  let left = e.clientX;
+  let top = e.clientY;
+  if (left + rect.width > window.innerWidth - pad) left = window.innerWidth - rect.width - pad;
+  if (top + rect.height > window.innerHeight - pad) top = window.innerHeight - rect.height - pad;
+  menu.style.left = Math.max(pad, left) + "px";
+  menu.style.top = Math.max(pad, top) + "px";
+}
+
 async function openSession(file, itemEl) {
   CURRENT_FILE = file;
   location.hash = "file=" + encodeURIComponent(file);
@@ -1799,7 +1846,10 @@ document.addEventListener("keydown", (e) => {
     e.preventDefault();
     $("#search").focus();
   }
-  if (e.key === "Escape") $$(".dropdown-panel").forEach((p) => p.classList.add("hidden"));
+  if (e.key === "Escape") {
+    $$(".dropdown-panel").forEach((p) => p.classList.add("hidden"));
+    hideSessionContextMenu();
+  }
 });
 
 // ---------- nav button + outline wiring ----------
@@ -1817,7 +1867,9 @@ $("#main").addEventListener("scroll", () => {
 // click anywhere outside an open dropdown closes it
 document.addEventListener("click", () => {
   $$(".dropdown-panel").forEach((p) => p.classList.add("hidden"));
+  hideSessionContextMenu();
 });
+window.addEventListener("scroll", hideSessionContextMenu, true);
 
 function cssEscape(s) {
   return (window.CSS && CSS.escape) ? CSS.escape(s) : s.replace(/["\\]/g, "\\$&");
