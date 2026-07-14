@@ -5,12 +5,24 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Transcript Viewer</title>
   <link rel="stylesheet" href="/style.css" />
-  <!-- markdown + sanitization, loaded from CDN; falls back to plain text if offline -->
-  <script src="https://cdn.jsdelivr.net/npm/marked@12/marked.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/dompurify@3/dist/purify.min.js"></script>
+  <!-- markdown + sanitization, loaded from CDN; falls back to plain text if offline.
+       Versions are pinned and integrity-hashed (SRI) so a compromised or drifted
+       CDN file is refused rather than executed — a refused file degrades exactly
+       like being offline. To upgrade: bump the version and recompute the hash
+       (openssl dgst -sha384 -binary FILE | openssl base64 -A). -->
+  <script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"
+          integrity="sha384-/TQbtLCAerC3jgaim+N78RZSDYV7ryeoBCVqTuzRrFec2akfBkHS7ACQ3PQhvMVi"
+          crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/dompurify@3.4.12/dist/purify.min.js"
+          integrity="sha384-piCcpDdJ7qVeK4Tv8Z6Hpcr3ZBIgP16TxQTPVfsLFdZ5uDgwc3Y8Ho7oUnqf12qu"
+          crossorigin="anonymous"></script>
   <!-- KaTeX for inline / display math; falls back to raw $…$ if offline -->
-  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css" />
-  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css"
+        integrity="sha384-nB0miv6/jRmo5UMMR1wu3Gz6NLsoTkbqJghGIsx//Rlm+ZU03BU6SQNC66uf4l5+"
+        crossorigin="anonymous" />
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"
+          integrity="sha384-7zkQWkzuo3B5mTepMUcHkMB5jZaolc2xDwL6VFqjFALcbeS9Ggm/Yr2r3Dy4lfFg"
+          crossorigin="anonymous"></script>
 </head>
 <body>
   <div id="app">

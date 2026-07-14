@@ -15,10 +15,10 @@ import json
 import mimetypes
 import re
 import sqlite3
-import threading
-from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote
+
+import common
 
 DEFAULT_CODEX_HOME = Path.home() / ".codex"
 
@@ -28,23 +28,17 @@ SESSIONS_DIR = DEFAULT_CODEX_HOME / "sessions"
 ARCHIVED_SESSIONS_DIR = DEFAULT_CODEX_HOME / "archived_sessions"
 STATE_DB = DEFAULT_CODEX_HOME / "state_5.sqlite"
 MAX_INLINE_IMAGE_CHARS = 2_000_000
-_SUMMARY_CACHE: dict[str, tuple[int, int, str, dict]] = {}
-_SUMMARY_CACHE_LOCK = threading.RLock()
-_SUMMARY_CACHE_DIRTY = False
-_SUMMARY_CACHE_GENERATION = 0
+SUMMARY_CACHE = common.SummaryCache()
 
 
 def configure(codex_home: Path) -> None:
     """Point the module at a Codex home directory."""
-    global CODEX_HOME, SESSIONS_DIR, ARCHIVED_SESSIONS_DIR, STATE_DB, _SUMMARY_CACHE_DIRTY, _SUMMARY_CACHE_GENERATION
+    global CODEX_HOME, SESSIONS_DIR, ARCHIVED_SESSIONS_DIR, STATE_DB
     CODEX_HOME = Path(codex_home).expanduser()
     SESSIONS_DIR = CODEX_HOME / "sessions"
     ARCHIVED_SESSIONS_DIR = CODEX_HOME / "archived_sessions"
     STATE_DB = CODEX_HOME / "state_5.sqlite"
-    with _SUMMARY_CACHE_LOCK:
-        _SUMMARY_CACHE.clear()
-        _SUMMARY_CACHE_DIRTY = False
-        _SUMMARY_CACHE_GENERATION = 0
+    SUMMARY_CACHE.clear()
 
 
 def _thread_signature(thread_row: dict | None) -> str:
@@ -56,59 +50,6 @@ def _thread_signature(thread_row: dict | None) -> str:
         "tokens_used", "source", "thread_source", "cli_version", "model_provider",
     )
     return json.dumps([row.get(field) for field in fields], sort_keys=True, default=str)
-
-
-def load_summary_cache(data: dict) -> None:
-    global _SUMMARY_CACHE_DIRTY, _SUMMARY_CACHE_GENERATION
-    with _SUMMARY_CACHE_LOCK:
-        for key, value in (data or {}).items():
-            try:
-                _SUMMARY_CACHE[key] = (int(value[0]), int(value[1]), str(value[2]), value[3])
-            except (TypeError, ValueError, IndexError):
-                continue
-        _SUMMARY_CACHE_DIRTY = False
-        _SUMMARY_CACHE_GENERATION = 0
-
-
-def dump_summary_cache() -> dict:
-    with _SUMMARY_CACHE_LOCK:
-        return {key: [mtime, size, signature, summary] for key, (mtime, size, signature, summary) in _SUMMARY_CACHE.items()}
-
-
-def summary_cache_dirty() -> bool:
-    with _SUMMARY_CACHE_LOCK:
-        return _SUMMARY_CACHE_DIRTY
-
-
-def summary_cache_generation() -> int:
-    with _SUMMARY_CACHE_LOCK:
-        return _SUMMARY_CACHE_GENERATION
-
-
-def mark_summary_cache_saved(generation: int) -> None:
-    global _SUMMARY_CACHE_DIRTY
-    with _SUMMARY_CACHE_LOCK:
-        if _SUMMARY_CACHE_GENERATION == generation:
-            _SUMMARY_CACHE_DIRTY = False
-
-
-def _iter_records(path: Path):
-    with path.open(encoding="utf-8") as fh:
-        for line in fh:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                yield json.loads(line)
-            except json.JSONDecodeError:
-                continue
-
-
-def _safe_stat(path: Path):
-    try:
-        return path.stat()
-    except OSError:
-        return None
 
 
 def _parse_json_string(value):
@@ -402,14 +343,8 @@ def _first_user_message(records: list[dict]) -> str:
             continue
         payload = rec.get("payload") or {}
         if payload.get("type") == "user_message" and payload.get("message"):
-            text = " ".join(str(payload["message"]).split())
-            return text[:100] + ("…" if len(text) > 100 else "")
+            return common.short_title(str(payload["message"]))
     return ""
-
-
-def _short_title(text: str, n: int = 100) -> str:
-    text = " ".join((text or "").split())
-    return text[:n] + ("…" if len(text) > n else "")
 
 
 def _thread_id_from_path(path: Path) -> str:
@@ -575,35 +510,23 @@ def _read_thread_rows() -> dict[str, dict]:
     return rows
 
 
-def _iso_from_ms(ms) -> str:
-    if ms is None:
-        return ""
-    try:
-        return datetime.fromtimestamp(int(ms) / 1000, tz=timezone.utc).isoformat()
-    except (TypeError, ValueError, OSError):
-        return ""
-
-
 def session_summary(path: Path, thread_row: dict | None = None) -> dict:
-    global _SUMMARY_CACHE_DIRTY, _SUMMARY_CACHE_GENERATION
-    st = _safe_stat(path)
+    """Lightweight metadata for a Codex session, cached by file identity plus a
+    fingerprint of the SQLite thread row (which can change without the JSONL)."""
+    st = common.safe_stat(path)
     identity = (st.st_mtime_ns, st.st_size) if st else (0, 0)
-    signature = _thread_signature(thread_row)
-    with _SUMMARY_CACHE_LOCK:
-        cached = _SUMMARY_CACHE.get(str(path))
-    if cached and cached[:3] == (identity[0], identity[1], signature):
-        return cached[3]
+    fingerprint = (identity[0], identity[1], _thread_signature(thread_row))
+    cached = SUMMARY_CACHE.get(str(path), fingerprint)
+    if cached is not None:
+        return cached
 
     summary = _session_summary_uncached(path, thread_row)
-    with _SUMMARY_CACHE_LOCK:
-        _SUMMARY_CACHE[str(path)] = (identity[0], identity[1], signature, summary)
-        _SUMMARY_CACHE_DIRTY = True
-        _SUMMARY_CACHE_GENERATION += 1
+    SUMMARY_CACHE.put(str(path), fingerprint, summary)
     return summary
 
 
 def _session_summary_uncached(path: Path, thread_row: dict | None = None) -> dict:
-    records = list(_iter_records(path))
+    records = list(common.iter_jsonl(path))
     meta = {}
     first_ts = None
     last_ts = None
@@ -640,7 +563,7 @@ def _session_summary_uncached(path: Path, thread_row: dict | None = None) -> dic
             elif pt == "web_search_call":
                 n_web += 1
 
-    st = _safe_stat(path)
+    st = common.safe_stat(path)
     row = thread_row or {}
     title = _first_user_message(records) or row.get("title") or row.get("preview") or "(untitled session)"
     cwd = row.get("cwd") or meta.get("cwd") or ""
@@ -651,9 +574,10 @@ def _session_summary_uncached(path: Path, thread_row: dict | None = None) -> dic
     if subagent_fields.get("subagent_type") == "guardian":
         title = "Approval reviews"
     elif subagent_fields:
-        title = _short_title(f"[{subagent_fields['subagent_type']}] {title}")
+        title = common.short_title(f"[{subagent_fields['subagent_type']}] {title}")
 
     summary = {
+        "agent": "codex",
         "id": row.get("id") or meta.get("id") or _thread_id_from_path(path),
         "file": str(path),
         "title": title,
@@ -665,8 +589,8 @@ def _session_summary_uncached(path: Path, thread_row: dict | None = None) -> dic
         "model": row.get("model") or model,
         "reasoning_effort": row.get("reasoning_effort") or "",
         "tokens_used": row.get("tokens_used") or 0,
-        "first_ts": first_ts or _iso_from_ms(created_ms),
-        "last_ts": last_ts or _iso_from_ms(updated_ms),
+        "first_ts": first_ts or common.iso_from_ms(created_ms),
+        "last_ts": last_ts or common.iso_from_ms(updated_ms),
         "n_user": n_user,
         "n_assistant": n_assistant,
         "n_tool": n_tool,
@@ -681,7 +605,7 @@ def _session_summary_uncached(path: Path, thread_row: dict | None = None) -> dic
 
 
 def list_sessions() -> list[dict]:
-    projects: dict[str, dict] = {}
+    """Flat list of Codex session summaries (live + archived + DB-referenced)."""
     rows_by_path = _read_thread_rows()
     paths = set()
 
@@ -694,25 +618,14 @@ def list_sessions() -> list[dict]:
         if path.exists():
             paths.add(path)
 
+    out: list[dict] = []
     for path in sorted(paths):
         try:
             resolved = path.resolve()
             row = rows_by_path.get(str(resolved)) or rows_by_path.get(str(path))
-            summary = session_summary(resolved, row)
+            out.append(session_summary(resolved, row))
         except (OSError, ValueError):
             continue
-        key = summary.get("cwd") or "(unknown project)"
-        group = projects.setdefault(
-            key,
-            {"dir": key, "path": key, "sessions": [], "last_mtime": 0},
-        )
-        group["sessions"].append(summary)
-        group["last_mtime"] = max(group["last_mtime"], summary["mtime"])
-
-    out = list(projects.values())
-    for group in out:
-        group["sessions"].sort(key=lambda s: s["mtime"], reverse=True)
-    out.sort(key=lambda p: p["last_mtime"], reverse=True)
     return out
 
 
@@ -824,7 +737,7 @@ def _local_image_payload(path_value) -> dict | None:
     content_type = mimetypes.guess_type(str(resolved))[0] or ""
     if not content_type.startswith("image/"):
         return None
-    st = _safe_stat(resolved)
+    st = common.safe_stat(resolved)
     return {
         "kind": "local",
         "src": "/api/local-image?path=" + quote(str(resolved), safe=""),
@@ -922,7 +835,7 @@ def _normalize_tool_output(output, name: str = "", args=None) -> dict:
 
 
 def parse_session(path: Path) -> dict:
-    records = list(_iter_records(path))
+    records = list(common.iter_jsonl(path))
     meta = {}
     title = ""
     turn_contexts: dict[str, dict] = {}
@@ -1342,10 +1255,11 @@ def parse_session(path: Path) -> dict:
     if is_guardian:
         title = "Approval reviews"
     elif subagent_fields:
-        title = _short_title(f"[{subagent_fields['subagent_type']}] {title}")
+        title = common.short_title(f"[{subagent_fields['subagent_type']}] {title}")
     meta.pop("base_instructions", None)  # surfaced as an instructions event instead
 
     data = {
+        "agent": "codex",
         "id": meta.get("id") or _thread_id_from_path(path),
         "title": title or "(untitled session)",
         "meta": meta,

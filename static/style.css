@@ -149,6 +149,29 @@ body.outline-collapsed #nav-buttons { right: 24px; }
   border-top-left-radius: 0;
   border-bottom-left-radius: 0;
 }
+.subagent-toggle {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  width: max-content;
+  margin-top: 5px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  font-size: 12px;
+  line-height: 1.4;
+  cursor: pointer;
+}
+.subagent-toggle:hover,
+.subagent-toggle:focus-visible {
+  color: var(--accent);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  outline: none;
+}
+.subagent-count { font-variant-numeric: tabular-nums; }
 
 .ctx-menu {
   position: fixed;

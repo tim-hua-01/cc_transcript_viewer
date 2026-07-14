@@ -10,3 +10,5 @@ venv/
 *.swp
 .idea/
 .vscode/
+.cursor/
+.claude/

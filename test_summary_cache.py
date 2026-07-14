@@ -8,7 +8,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
-import codex_server as codex
+import claude_parser as claude
+import codex_parser as codex
+import common
 import server
 
 
@@ -18,23 +20,15 @@ class SummaryCacheTests(unittest.TestCase):
         self.root = Path(self.tempdir.name)
         self.old_cache_file = server.CACHE_FILE
         server.CACHE_FILE = self.root / "cache" / "summaries.json"
-        server._SUMMARY_CACHE.clear()
         server._CACHE_LOADED = False
-        server._SUMMARY_CACHE_DIRTY = False
-        server._SUMMARY_CACHE_GENERATION = 0
-        codex._SUMMARY_CACHE.clear()
-        codex._SUMMARY_CACHE_DIRTY = False
-        codex._SUMMARY_CACHE_GENERATION = 0
+        for cache in server._PARSER_CACHES.values():
+            cache.clear()
 
     def tearDown(self):
         server.CACHE_FILE = self.old_cache_file
-        server._SUMMARY_CACHE.clear()
         server._CACHE_LOADED = False
-        server._SUMMARY_CACHE_DIRTY = False
-        server._SUMMARY_CACHE_GENERATION = 0
-        codex._SUMMARY_CACHE.clear()
-        codex._SUMMARY_CACHE_DIRTY = False
-        codex._SUMMARY_CACHE_GENERATION = 0
+        for cache in server._PARSER_CACHES.values():
+            cache.clear()
         self.tempdir.cleanup()
 
     def _claude_session(self) -> Path:
@@ -48,20 +42,23 @@ class SummaryCacheTests(unittest.TestCase):
 
     def test_cache_round_trip(self):
         path = self._claude_session()
-        expected = server.cc_session_summary(path)
+        expected = claude.session_summary(path)
         server.save_summary_caches()
 
-        server._SUMMARY_CACHE.clear()
+        claude.SUMMARY_CACHE.clear()
         server._CACHE_LOADED = False
         server.load_summary_caches()
 
-        self.assertEqual(server.cc_session_summary(path), expected)
+        # The loaded entry must be served straight from the cache (no re-parse).
+        identity = common.file_identity(path)
+        self.assertEqual(claude.SUMMARY_CACHE.get(str(path), identity), expected)
+        self.assertEqual(claude.session_summary(path), expected)
         payload = json.loads(server.CACHE_FILE.read_text(encoding="utf-8"))
         self.assertEqual(payload["version"], server._CACHE_VERSION)
 
     def test_file_size_invalidates_same_mtime_cache_entry(self):
         path = self._claude_session()
-        first = server.cc_session_summary(path)
+        first = claude.session_summary(path)
         original_mtime = path.stat().st_mtime_ns
         with path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps({
@@ -72,7 +69,7 @@ class SummaryCacheTests(unittest.TestCase):
         path.touch()
         os.utime(path, ns=(original_mtime, original_mtime))
 
-        second = server.cc_session_summary(path)
+        second = claude.session_summary(path)
         self.assertEqual(first["n_assistant"], 0)
         self.assertEqual(second["n_assistant"], 1)
 
@@ -88,6 +85,34 @@ class SummaryCacheTests(unittest.TestCase):
         second = codex.session_summary(path, {"title": "second"})
         self.assertEqual(first["title"], "first")
         self.assertEqual(second["title"], "second")
+
+    def test_dirty_flag_clears_only_when_no_concurrent_update(self):
+        cache = common.SummaryCache()
+        cache.put("a", (1, 2), {"x": 1})
+        self.assertTrue(cache.dirty)
+        generation, data = cache.snapshot()
+        self.assertEqual(data, {"a": [[1, 2], {"x": 1}]})
+
+        # An update racing the save keeps the cache dirty.
+        cache.put("b", (3, 4), {"y": 2})
+        cache.mark_saved(generation)
+        self.assertTrue(cache.dirty)
+
+        generation, _ = cache.snapshot()
+        cache.mark_saved(generation)
+        self.assertFalse(cache.dirty)
+
+    def test_load_rejects_malformed_entries(self):
+        cache = common.SummaryCache()
+        cache.load({
+            "good": [[1, 2], {"t": "ok"}],
+            "bad-shape": [1, 2, {"t": "no"}],
+            "bad-types": ["fp", "summary"],
+        })
+        self.assertEqual(cache.get("good", (1, 2)), {"t": "ok"})
+        self.assertIsNone(cache.get("good", (1, 3)))  # fingerprint mismatch
+        self.assertIsNone(cache.get("bad-shape", (1, 2)))
+        self.assertIsNone(cache.get("bad-types", (1, 2)))
 
 
 if __name__ == "__main__":

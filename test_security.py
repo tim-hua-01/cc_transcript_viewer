@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import ast
 import json
+import re
 import socket
 import sqlite3
 import tempfile
@@ -27,8 +28,9 @@ from http.server import ThreadingHTTPServer
 from pathlib import Path
 
 import server
-import codex_server as codex
-import cursor_server as cursor
+import claude_parser as claude
+import codex_parser as codex
+import cursor_parser as cursor
 
 
 # --------------------------------------------------------------------------- #
@@ -56,285 +58,12 @@ def _guard(real):
     return wrapper
 
 
-def _write_fixture_session(
-    projects_dir: Path,
-    session_id: str = "11111111-1111-1111-1111-111111111111",
-    prompt: str = "hello world",
-    additional_prompts: tuple[str, ...] = (),
-    extra_records: tuple[dict, ...] = (),
-) -> Path:
-    """A minimal but valid Claude Code transcript so endpoints have real data."""
-    proj = projects_dir / "-tmp-proj"
-    proj.mkdir(parents=True, exist_ok=True)
-    f = proj / f"{session_id}.jsonl"
-    records = [
-        {"type": "user", "timestamp": "2024-01-01T00:00:00Z", "cwd": "/tmp/proj",
-         "message": {"role": "user", "content": prompt}},
-        {"type": "assistant", "timestamp": "2024-01-01T00:00:01Z",
-         "message": {"role": "assistant", "model": "claude-test",
-                     "content": [{"type": "text", "text": "hi there"}]}},
-    ]
-    for i, extra_prompt in enumerate(additional_prompts, start=2):
-        records.extend([
-            {"type": "user", "timestamp": f"2024-01-01T00:00:{i:02d}Z",
-             "message": {"role": "user", "content": extra_prompt}},
-            {"type": "assistant", "timestamp": f"2024-01-01T00:00:{i + 1:02d}Z",
-             "message": {"role": "assistant", "model": "claude-test",
-                         "content": [{"type": "text", "text": "continued reply"}]}},
-        ])
-    records.extend(extra_records)
-    f.write_text("\n".join(json.dumps(r) for r in records) + "\n")
-    return f
-
-
-def _write_cli_store(
-    chats_dir: Path,
-    session_id: str = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
-    cwd: str = "/Users/test/demo",
-) -> Path:
-    """Minimal Cursor CLI store.db with a tool call + result."""
-    sess = chats_dir / "deadbeefcafebabe" / session_id
-    sess.mkdir(parents=True)
-    (sess / "meta.json").write_text(
-        json.dumps({
-            "schemaVersion": 1,
-            "createdAtMs": 1_700_000_000_000,
-            "updatedAtMs": 1_700_000_100_000,
-            "hasConversation": True,
-            "title": "Store db session",
-            "cwd": cwd,
-        }),
-        encoding="utf-8",
-    )
-    db = sess / "store.db"
-    conn = sqlite3.connect(db)
-    conn.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)")
-    conn.execute("CREATE TABLE blobs (id TEXT PRIMARY KEY, data BLOB)")
-    meta = {
-        "agentId": session_id,
-        "latestRootBlobId": "0" * 64,
-        "name": "Store db session",
-        "mode": "default",
-        "createdAt": 1_700_000_000_000,
-        "lastUsedModel": "grok-test",
-    }
-    conn.execute(
-        "INSERT INTO meta(key, value) VALUES ('0', ?)",
-        (json.dumps(meta).encode("utf-8").hex(),),
-    )
-    blobs = [
-        ("a" * 64, json.dumps({
-            "role": "user",
-            "content": [{
-                "type": "text",
-                "text": "<user_query>\nhello from store db\n</user_query>",
-            }],
-        }).encode()),
-        ("b" * 64, json.dumps({
-            "role": "assistant",
-            "content": [
-                {"type": "text", "text": "Running a command."},
-                {
-                    "type": "tool-call",
-                    "toolCallId": "call-1",
-                    "toolName": "Shell",
-                    "args": {"command": "echo hi", "description": "say hi"},
-                },
-            ],
-        }).encode()),
-        ("c" * 64, json.dumps({
-            "role": "tool",
-            "content": [{
-                "type": "tool-result",
-                "toolCallId": "call-1",
-                "toolName": "Shell",
-                "result": "Exit code: 0\n\nhi\n",
-            }],
-        }).encode()),
-        ("d" * 64, json.dumps({
-            "role": "assistant",
-            "content": [{"type": "text", "text": "Done."}],
-        }).encode()),
-    ]
-    for bid, data in blobs:
-        conn.execute("INSERT INTO blobs(id, data) VALUES (?, ?)", (bid, data))
-    conn.commit()
-    conn.close()
-    return db
-
-
-def _write_cli_session(
-    projects_dir: Path,
-    session_id: str = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
-    project_slug: str = "Users-test-demo",
-    user_text: str = "hello from cursor cli",
-) -> Path:
-    """Minimal Cursor CLI agent-transcripts JSONL under a fake projects dir."""
-    session_dir = projects_dir / project_slug / "agent-transcripts" / session_id
-    session_dir.mkdir(parents=True)
-    path = session_dir / f"{session_id}.jsonl"
-    records = [
-        {
-            "role": "user",
-            "message": {
-                "content": [{
-                    "type": "text",
-                    "text": (
-                        f"<timestamp>Monday, Jan 1, 2024</timestamp>\n"
-                        f"<user_query>\n{user_text}\n</user_query>"
-                    ),
-                }],
-            },
-        },
-        {
-            "role": "assistant",
-            "message": {
-                "content": [
-                    {"type": "text", "text": "Looking into it."},
-                    {
-                        "type": "tool_use",
-                        "name": "Shell",
-                        "input": {
-                            "command": "echo hi",
-                            "description": "say hi",
-                            "working_directory": "/Users/test/demo",
-                        },
-                    },
-                ],
-            },
-        },
-        {
-            "role": "assistant",
-            "message": {
-                "content": [
-                    {
-                        "type": "tool_use",
-                        "name": "StrReplace",
-                        "input": {
-                            "path": "/Users/test/demo/a.py",
-                            "old_string": "x = 1",
-                            "new_string": "x = 2",
-                        },
-                    },
-                ],
-            },
-        },
-    ]
-    with path.open("w", encoding="utf-8") as fh:
-        for rec in records:
-            fh.write(json.dumps(rec) + "\n")
-    return path
-
-
-def _write_guardian_sessions(codex_home: Path) -> tuple[Path, Path, Path]:
-    sessions = codex_home / "sessions" / "2026" / "01" / "01"
-    sessions.mkdir(parents=True)
-    parent_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
-    guardian_id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
-    parent = sessions / f"rollout-2026-01-01T00-00-00-{parent_id}.jsonl"
-    guardian = sessions / f"rollout-2026-01-01T00-00-01-{guardian_id}.jsonl"
-    image = sessions / "fixture.png"
-    image.write_bytes(b"\x89PNG\r\n\x1a\n")
-    inline_image = "data:image/png;base64,iVBORw0KGgo="
-    parent_records = [
-        {"timestamp": "2026-01-01T00:00:00Z", "type": "session_meta",
-         "payload": {"id": parent_id, "cwd": "/tmp/proj"}},
-        {"timestamp": "2026-01-01T00:00:01Z", "type": "event_msg",
-         "payload": {"type": "user_message", "message": "parent task"}},
-        {"timestamp": "2026-01-01T00:00:01Z", "type": "response_item",
-         "payload": {"type": "message", "role": "user", "content": [
-             {"type": "input_text", "text": f'<image name=[Image #1] path="{image}">'},
-             {"type": "input_image", "image_url": inline_image},
-             {"type": "input_text", "text": "</image>"},
-             {"type": "input_text", "text": "look at this"},
-         ]}},
-        {"timestamp": "2026-01-01T00:00:01Z", "type": "event_msg",
-         "payload": {"type": "user_message", "message": "look at this",
-                     "images": [], "local_images": [str(image)]}},
-        {"timestamp": "2026-01-01T00:00:01Z", "type": "response_item",
-         "payload": {"type": "message", "role": "user", "content": [
-             {"type": "input_text", "text": '<image name=[Image #1] path="/missing.png">'},
-             {"type": "input_image", "image_url": inline_image},
-             {"type": "input_text", "text": "</image>"},
-             {"type": "input_text", "text": "missing image"},
-         ]}},
-        {"timestamp": "2026-01-01T00:00:01Z", "type": "event_msg",
-         "payload": {"type": "user_message", "message": "missing image",
-                     "images": [], "local_images": ["/missing.png"]}},
-        {"timestamp": "2026-01-01T00:00:02Z", "type": "event_msg",
-         "payload": {"type": "task_started", "turn_id": "parent-turn",
-                     "model_context_window": 300000, "collaboration_mode_kind": "default"}},
-        {"timestamp": "2026-01-01T00:00:02Z", "type": "turn_context",
-         "payload": {"turn_id": "parent-turn", "model": "codex-test", "effort": "medium",
-                     "approval_policy": "on-request", "sandbox_policy": {"type": "workspace-write"}}},
-        {"timestamp": "2026-01-01T00:00:03Z", "type": "event_msg",
-         "payload": {"type": "user_message", "message": "metadata turn"}},
-        {"timestamp": "2026-01-01T00:00:04Z", "type": "event_msg",
-         "payload": {"type": "agent_message", "message": "metadata answer"}},
-        {"timestamp": "2026-01-01T00:00:04Z", "type": "event_msg",
-         "payload": {"type": "token_count", "info": {
-             "model_context_window": 300000,
-             "total_token_usage": {"input_tokens": 100, "output_tokens": 10},
-         }}},
-        {"timestamp": "2026-01-01T00:00:05Z", "type": "event_msg",
-         "payload": {"type": "task_complete", "turn_id": "parent-turn",
-                     "duration_ms": 3000, "time_to_first_token_ms": 700}},
-        {"timestamp": "2026-01-01T00:00:06Z", "type": "compacted",
-         "payload": {
-             "window_number": 1,
-             "previous_window_id": "window-old",
-             "window_id": "window-new",
-             "message": "",
-             "replacement_history": [
-                 {"type": "message", "role": "user", "content": [
-                     {"type": "input_text", "text": "retained prompt"},
-                 ]},
-                 {"type": "compaction", "id": "cmp-test", "encrypted_content": "ciphertext"},
-             ],
-         }},
-        {"timestamp": "2026-01-01T00:00:06Z", "type": "world_state",
-         "payload": {"full": True, "state": {"environments": {"local": {"shell": "zsh"}}}}},
-        {"timestamp": "2026-01-01T00:00:06Z", "type": "event_msg",
-         "payload": {"type": "context_compacted"}},
-    ]
-    planned = {
-        "command": ["/bin/zsh", "-lc", "python3 -m unittest test_security"],
-        "cwd": "/tmp/proj",
-        "justification": "Run local tests?",
-        "sandbox_permissions": "require_escalated",
-        "tool": "exec_command",
-    }
-    guardian_records = [
-        {"timestamp": "2026-01-01T00:00:02Z", "type": "session_meta",
-         "payload": {
-             "id": guardian_id, "parent_thread_id": parent_id,
-             "thread_source": "subagent", "source": {"subagent": {"other": "guardian"}},
-             "cwd": "/tmp/proj", "base_instructions": {"text": "Review actions."},
-         }},
-        {"timestamp": "2026-01-01T00:00:02Z", "type": "event_msg",
-         "payload": {"type": "task_started", "turn_id": "turn-1",
-                     "model_context_window": 200000,
-                     "collaboration_mode_kind": "codex-auto-review"}},
-        {"timestamp": "2026-01-01T00:00:02Z", "type": "turn_context",
-         "payload": {"turn_id": "turn-1", "model": "guardian-test", "effort": "low",
-                     "approval_policy": "never", "sandbox_policy": {"type": "read-only"}}},
-        {"timestamp": "2026-01-01T00:00:03Z", "type": "event_msg",
-         "payload": {"type": "user_message",
-                     "message": "Review this action.\nPlanned action JSON:\n" + json.dumps(planned)}},
-        {"timestamp": "2026-01-01T00:00:04Z", "type": "event_msg",
-         "payload": {"type": "agent_message", "message": '{"outcome":"allow"}'}},
-        {"timestamp": "2026-01-01T00:00:04Z", "type": "event_msg",
-         "payload": {"type": "token_count", "info": {
-             "model_context_window": 200000,
-             "total_token_usage": {"input_tokens": 1200, "output_tokens": 20},
-         }}},
-        {"timestamp": "2026-01-01T00:00:05Z", "type": "event_msg",
-         "payload": {"type": "task_complete", "turn_id": "turn-1",
-                     "duration_ms": 2000, "time_to_first_token_ms": 500}},
-    ]
-    parent.write_text("\n".join(json.dumps(r) for r in parent_records) + "\n")
-    guardian.write_text("\n".join(json.dumps(r) for r in guardian_records) + "\n")
-    return parent, guardian, image
+from test_fixtures import (
+    _write_cli_session,
+    _write_cli_store,
+    _write_fixture_session,
+    _write_guardian_sessions,
+)
 
 
 class SecurityTest(unittest.TestCase):
@@ -377,9 +106,13 @@ class SecurityTest(unittest.TestCase):
                  }},
             ),
         )
-        server.PROJECTS_DIR = cls.projects_dir
+        claude.configure(cls.projects_dir)
         server.CUSTOM_NAMES_FILE = tmp / "viewer" / "names.json"
         server._CUSTOM_NAMES_CACHE = None
+        # Keep the persisted summary cache hermetic too — never touch the
+        # user's real ~/.cache file from the test suite.
+        cls._old_cache_file = server.CACHE_FILE
+        server.CACHE_FILE = tmp / "cache" / "summaries.json"
         cls.codex_parent, cls.codex_guardian, cls.codex_image = _write_guardian_sessions(tmp / "codex")
         codex.configure(tmp / "codex")
         cls.cursor_projects = tmp / "cursor-projects"
@@ -409,6 +142,7 @@ class SecurityTest(unittest.TestCase):
         cls.thread.join(timeout=5)
         socket.socket.connect = _real_connect
         socket.socket.connect_ex = _real_connect_ex
+        server.CACHE_FILE = cls._old_cache_file
         cls._tmp.cleanup()
 
     def get(self, path: str):
@@ -418,6 +152,29 @@ class SecurityTest(unittest.TestCase):
                 return r.status, r.headers, r.read()
         except urllib.error.HTTPError as e:
             return e.code, e.headers, e.read()
+
+    def test_json_response_ignores_disconnected_client(self):
+        """A cancelled browser poll should not raise or trigger a second response."""
+        class BrokenWriter:
+            def write(self, _body):
+                raise BrokenPipeError(32, "Broken pipe")
+
+        class FakeHandler:
+            wfile = BrokenWriter()
+            close_connection = False
+
+            def send_response(self, _status):
+                pass
+
+            def send_header(self, _name, _value):
+                pass
+
+            def end_headers(self):
+                pass
+
+        fake = FakeHandler()
+        server.Handler._send_json(fake, {"sessions": []})
+        self.assertTrue(fake.close_connection)
 
     def put_json(self, path: str, payload: dict):
         url = f"http://127.0.0.1:{self.port}{path}"
@@ -478,7 +235,7 @@ class SecurityTest(unittest.TestCase):
         self.assertEqual(match["score"], server.USER_MSG_WEIGHT)
 
     def test_claude_native_metadata_is_exposed(self):
-        summary = server.cc_session_summary(self.metadata_fixture)
+        summary = claude.session_summary(self.metadata_fixture)
         self.assertEqual(summary["title"], "nativepriority title")
         self.assertEqual(summary["claude_title"], "nativepriority title")
         self.assertEqual(summary["agent_name"], "reviewer")
@@ -649,7 +406,14 @@ class SecurityTest(unittest.TestCase):
             "websocket", "websockets", "paramiko", "boto3", "google",
         }
         forbidden_full = {"urllib.request", "urllib.error", "http.client"}
-        for mod_path in (Path("server.py"), Path("codex_server.py"), Path("cursor_server.py")):
+        # Every product module, discovered rather than listed, so a new module
+        # can't silently skip the scan. (Tests themselves use urllib as the
+        # loopback client, so they're excluded.)
+        modules = sorted(
+            p for p in Path(".").glob("*.py") if not p.name.startswith("test_")
+        )
+        self.assertGreaterEqual(len(modules), 5, f"suspiciously few modules: {modules}")
+        for mod_path in modules:
             tree = ast.parse(mod_path.read_text())
             imported = set()
             for node in ast.walk(tree):
@@ -705,6 +469,64 @@ class SecurityTest(unittest.TestCase):
         self.assertIn("Shell", names)
         self.assertIn("Edit", names)  # StrReplace normalized
         self.assertTrue(all(t.get("result", {}).get("missing") for t in tools))
+
+    def test_cursor_cli_subagent_link_survives_preferred_db_record(self):
+        """A rich duplicate keeps hierarchy learned from its JSONL path."""
+        parent_id = self.cli_fixture.stem
+        sub_id = "cccccccc-cccc-cccc-cccc-cccccccccccc"
+        sub_dir = self.cli_fixture.parent / "subagents"
+        sub_dir.mkdir()
+        sub_path = sub_dir / f"{sub_id}.jsonl"
+        sub_path.write_text(json.dumps({
+            "role": "user",
+            "message": {"content": "inspect the child task"},
+        }) + "\n")
+
+        original_list_db = cursor._list_db_sessions
+        try:
+            cursor._list_db_sessions = lambda: [
+                {"id": parent_id, "file": "cursordb:" + parent_id,
+                 "title": "Rich parent", "mtime": 10},
+                {"id": sub_id, "file": "cursordb:" + sub_id,
+                 "title": "Rich child", "mtime": 9},
+            ]
+            sessions = cursor.list_sessions()
+        finally:
+            cursor._list_db_sessions = original_list_db
+            sub_path.unlink()
+            sub_dir.rmdir()
+        child = next(s for s in sessions if s["id"] == sub_id)
+        self.assertEqual(child["file"], "cursordb:" + sub_id)
+        self.assertTrue(child["is_subagent"])
+        self.assertEqual(child["parent_id"], parent_id)
+        self.assertEqual(child["parent_file"], "cursordb:" + parent_id)
+
+    def test_cursor_cli_store_subagent_info_is_grouped(self):
+        """Newer top-level chat stores use subagentInfo instead of a subdirectory."""
+        parent_id = self.cli_fixture.stem
+        sub_id = "dddddddd-dddd-dddd-dddd-dddddddddddd"
+        _write_cli_store(
+            self.cursor_chats,
+            session_id=sub_id,
+            title="New Agent",
+            user_text=(
+                "<system_reminder>You are running as a subagent.</system_reminder>\n"
+                "You are a candidate runner.\n\n## Task\nInspect the dependency setup."
+            ),
+            meta_extra={"subagentInfo": {
+                "parentAgentId": parent_id,
+                "rootParentAgentId": parent_id,
+                "typeName": "best-of-n-runner",
+            }},
+        )
+
+        sessions = cursor.list_sessions()
+        child = next(s for s in sessions if s["id"] == sub_id)
+        self.assertTrue(child["is_subagent"])
+        self.assertEqual(child["subagent_type"], "best-of-n-runner")
+        self.assertEqual(child["parent_id"], parent_id)
+        self.assertEqual(child["parent_file"], str(self.cli_fixture.resolve()))
+        self.assertEqual(child["title"], "[best-of-n-runner] Inspect the dependency setup.")
 
     def test_cursor_cli_store_db_includes_tool_results(self):
         """CLI store.db sessions are preferred and include tool outputs."""
@@ -768,6 +590,31 @@ class SecurityTest(unittest.TestCase):
         """A normal loopback Host is served as usual."""
         self.assertEqual(self.request_with_host("/api/sessions", "localhost:1234"), 200)
         self.assertEqual(self.request_with_host("/api/sessions", "127.0.0.1"), 200)
+
+
+class FrontendAssetIntegrityTest(unittest.TestCase):
+    """Every external script/stylesheet must be version-pinned and SRI-hashed.
+
+    The CDN-served scripts (marked, DOMPurify, KaTeX) are the trust root for
+    sanitizing transcript content in the browser; without an integrity hash a
+    compromised or silently-updated CDN file would execute with full access to
+    every transcript. A floating version tag (e.g. ``@12``) defeats SRI because
+    the alias can move to bytes that no longer match the hash.
+    """
+
+    def test_external_resources_have_pinned_versions_and_sri(self):
+        html = (Path("static") / "index.html").read_text(encoding="utf-8")
+        tags = re.findall(r"<(?:script|link)\b[^>]*>", html)
+        external = [t for t in tags if re.search(r"""(?:src|href)=["']https?://""", t)]
+        self.assertTrue(external, "expected CDN tags in index.html")
+        for tag in external:
+            with self.subTest(tag=tag):
+                self.assertRegex(tag, r'integrity="sha(256|384|512)-[A-Za-z0-9+/=]+"',
+                                 "external resource missing SRI integrity hash")
+                self.assertIn('crossorigin="anonymous"', tag)
+                url = re.search(r"""(?:src|href)=["'](https?://[^"']+)""", tag).group(1)
+                self.assertRegex(url, r"@\d+\.\d+\.\d+/",
+                                 "CDN URL must pin an exact version (x.y.z)")
 
 
 if __name__ == "__main__":

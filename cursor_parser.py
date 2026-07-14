@@ -41,8 +41,10 @@ import difflib
 import json
 import re
 import sqlite3
-from datetime import datetime, timezone
 from pathlib import Path
+
+import common
+import cursor_binary
 
 # macOS default. (Linux: ~/.config/Cursor/...; Windows: %APPDATA%/Cursor/...)
 DEFAULT_DB_PATH = (
@@ -110,8 +112,8 @@ _CLI_SYSTEM_REMINDER_RE = re.compile(
     r"<system_reminder>\s*(.*?)\s*</system_reminder>", re.DOTALL | re.IGNORECASE
 )
 
-# Per-file summary cache for CLI JSONL / store.db (mtime, size) -> summary dict.
-_CLI_SUMMARY_CACHE: dict[str, tuple[float, int, dict]] = {}
+# Per-file summary cache for CLI JSONL / store.db, keyed on (mtime, size).
+SUMMARY_CACHE = common.SummaryCache()
 # session id -> store.db path, refreshed whenever we scan chats.
 _CLI_STORE_INDEX: dict[str, Path] = {}
 
@@ -122,7 +124,7 @@ def configure(
     chats_dir: Path | None = None,
 ) -> None:
     """Point the module at Cursor IDE DB / projects / chats directories."""
-    global DB_PATH, PROJECTS_DIR, CHATS_DIR, _LIST_CACHE, _CLI_SUMMARY_CACHE, _CLI_STORE_INDEX
+    global DB_PATH, PROJECTS_DIR, CHATS_DIR, _LIST_CACHE, _CLI_STORE_INDEX
     if db_path is None:
         DB_PATH = DEFAULT_DB_PATH
     else:
@@ -142,7 +144,7 @@ def configure(
     else:
         CHATS_DIR = Path(chats_dir).expanduser()
     _LIST_CACHE = None
-    _CLI_SUMMARY_CACHE = {}
+    SUMMARY_CACHE.clear()
     _CLI_STORE_INDEX = {}
 
 
@@ -156,13 +158,6 @@ def _connect() -> sqlite3.Connection | None:
         return None
 
 
-def _safe_stat():
-    try:
-        return DB_PATH.stat()
-    except OSError:
-        return None
-
-
 def _loads(value):
     if value is None:
         return None
@@ -173,12 +168,8 @@ def _loads(value):
 
 
 def _iso_from_ms(ms) -> str | None:
-    if ms in (None, 0):
-        return None
-    try:
-        return datetime.fromtimestamp(int(ms) / 1000, tz=timezone.utc).isoformat()
-    except (TypeError, ValueError, OSError):
-        return None
+    # None (not "") when missing, matching what this module has always emitted.
+    return common.iso_from_ms(ms) or None
 
 
 def _composer_cwd(d: dict) -> str:
@@ -193,16 +184,11 @@ def _composer_cwd(d: dict) -> str:
     return ""
 
 
-def _short_title(text: str, n: int = 100) -> str:
-    text = " ".join((text or "").split())
-    return text[:n] + ("…" if len(text) > n else "")
-
-
 # ---------------------------------------------------------------------------
 # Session list
 # ---------------------------------------------------------------------------
-# Cache the whole grouped list, keyed by the DB file mtime so the 1s /api/sessions
-# poll doesn't re-read 100+ composers every tick.
+# Cache the whole IDE session list, keyed by the DB file mtime so the 1s
+# /api/sessions poll doesn't re-read 100+ composers every tick.
 _LIST_CACHE: tuple[float, list] | None = None
 
 
@@ -243,7 +229,7 @@ def _summary_from_composer(conn, cid: str, d: dict, db_mtime: float) -> dict:
         if h.get("type") == 2 and (h.get("grouping") or {}).get("toolFormerTool") is None
     )
     model = (d.get("modelConfig") or {}).get("modelName") or ""
-    title = d.get("name") or _short_title(_first_user_text(conn, cid, headers)) or "(untitled session)"
+    title = d.get("name") or common.short_title(_first_user_text(conn, cid, headers)) or "(untitled session)"
     created = d.get("createdAt")
     updated = d.get("lastUpdatedAt") or created
     mtime = (updated / 1000) if updated else db_mtime
@@ -269,9 +255,9 @@ def _summary_from_composer(conn, cid: str, d: dict, db_mtime: float) -> dict:
 
 
 def _list_db_sessions() -> list[dict]:
-    """IDE conversations from state.vscdb, grouped by cwd."""
+    """IDE conversation summaries from state.vscdb."""
     global _LIST_CACHE
-    st = _safe_stat()
+    st = common.safe_stat(DB_PATH)
     if st is None:
         return []
     if _LIST_CACHE and _LIST_CACHE[0] == st.st_mtime:
@@ -280,7 +266,7 @@ def _list_db_sessions() -> list[dict]:
     conn = _connect()
     if conn is None:
         return []
-    projects: dict[str, dict] = {}
+    sessions: list[dict] = []
     try:
         rows = conn.execute(
             "select key, value from cursorDiskKV where key like 'composerData:%'"
@@ -294,68 +280,65 @@ def _list_db_sessions() -> list[dict]:
             if not (d.get("fullConversationHeadersOnly") or []):
                 continue
             try:
-                summary = _summary_from_composer(conn, cid, d, st.st_mtime)
+                sessions.append(_summary_from_composer(conn, cid, d, st.st_mtime))
             except (sqlite3.Error, ValueError, TypeError):
                 continue
-            key_cwd = summary.get("cwd") or "(unknown project)"
-            group = projects.setdefault(
-                key_cwd, {"dir": key_cwd, "path": key_cwd, "sessions": [], "last_mtime": 0}
-            )
-            group["sessions"].append(summary)
-            group["last_mtime"] = max(group["last_mtime"], summary["mtime"])
     finally:
         conn.close()
 
-    out = list(projects.values())
-    for group in out:
-        group["sessions"].sort(key=lambda s: s["mtime"], reverse=True)
-    out.sort(key=lambda p: p["last_mtime"], reverse=True)
-    _LIST_CACHE = (st.st_mtime, out)
-    return out
+    _LIST_CACHE = (st.st_mtime, sessions)
+    return sessions
 
 
 def list_sessions() -> list[dict]:
-    """Conversations grouped by cwd (IDE DB + CLI store.db + JSONL orphans)."""
-    projects: dict[str, dict] = {}
-    for group in _list_db_sessions():
-        key_cwd = group.get("path") or group.get("dir") or "(unknown project)"
-        projects[key_cwd] = {
-            "dir": key_cwd,
-            "path": key_cwd,
-            "sessions": list(group.get("sessions") or []),
-            "last_mtime": group.get("last_mtime") or 0,
-        }
+    """Flat list of Cursor session summaries (IDE DB + CLI store.db + JSONL).
 
-    known_ids = {
-        s["id"]
-        for group in projects.values()
-        for s in group["sessions"]
-        if s.get("id")
-    }
+    When the same conversation exists in more than one store, preference is
+    IDE ``state.vscdb`` > CLI ``store.db`` > JSONL export — but the losing
+    records still contribute structural metadata (subagent linkage, titles)
+    to the preferred one.
+    """
+    sessions_by_id: dict[str, dict] = {}
+    for summary in _list_db_sessions():
+        if summary.get("id"):
+            sessions_by_id[summary["id"]] = summary
 
-    # Prefer rich per-chat store.db over the lossy JSONL export.
-    for summary in _iter_cli_store_summaries(skip_ids=known_ids):
-        known_ids.add(summary["id"])
-        key_cwd = summary.get("cwd") or "(unknown project)"
-        group = projects.setdefault(
-            key_cwd, {"dir": key_cwd, "path": key_cwd, "sessions": [], "last_mtime": 0}
-        )
-        group["sessions"].append(summary)
-        group["last_mtime"] = max(group["last_mtime"], summary.get("mtime") or 0)
+    # Prefer rich per-chat store.db over the lossy JSONL export. Store metadata
+    # also carries the newer subagent hierarchy, so inspect duplicates too.
+    for summary in _iter_cli_store_summaries():
+        preferred = sessions_by_id.get(summary.get("id"))
+        if preferred is not None:
+            if summary.get("is_subagent"):
+                for field in ("is_subagent", "subagent_type", "parent_id", "root_parent_id"):
+                    preferred[field] = summary.get(field)
+                if not preferred.get("title") or preferred.get("title") == "New Agent":
+                    preferred["title"] = summary.get("title")
+            continue
+        sessions_by_id[summary["id"]] = summary
 
-    for summary in _iter_cli_summaries(skip_ids=known_ids):
-        key_cwd = summary.get("cwd") or "(unknown project)"
-        group = projects.setdefault(
-            key_cwd, {"dir": key_cwd, "path": key_cwd, "sessions": [], "last_mtime": 0}
-        )
-        group["sessions"].append(summary)
-        group["last_mtime"] = max(group["last_mtime"], summary.get("mtime") or 0)
+    # JSONL paths encode the subagent hierarchy, even when the same conversation
+    # is also present in the IDE DB or a rich CLI store.db.  Do not skip those
+    # duplicates: retain the preferred record, but copy its structural linkage.
+    for summary in _iter_cli_summaries():
+        preferred = sessions_by_id.get(summary.get("id"))
+        if preferred is not None:
+            if summary.get("is_subagent"):
+                for field in ("is_subagent", "subagent_type", "parent_id"):
+                    preferred[field] = summary.get(field)
+            continue
+        sessions_by_id[summary["id"]] = summary
 
-    out = list(projects.values())
-    for group in out:
-        group["sessions"].sort(key=lambda s: s.get("mtime") or 0, reverse=True)
-    out.sort(key=lambda p: p.get("last_mtime") or 0, reverse=True)
-    return out
+    # Sub-agent grouping in the unified server is keyed by the parent record's
+    # `file`. A subagent discovered from JSONL may have a cursordb:/cursorcli:
+    # parent, so resolve the link after all preferred records are selected.
+    for summary in sessions_by_id.values():
+        if not summary.get("is_subagent") or not summary.get("parent_id"):
+            continue
+        parent = sessions_by_id.get(summary["parent_id"])
+        if parent is not None:
+            summary["parent_file"] = parent.get("file") or ""
+
+    return list(sessions_by_id.values())
 
 
 # ---------------------------------------------------------------------------
@@ -435,9 +418,19 @@ def _normalize_tool(conn, tf: dict) -> dict:
     elif raw_name == "glob_file_search":
         inp = {"pattern": args.get("globPattern") or "", "path": args.get("targetDirectory") or ""}
         text = _format_glob(result)
+        # Newer Cursor leaves the JSON result's `files` list empty; the real
+        # match list lives only in the toolCallBinary protobuf.
+        if not text or text == "(no matches)":
+            files = cursor_binary.glob_files(tf)
+            if files:
+                text = "\n".join(files)
     elif raw_name == "ripgrep_raw_search":
         inp = {"pattern": args.get("pattern") or args.get("query") or "", "path": args.get("path") or ""}
         text, is_error = _format_generic(result, is_error)
+        # Grep results are almost never in the JSON result — decode the
+        # toolCallBinary protobuf (fall back to additionalData stats).
+        if not text:
+            text = cursor_binary.grep_result_text(tf)
     elif raw_name == "read_lints":
         inp = {"paths": args.get("paths") or ([args["path"]] if args.get("path") else [])}
         text, is_error = _format_generic(result, is_error)
@@ -460,6 +453,14 @@ def _normalize_tool(conn, tf: dict) -> dict:
     else:
         inp = args or {}
         text, is_error = _format_generic(result, is_error)
+
+    # Last resort for completed calls whose result was never written to JSON
+    # (Cursor is migrating tool results into the binary record — grep first,
+    # await and others already affected): pull readable strings out of the
+    # binary's result section. Skip edit_file (rendered as a diff from content
+    # snapshots) and todo_write (input-only), where this would only add noise.
+    if not text and status == "completed" and raw_name not in ("edit_file_v2", "todo_write"):
+        text = cursor_binary.generic_result_text(tf)
 
     return {
         "type": "tool_use",
@@ -579,7 +580,7 @@ def parse_session_by_id(composer_id: str) -> dict | None:
         return {
             "agent": "cursor",
             "id": composer_id,
-            "title": d.get("name") or _short_title(_first_user_text(conn, composer_id, headers)) or "(untitled session)",
+            "title": d.get("name") or common.short_title(_first_user_text(conn, composer_id, headers)) or "(untitled session)",
             "meta": meta,
             "events": events,
             "n_records": len(headers),
@@ -688,18 +689,6 @@ def _clean_cli_user_text(text: str) -> str:
     # Drop other simple XML-ish wrappers the CLI sometimes wraps prompts in.
     text = re.sub(r"</?[a-zA-Z][a-zA-Z0-9_-]*>", " ", text)
     return " ".join(text.split())
-
-
-def _iter_cli_records(path: Path):
-    with path.open(encoding="utf-8") as fh:
-        for line in fh:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                yield json.loads(line)
-            except json.JSONDecodeError:
-                continue
 
 
 def _normalize_cli_tool(name: str, args: dict) -> dict:
@@ -814,7 +803,7 @@ def _cli_paths() -> list[Path]:
 
 
 def _cli_session_summary_uncached(path: Path) -> dict:
-    records = list(_iter_cli_records(path))
+    records = list(common.iter_jsonl(path))
     is_subagent = path.parent.name == "subagents"
     n_user = n_assistant = n_tool = 0
     first_user = ""
@@ -867,7 +856,7 @@ def _cli_session_summary_uncached(path: Path) -> dict:
         "cursor_source": "cli-jsonl",
         "id": path.stem,
         "file": str(path.resolve()),
-        "title": _short_title(first_user) or "(untitled session)",
+        "title": common.short_title(first_user) or "(untitled session)",
         "cwd": cwd,
         "git_branch": "",
         "version": "",
@@ -896,20 +885,16 @@ def _cli_session_summary_uncached(path: Path) -> dict:
 
 def cli_session_summary(path: Path) -> dict:
     """Lightweight metadata for one CLI JSONL transcript, cached by mtime/size."""
-    global _CLI_SUMMARY_CACHE
     key = str(path)
-    try:
-        st = path.stat()
-        identity = (st.st_mtime, st.st_size)
-    except OSError:
-        identity = None
+    st = common.safe_stat(path)
+    identity = (st.st_mtime, st.st_size) if st else None
     if identity is not None:
-        cached = _CLI_SUMMARY_CACHE.get(key)
-        if cached and cached[:2] == identity:
-            return cached[2]
+        cached = SUMMARY_CACHE.get(key, identity)
+        if cached is not None:
+            return cached
     summary = _cli_session_summary_uncached(path)
     if identity is not None:
-        _CLI_SUMMARY_CACHE[key] = (identity[0], identity[1], summary)
+        SUMMARY_CACHE.put(key, identity, summary)
     return summary
 
 
@@ -928,7 +913,7 @@ def parse_cli_session(path: Path) -> dict | None:
     """Full structured parse of a Cursor CLI agent-transcripts JSONL file."""
     if not path.exists():
         return None
-    records = list(_iter_cli_records(path))
+    records = list(common.iter_jsonl(path))
     is_subagent = path.parent.name == "subagents"
     events: list[dict] = []
 
@@ -993,7 +978,7 @@ def parse_cli_session(path: Path) -> dict | None:
         "agent": "cursor",
         "cursor_source": "cli-jsonl",
         "id": path.stem,
-        "title": _short_title(first_user) or "(untitled session)",
+        "title": common.short_title(first_user) or "(untitled session)",
         "meta": {"cwd": cwd} if cwd else {},
         "events": events,
         "n_records": len(records),
@@ -1122,6 +1107,30 @@ def _store_user_text(content) -> str:
     return ""
 
 
+def _store_subagent_fields(meta: dict) -> dict:
+    """Normalize Cursor CLI's store.db subagentInfo metadata."""
+    info = meta.get("subagentInfo")
+    if not isinstance(info, dict) or not info.get("parentAgentId"):
+        return {}
+    return {
+        "is_subagent": True,
+        "subagent_type": info.get("typeName") or "cursor-cli",
+        "parent_id": info["parentAgentId"],
+        "root_parent_id": info.get("rootParentAgentId") or info["parentAgentId"],
+    }
+
+
+def _store_prompt_text(text: str) -> str:
+    """Remove an injected reminder while retaining task text after it."""
+    return _clean_cli_user_text(_CLI_SYSTEM_REMINDER_RE.sub("", text or ""))
+
+
+def _store_subagent_title(text: str) -> str:
+    """Prefer the task section over generic subagent runner instructions."""
+    task = re.search(r"(?:^|\s)##\s+Task\s+(.+)", text or "", re.DOTALL | re.IGNORECASE)
+    return _clean_cli_user_text(task.group(1) if task else text)
+
+
 def _cli_store_paths() -> list[Path]:
     """All store.db files under CHATS_DIR."""
     global _CLI_STORE_INDEX
@@ -1187,6 +1196,7 @@ def _cli_store_summary_uncached(path: Path) -> dict | None:
         cwd = (side.get("cwd") or "").strip()
         created = meta.get("createdAt") or side.get("createdAtMs")
         updated = side.get("updatedAtMs") or created
+        subagent_fields = _store_subagent_fields(meta)
 
         n_user = n_assistant = n_tool = 0
         first_user = ""
@@ -1195,7 +1205,7 @@ def _cli_store_summary_uncached(path: Path) -> dict | None:
             content = msg.get("content")
             if role == "user":
                 text = _store_user_text(content)
-                cleaned = _clean_cli_user_text(text)
+                cleaned = _store_prompt_text(text)
                 if cleaned and "<user_info>" not in text:
                     n_user += 1
                     if not first_user:
@@ -1210,11 +1220,16 @@ def _cli_store_summary_uncached(path: Path) -> dict | None:
                             n_tool += 1
             elif role == "tool":
                 pass
-        if not title:
-            title = _short_title(first_user) or "(untitled session)"
+        if subagent_fields and (not title or title == "New Agent"):
+            task_title = _store_subagent_title(first_user)
+            title = common.short_title(
+                f"[{subagent_fields['subagent_type']}] {task_title or first_user or '(sub-agent)'}"
+            )
+        elif not title:
+            title = common.short_title(first_user) or "(untitled session)"
 
         mtime = _store_db_mtime(path)
-        return {
+        summary = {
             "agent": "cursor",
             "cursor_source": "cli",
             "id": session_id,
@@ -1234,26 +1249,24 @@ def _cli_store_summary_uncached(path: Path) -> dict | None:
             "models": [model] if model else [],
             "mtime": mtime,
         }
+        summary.update(subagent_fields)
+        return summary
     finally:
         conn.close()
 
 
 def cli_store_summary(path: Path) -> dict | None:
     """Lightweight metadata for one CLI store.db, cached by mtime/size."""
-    global _CLI_SUMMARY_CACHE
     key = str(path)
-    try:
-        st = path.stat()
-        identity = (st.st_mtime, st.st_size)
-    except OSError:
-        identity = None
+    st = common.safe_stat(path)
+    identity = (st.st_mtime, st.st_size) if st else None
     if identity is not None:
-        cached = _CLI_SUMMARY_CACHE.get(key)
-        if cached and cached[:2] == identity:
-            return cached[2]
+        cached = SUMMARY_CACHE.get(key, identity)
+        if cached is not None:
+            return cached
     summary = _cli_store_summary_uncached(path)
     if summary is not None and identity is not None:
-        _CLI_SUMMARY_CACHE[key] = (identity[0], identity[1], summary)
+        SUMMARY_CACHE.put(key, identity, summary)
     return summary
 
 
@@ -1297,6 +1310,7 @@ def parse_cli_store(path: Path) -> dict | None:
         model = meta.get("lastUsedModel") or ""
         title = (meta.get("name") or side.get("title") or "").strip()
         cwd = (side.get("cwd") or "").strip()
+        subagent_fields = _store_subagent_fields(meta)
 
         messages = list(_iter_store_role_messages(conn))
 
@@ -1346,7 +1360,7 @@ def parse_cli_store(path: Path) -> dict | None:
                             "is_sidechain": False,
                         }
                     )
-                    continue
+                    text = _CLI_SYSTEM_REMINDER_RE.sub("", text)
                 cleaned = _clean_cli_user_text(text)
                 if not cleaned:
                     continue
@@ -1415,14 +1429,19 @@ def parse_cli_store(path: Path) -> dict | None:
                 }
             )
 
-        if not title:
-            title = _short_title(first_user) or "(untitled session)"
+        if subagent_fields and (not title or title == "New Agent"):
+            task_title = _store_subagent_title(first_user)
+            title = common.short_title(
+                f"[{subagent_fields['subagent_type']}] {task_title or first_user or '(sub-agent)'}"
+            )
+        elif not title:
+            title = common.short_title(first_user) or "(untitled session)"
         out_meta = {}
         if cwd:
             out_meta["cwd"] = cwd
         if model:
             out_meta["model"] = model
-        return {
+        out = {
             "agent": "cursor",
             "cursor_source": "cli",
             "id": session_id,
@@ -1431,6 +1450,8 @@ def parse_cli_store(path: Path) -> dict | None:
             "events": events,
             "n_records": len(messages),
         }
+        out.update(subagent_fields)
+        return out
     finally:
         conn.close()
 

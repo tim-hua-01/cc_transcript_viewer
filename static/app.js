@@ -132,6 +132,9 @@ let CONTENT_MATCHES = null;
 // Selected values for the dropdown filters; empty set = no constraint (all).
 const SELECTED_MODELS = new Set();
 const SELECTED_DIRS = new Set();
+// Parent session file keys whose linked subagent subtrees are hidden.
+// Kept outside renderSidebar so live polling does not reopen collapsed groups.
+const COLLAPSED_SUBAGENT_PARENTS = new Set();
 
 // ---------- sidebar ----------
 async function loadSessions() {
@@ -302,7 +305,55 @@ function renderSidebar(query) {
   $("#sidebar-stats").textContent =
     `${matches.length} sessions · ${nClaude} Claude · ${nCodex} Codex · ${nCursor} Cursor`;
 
+  const matchedByFile = new Map(matches.map((s) => [s.file, s]));
+  const subagentCounts = new Map();
   for (const s of matches) {
+    if (!s.is_subagent || !s.parent_file || !matchedByFile.has(s.parent_file)) continue;
+    subagentCounts.set(s.parent_file, (subagentCounts.get(s.parent_file) || 0) + 1);
+  }
+
+  for (const s of matches) {
+    // Searches should always expose their matching results. A filtered orphan
+    // also remains visible when its parent is not in the current result set.
+    if (!q && s.is_subagent) {
+      let parentFile = s.parent_file;
+      const visited = new Set();
+      let hiddenByAncestor = false;
+      while (parentFile && matchedByFile.has(parentFile) && !visited.has(parentFile)) {
+        if (COLLAPSED_SUBAGENT_PARENTS.has(parentFile)) {
+          hiddenByAncestor = true;
+          break;
+        }
+        visited.add(parentFile);
+        parentFile = matchedByFile.get(parentFile).parent_file;
+      }
+      if (hiddenByAncestor) continue;
+    }
+
+    const subagentCount = subagentCounts.get(s.file) || 0;
+    const subagentsCollapsed = COLLAPSED_SUBAGENT_PARENTS.has(s.file);
+    const subagentToggle = subagentCount && !q
+      ? el(
+          "button",
+          {
+            class: "subagent-toggle",
+            type: "button",
+            title: `${subagentsCollapsed ? "Expand" : "Collapse"} ${subagentCount} sub-agent${subagentCount === 1 ? "" : "s"}`,
+            "aria-label": `${subagentsCollapsed ? "Expand" : "Collapse"} sub-agents`,
+            "aria-expanded": subagentsCollapsed ? "false" : "true",
+            onclick: (e) => {
+              e.stopPropagation();
+              if (subagentsCollapsed) COLLAPSED_SUBAGENT_PARENTS.delete(s.file);
+              else COLLAPSED_SUBAGENT_PARENTS.add(s.file);
+              renderSidebar($("#search").value);
+              markActive();
+            },
+          },
+          el("span", { "aria-hidden": "true" }, subagentsCollapsed ? "▸" : "▾"),
+          `${subagentsCollapsed ? "Expand" : "Collapse"} subagents`,
+          el("span", { class: "subagent-count" }, `(${subagentCount})`)
+        )
+      : null;
     const tsForRel = s.last_ts || (s.mtime ? new Date(s.mtime * 1000).toISOString() : null);
     const item = el(
       "div",
@@ -339,7 +390,8 @@ function renderSidebar(query) {
         "div",
         { class: "session-id", title: "Click to copy full id: " + s.id, onclick: (e) => copyId(e, s.id) },
         s.id
-      )
+      ),
+      subagentToggle
     );
     item.addEventListener("click", () => openSession(s.file, item));
     item.addEventListener("contextmenu", (e) => showSessionContextMenu(e, s.file));

@@ -139,6 +139,10 @@ This app reads your private transcripts, so it's built to keep them on your mach
 
 - **No outbound network code.** The server imports only Python's standard-library `http.server`
   (inbound), with no HTTP client, sockets, mail, or telemetry anywhere. Nothing is ever uploaded.
+- **Pinned, integrity-checked frontend assets.** The browser page loads three libraries from a CDN
+  (marked, DOMPurify, KaTeX) for markdown/math rendering. Each is pinned to an exact version with an
+  SRI `integrity` hash, so a compromised or changed CDN file is refused by the browser rather than
+  executed; a refused file degrades gracefully (plain-text rendering), exactly like being offline.
 - **Loopback by default.** It binds `127.0.0.1`; LAN exposure requires an explicit `--host 0.0.0.0`.
 - **DNS-rebinding guard.** While bound to loopback, it enforces a `Host`-header allowlist
   (`127.0.0.1` / `localhost`), so a malicious web page that rebinds its domain to `127.0.0.1` can't
@@ -157,7 +161,8 @@ This app reads your private transcripts, so it's built to keep them on your mach
 These guarantees are enforced by a zero-dependency test suite — run it yourself:
 
 ```bash
-python3 -m unittest test_security
+python3 -m unittest            # everything: security, parsers, schema, caching
+python3 -m unittest test_security   # just the security guarantees
 ```
 
 It spins the server up on loopback, exercises every endpoint with a socket-level guard installed, and
@@ -252,12 +257,19 @@ Restart Claude Code (or run `/config` once) for the change to take effect. Note 
 
 | File | Role |
 |------|------|
-| `server.py` | The unified stdlib HTTP server. Scans Claude Code, Codex, and Cursor (IDE + CLI) sources into one time-sorted list (caching per-file summaries by mtime), parses each Claude Code session into a clean event stream (pairing tool results to calls), dispatches `/api/session` to the right parser by transcript root / `cursordb:` scheme, and serves the JSON API (`/api/sessions`, `/api/session?file=...`, `/api/session-name`, `/api/search?q=...`, `/api/local-image`) plus the static frontend. `/api/session` only serves files under the allowed roots; `/api/session-name` only updates the viewer-owned names file; `/api/local-image` serves only image-typed files; and a `Host`-header allowlist guards the loopback server against DNS rebinding. |
-| `codex_server.py` | Codex parsing library (imported by `server.py`): parses rollout JSONL, reads `state_5.sqlite` metadata, pairs tool calls with outputs, unpacks orchestration-style `exec` calls, correlates local and embedded prompt images, consolidates per-turn bookkeeping, recognizes guardian/sub-agent relationships, and renders `apply_patch` diffs. Call `configure(codex_home)` to point it elsewhere. |
-| `cursor_server.py` | Cursor parsing library (imported by `server.py`): reads IDE `state.vscdb`; reads CLI `~/.cursor/chats/.../store.db` (with JSONL fallback under `agent-transcripts`); normalizes tool names/inputs; reconstructs IDE `edit_file` diffs; emits Claude-shaped events. IDE uses `cursordb:<id>`; CLI store uses `cursorcli:<id>`. Call `configure(db_path, projects_dir=…, chats_dir=…)` to retarget. |
-| `static/index.html`, `static/style.css`, `static/app.js` | The single frontend (vanilla JS, no build step). `app.js` dispatches on event kind and renders the Claude Code / Cursor (block-based) and Codex (flat) shapes, and runs the always-on live-refresh poll loop. |
-| `test_security.py` | Zero-dependency security tests (`python3 -m unittest test_security`): asserts no outbound connections at runtime, no network-client imports, loopback default bind, the `Host`-header rebinding guard, and that `/api/session` is confined to the transcript roots while `/api/local-image` serves images only. |
-| `test_summary_cache.py` | Summary-cache unit tests. |
+| `server.py` | The unified stdlib HTTP layer plus everything that spans sources: merges the three parsers' session lists into one time-sorted sidebar list, dispatches `/api/session` to the right parser by transcript root / `cursordb:`/`cursorcli:` scheme, runs full-text search, owns custom names and summary-cache persistence, and serves the JSON API (`/api/sessions`, `/api/session?file=...`, `/api/session-name`, `/api/search?q=...`, `/api/local-image`) plus the static frontend. `/api/session` only serves files under the allowed roots; `/api/session-name` only updates the viewer-owned names file; `/api/local-image` serves only image-typed files; and a `Host`-header allowlist guards the loopback server against DNS rebinding. |
+| `claude_parser.py` | Claude Code parsing library (imported by `server.py`): parses session JSONL into a clean event stream (pairing tool results to calls), detects system-injected "user" records, folds rewound/edited branches into collapsible markers, labels sub-agents from their spawning `Task`/`Agent` calls, and builds sidebar summaries (cold scans use a process pool). Call `configure(projects_dir)` to point it elsewhere. |
+| `codex_parser.py` | Codex parsing library: parses rollout JSONL, reads `state_5.sqlite` metadata, pairs tool calls with outputs, unpacks orchestration-style `exec` calls, correlates local and embedded prompt images, consolidates per-turn bookkeeping, recognizes guardian/sub-agent relationships, and renders `apply_patch` diffs. Call `configure(codex_home)` to point it elsewhere. |
+| `cursor_parser.py` | Cursor parsing library: reads IDE `state.vscdb`; reads CLI `~/.cursor/chats/.../store.db` (with JSONL fallback under `agent-transcripts`); normalizes tool names/inputs; reconstructs IDE `edit_file` diffs; decodes grep/glob results out of Cursor's binary protobuf tool records (`toolCallBinary`) since newer Cursor versions no longer store them as JSON; emits Claude-shaped events. IDE uses `cursordb:<id>`; CLI store uses `cursorcli:<id>`. Call `configure(db_path, projects_dir=…, chats_dir=…)` to retarget. |
+| `cursor_binary.py` | Decoder for Cursor's `toolCallBinary` protobuf records (wire-format only, no schema/dependency): exact grep and glob result reconstruction, plus a generic best-effort string recovery for any other completed call whose result was never written to JSON (e.g. `await`). |
+| `common.py` | Helpers shared by the three parsers: JSONL iteration, title truncation, timestamp conversion, and the thread-safe fingerprint-keyed `SummaryCache` all of them use. |
+| `event_schema.py` | The written-down (and machine-checked) event contract between the parsers and the frontend: every event kind, both message shapes, and validators the test suite runs over every parser's output. |
+| `static/index.html`, `static/style.css`, `static/app.js` | The single frontend (vanilla JS, no build step). `app.js` dispatches on event kind and renders the Claude Code / Cursor (block-based) and Codex (flat) shapes, and runs the always-on live-refresh poll loop. CDN assets (marked, DOMPurify, KaTeX) are version-pinned with SRI integrity hashes. |
+| `test_security.py` | Zero-dependency security tests (`python3 -m unittest test_security`): asserts no outbound connections at runtime, no network-client imports, loopback default bind, the `Host`-header rebinding guard, that `/api/session` is confined to the transcript roots while `/api/local-image` serves images only, and that every CDN asset is version-pinned and SRI-hashed. |
+| `test_parsers.py` | Characterization tests for the parser internals: branch folding, the Codex JS-literal orchestration parser, Cursor blob/JSON extraction and diff reconstruction, queued prompts with images. |
+| `test_event_schema.py` | Conformance tests: every parser's summaries and full parses must satisfy `event_schema.py`, and `app.js` must dispatch on every declared kind. |
+| `test_summary_cache.py` | Summary-cache unit tests (round-trip persistence, fingerprint invalidation, dirty-flag races). |
+| `test_fixtures.py` | Shared fixture builders that write minimal-but-valid transcripts for each source. |
 
 ### Transcript format notes
 
