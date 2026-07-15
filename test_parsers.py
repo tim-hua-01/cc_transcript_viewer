@@ -531,6 +531,92 @@ class CursorCliTextTests(unittest.TestCase):
         self.assertEqual(out, "/Users/nosuchuser/proj")
 
 
+class CursorIdePerTurnModelTests(unittest.TestCase):
+    """IDE sessions store the selected model on each user bubble as modelInfo."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db_path = Path(self.tmp.name) / "state.vscdb"
+        self.cid = "test-composer-multi-model"
+        self._old = (cursor.DB_PATH, cursor.PROJECTS_DIR, cursor.CHATS_DIR)
+        self._write_fixture()
+        cursor.configure(self.db_path, projects_dir=Path(self.tmp.name) / "projects",
+                         chats_dir=Path(self.tmp.name) / "chats")
+
+    def tearDown(self):
+        cursor.configure(self._old[0], projects_dir=self._old[1], chats_dir=self._old[2])
+        self.tmp.cleanup()
+
+    def _write_fixture(self):
+        import sqlite3
+
+        headers = [
+            {"bubbleId": "u1", "type": 1},
+            {"bubbleId": "a1", "type": 2},
+            {"bubbleId": "u2", "type": 1},
+            {"bubbleId": "a2", "type": 2},
+            {"bubbleId": "u3", "type": 1},
+            {"bubbleId": "a3", "type": 2},
+        ]
+        composer = {
+            "name": "multi-model chat",
+            "modelConfig": {"modelName": "claude-opus-4-8"},
+            "fullConversationHeadersOnly": headers,
+            "createdAt": 1_700_000_000_000,
+            "lastUpdatedAt": 1_700_000_100_000,
+        }
+        bubbles = {
+            "u1": {"type": 1, "text": "use grok", "modelInfo": {"modelName": "grok-4.5"}},
+            "a1": {"type": 2, "text": "grok reply"},
+            "u2": {"type": 1, "text": "switch to gpt", "modelInfo": {"modelName": "gpt-5.6-sol"}},
+            "a2": {"type": 2, "text": "gpt reply"},
+            "u3": {"type": 1, "text": "now opus", "modelInfo": {"modelName": "claude-opus-4-8"}},
+            "a3": {"type": 2, "text": "opus reply"},
+        }
+        conn = sqlite3.connect(self.db_path)
+        try:
+            conn.execute("create table cursorDiskKV (key text primary key, value text)")
+            conn.execute(
+                "insert into cursorDiskKV values (?, ?)",
+                (f"composerData:{self.cid}", json.dumps(composer)),
+            )
+            for bid, bubble in bubbles.items():
+                conn.execute(
+                    "insert into cursorDiskKV values (?, ?)",
+                    (f"bubbleId:{self.cid}:{bid}", json.dumps(bubble)),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def test_assistant_events_use_preceding_user_modelInfo(self):
+        data = cursor.parse_session_by_id(self.cid)
+        self.assertIsNotNone(data)
+        asst = [e for e in data["events"] if e["kind"] == "assistant"]
+        self.assertEqual([e["model"] for e in asst], ["grok-4.5", "gpt-5.6-sol", "claude-opus-4-8"])
+        self.assertEqual(data["meta"]["model"], "claude-opus-4-8")
+        self.assertEqual(data["meta"]["models"], ["grok-4.5", "gpt-5.6-sol", "claude-opus-4-8"])
+
+    def test_falls_back_to_session_model_without_modelInfo(self):
+        import sqlite3
+
+        # Clear modelInfo on all user bubbles — assistants should use session config.
+        conn = sqlite3.connect(self.db_path)
+        try:
+            for bid in ("u1", "u2", "u3"):
+                key = f"bubbleId:{self.cid}:{bid}"
+                row = conn.execute("select value from cursorDiskKV where key=?", (key,)).fetchone()
+                b = json.loads(row[0])
+                b.pop("modelInfo", None)
+                conn.execute("update cursorDiskKV set value=? where key=?", (json.dumps(b), key))
+            conn.commit()
+        finally:
+            conn.close()
+        data = cursor.parse_session_by_id(self.cid)
+        asst = [e for e in data["events"] if e["kind"] == "assistant"]
+        self.assertEqual({e["model"] for e in asst}, {"claude-opus-4-8"})
+
+
 class ShortTitleTests(unittest.TestCase):
     def test_collapses_whitespace_and_truncates(self):
         text = "  a   very\n\nspaced   " + "x" * 200

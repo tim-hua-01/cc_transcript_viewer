@@ -5,7 +5,8 @@ Three sources:
 
 1. **Cursor IDE** — the SQLite store at
    ``~/Library/Application Support/Cursor/User/globalStorage/state.vscdb``.
-   Full fidelity: tool outputs, model, thinking, timestamps, token counts.
+   Full fidelity: tool outputs, per-turn model (from user-bubble
+   ``modelInfo``), thinking, timestamps, token counts.
    Sessions are addressed by the synthetic id ``cursordb:<composerId>``.
 
 2. **Cursor CLI (canonical)** — per-chat SQLite at
@@ -216,6 +217,16 @@ def _first_user_text(conn: sqlite3.Connection, cid: str, headers: list) -> str:
         b = _loads(row[0]) if row else None
         if b and (b.get("text") or "").strip():
             return b["text"]
+    return ""
+
+
+def _model_from_bubble(b: dict | None) -> str:
+    """Per-turn model Cursor stores on user bubbles as ``modelInfo.modelName``."""
+    if not isinstance(b, dict):
+        return ""
+    mi = b.get("modelInfo")
+    if isinstance(mi, dict):
+        return (mi.get("modelName") or "").strip()
     return ""
 
 
@@ -532,7 +543,13 @@ def parse_session_by_id(composer_id: str) -> dict | None:
         d = _loads(row[0]) or {}
         headers = d.get("fullConversationHeadersOnly") or []
         bubbles = _bubble_rows(conn, composer_id)
-        model = (d.get("modelConfig") or {}).get("modelName") or ""
+        # Session config is only the *currently selected* model. Per-turn model
+        # lives on user bubbles as modelInfo.modelName and applies to the
+        # assistant replies that follow until the next user turn overrides it.
+        session_model = (d.get("modelConfig") or {}).get("modelName") or ""
+        current_model = session_model
+        models_seen: list[str] = []
+        models_seen_set: set[str] = set()
 
         events: list[dict] = []
 
@@ -545,6 +562,10 @@ def parse_session_by_id(composer_id: str) -> dict | None:
                 continue
             btype = b.get("type")
             ts = h.get("createdAt") or b.get("createdAt")
+
+            bubble_model = _model_from_bubble(b)
+            if bubble_model:
+                current_model = bubble_model
 
             if btype == 1:  # user
                 text = b.get("text") or ""
@@ -567,16 +588,29 @@ def parse_session_by_id(composer_id: str) -> dict | None:
                 blocks.append(_normalize_tool(conn, tf))
             if not blocks:
                 continue
+            if current_model and current_model not in models_seen_set:
+                models_seen_set.add(current_model)
+                models_seen.append(current_model)
             events.append(
-                {"kind": "assistant", "ts": ts, "model": model, "blocks": blocks, "is_sidechain": False}
+                {
+                    "kind": "assistant",
+                    "ts": ts,
+                    "model": current_model,
+                    "blocks": blocks,
+                    "is_sidechain": False,
+                }
             )
 
         cwd = _composer_cwd(d)
         meta = {}
         if cwd:
             meta["cwd"] = cwd
-        if model:
-            meta["model"] = model
+        # Prefer the last turn's model; fall back to session config.
+        meta_model = current_model or session_model
+        if meta_model:
+            meta["model"] = meta_model
+        if models_seen:
+            meta["models"] = models_seen
         return {
             "agent": "cursor",
             "id": composer_id,
