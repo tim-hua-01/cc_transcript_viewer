@@ -109,6 +109,10 @@ accumulated.
   summary is encrypted and therefore unreadable from the transcript.
 - **Pull-request links.** Claude Code sessions associated with a PR show a safe, clickable PR link in
   the transcript header.
+- **Local source links.** Absolute Markdown links inside a session's workspace open through macOS
+  Launch Services in the file's default application. Line suffixes such as `:42` are recognized and
+  removed before opening (the default application decides where to position the document). Targets
+  outside the workspace and executable/application files are rejected.
 - **Images.** Inline images in prompts/replies and Codex `view_image` are shown. For
   Codex user prompts, the viewer prefers the original `local_images` file and falls back to the
   embedded `input_image` data URL if the file is gone.
@@ -165,6 +169,9 @@ This app reads your private transcripts, so it's built to keep them on your mach
 - **Name writes are confined.** `/api/session-name` accepts only JSON, verifies that the referenced
   transcript exists under an allowed source, and writes only the configured custom-names file using
   an atomic replacement.
+- **Local opens are confined.** `/api/open-local` accepts only JSON POSTs, resolves the requested
+  path inside the selected session's workspace, rejects executables and application-like file types,
+  and invokes `/usr/bin/open` directly without a shell. It is unavailable on non-macOS hosts.
 
 These guarantees are enforced by a zero-dependency test suite — run it yourself:
 

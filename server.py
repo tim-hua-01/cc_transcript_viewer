@@ -23,6 +23,9 @@ from __future__ import annotations
 import argparse
 import json
 import mimetypes
+import os
+import subprocess
+import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -51,6 +54,13 @@ HOST_CHECK = True
 # Set by main() so handlers can reach it.
 CUSTOM_NAMES_FILE = DEFAULT_CUSTOM_NAMES_FILE
 CACHE_FILE = Path.home() / ".cache" / "transcript_viewer" / "summaries.json"
+
+# File types that macOS may execute or install when opened. Local-file links
+# are for source/documents, never for launching transcript-supplied programs.
+UNSAFE_OPEN_SUFFIXES = {
+    ".app", ".command", ".inetloc", ".pkg", ".scpt", ".terminal",
+    ".url", ".webloc", ".workflow",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -265,6 +275,46 @@ def load_session(file_id: str) -> dict | None:
         return None
     data = parse_session(target)
     return _apply_custom_name(data) if data is not None else None
+
+
+def open_local_file(file_id: str, path_value: str) -> Path:
+    """Open a transcript-linked workspace file with the OS default app.
+
+    The target must resolve inside the session's cwd and must not itself be an
+    executable/application. This endpoint is intentionally narrower than the
+    image viewer: clicking model-authored text must never become a launcher for
+    arbitrary programs elsewhere on the machine.
+    """
+    data = load_session(file_id)
+    if data is None:
+        raise FileNotFoundError("session not found")
+    cwd = (data.get("meta") or {}).get("cwd")
+    if not isinstance(cwd, str) or not cwd.strip():
+        raise PermissionError("session has no workspace directory")
+    workspace = Path(cwd).expanduser().resolve()
+    raw_target = Path(path_value).expanduser()
+    target = (raw_target if raw_target.is_absolute() else workspace / raw_target).resolve()
+    if not target.exists():
+        raise FileNotFoundError("linked file not found")
+    if not _under(target, workspace):
+        raise PermissionError("linked file is outside the session workspace")
+    if not (target.is_file() or target.is_dir()):
+        raise PermissionError("linked path is not a regular file or directory")
+    if target.is_file() and (
+        target.suffix.lower() in UNSAFE_OPEN_SUFFIXES or os.access(target, os.X_OK)
+    ):
+        raise PermissionError("executable files cannot be opened from transcripts")
+    if sys.platform != "darwin":
+        raise NotImplementedError("opening local files is currently supported on macOS")
+
+    subprocess.run(
+        ["/usr/bin/open", str(target)],
+        check=True,
+        timeout=5,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    )
+    return target
 
 
 # ---------------------------------------------------------------------------
@@ -580,6 +630,56 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         self.send_error(404)
+
+    def do_POST(self):
+        if HOST_CHECK and not self._host_allowed():
+            self.send_error(403, "Host not allowed")
+            return
+
+        if urlparse(self.path).path != "/api/open-local":
+            self.send_error(404)
+            return
+        # application/json cannot be submitted by a cross-origin HTML form;
+        # browser fetches from another origin require a CORS preflight, which
+        # this server does not authorize.
+        if not self.headers.get("Content-Type", "").lower().startswith("application/json"):
+            self._send_json({"error": "expected application/json"}, status=415)
+            return
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            length = 0
+        if length <= 0 or length > 16384:
+            self._send_json({"error": "invalid request size"}, status=400)
+            return
+        try:
+            body = json.loads(self.rfile.read(length))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            self._send_json({"error": "invalid JSON"}, status=400)
+            return
+        file_id = body.get("file") if isinstance(body, dict) else None
+        path_value = body.get("path") if isinstance(body, dict) else None
+        if not isinstance(file_id, str) or not isinstance(path_value, str):
+            self._send_json({"error": "file and path must be strings"}, status=400)
+            return
+        if not path_value or len(path_value) > 8192 or "\x00" in path_value:
+            self._send_json({"error": "invalid path"}, status=400)
+            return
+        try:
+            opened = open_local_file(file_id, path_value)
+        except FileNotFoundError as e:
+            self._send_json({"error": str(e)}, status=404)
+            return
+        except PermissionError as e:
+            self._send_json({"error": str(e)}, status=403)
+            return
+        except NotImplementedError as e:
+            self._send_json({"error": str(e)}, status=501)
+            return
+        except (OSError, subprocess.SubprocessError) as e:
+            self._send_json({"error": f"could not open file: {e}"}, status=500)
+            return
+        self._send_json({"opened": str(opened)})
 
     def do_PUT(self):
         if HOST_CHECK and not self._host_allowed():

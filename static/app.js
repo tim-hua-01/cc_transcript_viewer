@@ -141,6 +141,76 @@ function md(text) {
   return `<p>${esc(text).replace(/\n/g, "<br>")}</p>`;
 }
 
+function localFileLinkTarget(anchor, cwd) {
+  if (!cwd) return null;
+  let href = anchor.getAttribute("href") || "";
+  try { href = decodeURI(href); } catch (_error) { return null; }
+  if (!href.startsWith("/")) return null;
+
+  let line = null;
+  const hashLine = href.match(/#L(\d+)(?:C\d+)?$/);
+  if (hashLine) {
+    line = Number(hashLine[1]);
+    href = href.slice(0, hashLine.index);
+  } else {
+    const suffixLine = href.match(/:(\d+)(?::\d+)?$/);
+    if (suffixLine) {
+      line = Number(suffixLine[1]);
+      href = href.slice(0, suffixLine.index);
+    }
+  }
+
+  const root = String(cwd).replace(/\/+$/, "");
+  if (href !== root && !href.startsWith(root + "/")) return null;
+  return { path: href, line };
+}
+
+async function openLocalFileLink(event, anchor, target) {
+  event.preventDefault();
+  if (anchor.dataset.opening === "1") return;
+  anchor.dataset.opening = "1";
+  anchor.classList.add("opening");
+  try {
+    const res = await fetch("/api/open-local", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ file: CURRENT_FILE, path: target.path }),
+    });
+    const result = await res.json();
+    if (!res.ok || result.error) throw new Error(result.error || `HTTP ${res.status}`);
+    anchor.classList.add("opened");
+    anchor.title = "Opened with the default app: " + result.opened;
+    setTimeout(() => anchor.classList.remove("opened"), 1400);
+  } catch (error) {
+    window.alert("Could not open local file: " + String(error));
+  } finally {
+    anchor.dataset.opening = "0";
+    anchor.classList.remove("opening");
+  }
+}
+
+function decorateMarkdownLinks(container, data) {
+  const cwd = (data.meta || {}).cwd || "";
+  $$(".md a", container).forEach((anchor) => {
+    const local = localFileLinkTarget(anchor, cwd);
+    if (local) {
+      anchor.classList.add("local-file-link");
+      anchor.href = "#";
+      anchor.setAttribute("role", "button");
+      anchor.title = "Open with the default app: " + local.path
+        + (local.line ? ` (link references line ${local.line})` : "");
+      anchor.addEventListener("click", (event) => openLocalFileLink(event, anchor, local));
+      return;
+    }
+    const href = anchor.getAttribute("href") || "";
+    if (/^https?:\/\//i.test(href)) {
+      anchor.classList.add("external-link");
+      anchor.target = "_blank";
+      anchor.rel = "noopener noreferrer";
+    }
+  });
+}
+
 // ---------- time formatting ----------
 function fmtTime(ts) {
   if (!ts) return "";
@@ -863,6 +933,7 @@ function renderTranscript(data, opts = {}) {
         return;
       }
       progress.remove();
+      decorateMarkdownLinks(t, data);
       groupTurnRuns(t);
       if (!opts.keepScroll) $("#main").scrollTop = 0;
       buildOutline();

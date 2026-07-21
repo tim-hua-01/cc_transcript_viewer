@@ -707,6 +707,11 @@ pre.guardian-review-context { max-height: 640px; margin: 8px 0 12px; }
 .md th, .md td { border: 1px solid var(--border); padding: 4px 8px; }
 .md img { max-width: 100%; border-radius: 6px; }
 .md a { color: var(--user); }
+.md a.local-file-link {
+  font-family: var(--mono); font-size: .94em; text-decoration-style: dotted;
+  cursor: pointer;
+}
+.md a.local-file-link.opening { color: var(--muted); cursor: progress; }
 
 /* Thinking */
 .thinking-block { margin: 8px 0; border-left: 3px solid var(--thinking); background: rgba(107,79,187,.06); border-radius: 0 8px 8px 0; }

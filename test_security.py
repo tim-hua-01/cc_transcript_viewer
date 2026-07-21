@@ -22,6 +22,7 @@ import threading
 import unittest
 import urllib.error
 import urllib.request
+from unittest import mock
 from urllib.parse import quote
 from http.client import HTTPConnection
 from http.server import ThreadingHTTPServer
@@ -190,6 +191,20 @@ class SecurityTest(unittest.TestCase):
         except urllib.error.HTTPError as e:
             return e.code, e.headers, e.read()
 
+    def post_json(self, path: str, payload: dict):
+        url = f"http://127.0.0.1:{self.port}{path}"
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode(),
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=5) as r:
+                return r.status, r.headers, r.read()
+        except urllib.error.HTTPError as e:
+            return e.code, e.headers, e.read()
+
     # ----- viewer-owned custom names -------------------------------------- #
 
     def test_custom_name_can_be_set_and_cleared(self):
@@ -212,6 +227,40 @@ class SecurityTest(unittest.TestCase):
         restored = json.loads(body)
         self.assertEqual(restored["title"], "hello world")
         self.assertEqual(restored["custom_title"], "")
+
+    def test_open_local_file_is_workspace_confined_and_non_executable(self):
+        workspace = self.projects_dir.parent / "workspace"
+        workspace.mkdir()
+        linked = workspace / "notes.txt"
+        linked.write_text("hello", encoding="utf-8")
+        outside = self.projects_dir.parent / "outside.txt"
+        outside.write_text("private", encoding="utf-8")
+        unsafe = workspace / "run.command"
+        unsafe.write_text("echo no", encoding="utf-8")
+        session = {"meta": {"cwd": str(workspace)}}
+
+        with (
+            mock.patch.object(server, "load_session", return_value=session),
+            mock.patch.object(server.sys, "platform", "darwin"),
+            mock.patch.object(server.subprocess, "run") as run,
+        ):
+            status, _, body = self.post_json(
+                "/api/open-local", {"file": str(self.fixture), "path": str(linked)}
+            )
+            self.assertEqual(status, 200)
+            self.assertEqual(json.loads(body)["opened"], str(linked.resolve()))
+            self.assertEqual(run.call_args.args[0], ["/usr/bin/open", str(linked.resolve())])
+
+            status, _, _ = self.post_json(
+                "/api/open-local", {"file": str(self.fixture), "path": str(outside)}
+            )
+            self.assertEqual(status, 403)
+
+            status, _, _ = self.post_json(
+                "/api/open-local", {"file": str(self.fixture), "path": str(unsafe)}
+            )
+            self.assertEqual(status, 403)
+            self.assertEqual(run.call_count, 1)
 
     def test_custom_title_search_outranks_user_message(self):
         data = server.load_session(str(self.fixture))
