@@ -1576,6 +1576,10 @@ function renderTool(b) {
   const bodyKids = [];
   bodyKids.push(el("div", { class: "tool-section-label" }, "Input"));
   bodyKids.push(fmt.inputNode);
+  if (b.instructions) {
+    bodyKids.push(el("div", { class: "tool-section-label" }, "Skill instructions"));
+    bodyKids.push(el("pre", { class: "payload truncatable" }, b.instructions));
+  }
   if (b.result) {
     const imgs = b.result.images || [];
     if (b.result.missing && !b.result.text && !imgs.length) {

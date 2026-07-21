@@ -137,7 +137,7 @@ def _synthetic_user_notice(text) -> dict | None:
 def _first_user_text(records: list[dict]) -> str:
     """First real user prompt text (skip tool results / command noise)."""
     for rec in records:
-        if rec.get("type") != "user" or rec.get("isSidechain"):
+        if rec.get("type") != "user" or rec.get("isSidechain") or rec.get("isMeta"):
             continue
         text = _user_record_text(rec)
         if not text or _synthetic_user_notice(text):
@@ -326,7 +326,11 @@ def _session_summary_uncached(path: Path) -> dict:
         if ts:
             first_ts = first_ts or ts
             last_ts = ts
-        if t == "user" and (is_subagent or not rec.get("isSidechain")):
+        if (
+            t == "user"
+            and not rec.get("isMeta")
+            and (is_subagent or not rec.get("isSidechain"))
+        ):
             # Skip system-injected wrappers so the count matches the user outline.
             text = _user_record_text(rec)
             if text and not _synthetic_user_notice(text):
@@ -577,14 +581,18 @@ def parse_session(path: Path) -> dict:
     records = list(common.iter_jsonl(path))
 
     results_by_id: dict[str, dict] = {}
+    tool_uses_by_id: dict[str, dict] = {}
+    skill_instructions_by_id: dict[str, str] = {}
     for rec in records:
-        if rec.get("type") != "user":
-            continue
         content = rec.get("message", {}).get("content")
         if not isinstance(content, list):
             continue
         for b in content:
-            if isinstance(b, dict) and b.get("type") == "tool_result":
+            if not isinstance(b, dict):
+                continue
+            if b.get("type") == "tool_use" and b.get("id"):
+                tool_uses_by_id[b["id"]] = b
+            elif rec.get("type") == "user" and b.get("type") == "tool_result":
                 tid = b.get("tool_use_id")
                 if tid:
                     norm = _normalize_tool_result_content(b.get("content"))
@@ -594,6 +602,11 @@ def parse_session(path: Path) -> dict:
                         "images": norm["images"],
                         "structured": rec.get("toolUseResult"),
                     }
+    for rec in records:
+        source_id = rec.get("sourceToolUseID")
+        source_tool = tool_uses_by_id.get(source_id, {})
+        if rec.get("type") == "user" and rec.get("isMeta") and source_tool.get("name") == "Skill":
+            skill_instructions_by_id[source_id] = _user_record_text(rec)
 
     events = []
     ai_title = ""
@@ -740,6 +753,32 @@ def parse_session(path: Path) -> dict:
             blocks, has_content = _content_blocks(rec.get("message", {}).get("content"))
             if not has_content:
                 continue
+            # Claude Code injects a selected skill's instructions as an isMeta
+            # user record. It is model context, not something the user typed.
+            # Custom skills usually include their full SKILL.md here; built-in
+            # skills may inject only a short instruction.
+            meta_text = _user_record_text(rec)
+            source_tool = tool_uses_by_id.get(rec.get("sourceToolUseID"), {})
+            is_skill = source_tool.get("name") == "Skill" or meta_text.lstrip().startswith(
+                "Base directory for this skill:"
+            )
+            if rec.get("isMeta") and is_skill:
+                # A linked Skill call already exists in the transcript. Its
+                # renderer includes these instructions inside that tool block,
+                # so do not add a second top-level event.
+                if source_tool.get("name") == "Skill":
+                    continue
+                skill_name = (source_tool.get("input") or {}).get("skill") or ""
+                emit(
+                    {
+                        "kind": "instructions",
+                        "ts": ts,
+                        "label": "Skill instructions" + (f" · {skill_name}" if skill_name else ""),
+                        "text": meta_text,
+                        "is_sidechain": is_sidechain,
+                    }
+                )
+                continue
             # System-injected wrappers (task notifications, slash-command echoes,
             # hook output, …) are recorded as `user` records but aren't real
             # prompts. Surface them as notices so they stay out of the user
@@ -781,6 +820,7 @@ def parse_session(path: Path) -> dict:
                             "input": b.get("input", {}),
                             "caller": b.get("caller"),
                             "result": result,
+                            "instructions": skill_instructions_by_id.get(tid, ""),
                         }
                     )
             if not blocks:

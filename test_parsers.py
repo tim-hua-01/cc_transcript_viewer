@@ -209,6 +209,61 @@ class SyntheticUserNoticeTests(unittest.TestCase):
         self.assertFalse(tools[0]["result"]["is_error"])
 
 
+class SkillInstructionTests(unittest.TestCase):
+    def test_skill_body_is_attached_to_tool_not_added_as_event(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "s.jsonl"
+            _write_jsonl(
+                path,
+                [
+                    _user("u1", None, "review this", "2026-01-01T00:00:00Z"),
+                    {
+                        "type": "assistant",
+                        "uuid": "a1",
+                        "parentUuid": "u1",
+                        "timestamp": "2026-01-01T00:00:01Z",
+                        "message": {
+                            "role": "assistant",
+                            "content": [
+                                {
+                                    "type": "tool_use",
+                                    "id": "skill1",
+                                    "name": "Skill",
+                                    "input": {"skill": "review"},
+                                }
+                            ],
+                        },
+                    },
+                    {
+                        "type": "user",
+                        "uuid": "u2",
+                        "parentUuid": "a1",
+                        "timestamp": "2026-01-01T00:00:02Z",
+                        "isMeta": True,
+                        "sourceToolUseID": "skill1",
+                        "message": {
+                            "role": "user",
+                            "content": [{"type": "text", "text": "# Review\nCheck the PR."}],
+                        },
+                    },
+                ],
+            )
+            data = claude.parse_session(path)
+            summary = claude.session_summary(path)
+
+        skill = next(
+            b
+            for event in data["events"]
+            for b in event.get("blocks", [])
+            if b.get("type") == "tool_use" and b.get("name") == "Skill"
+        )
+        self.assertEqual(skill["instructions"], "# Review\nCheck the PR.")
+        self.assertNotIn("instructions", [e["kind"] for e in data["events"]])
+        self.assertEqual([e["kind"] for e in data["events"]].count("user"), 1)
+        self.assertEqual(summary["n_user"], 1)
+        self.assertEqual(summary["title"], "review this")
+
+
 class QueuedPromptTests(unittest.TestCase):
     """queued_command attachments may carry a plain string or a block list."""
 
