@@ -439,6 +439,7 @@ class SecurityTest(unittest.TestCase):
         OUTBOUND.clear()
         for path in ["/", "/app.js", "/style.css", "/api/sessions",
                      "/api/search?q=hello",
+                     "/api/session-state?file=" + quote(str(self.fixture)),
                      "/api/session?file=" + quote(str(self.fixture))]:
             self.get(path)
         self.assertEqual(OUTBOUND, [], f"server made outbound connections: {OUTBOUND}")
@@ -489,6 +490,19 @@ class SecurityTest(unittest.TestCase):
             "/api/session?file=" + quote(str(self.fixture)))
         self.assertEqual(status, 200)
         self.assertNotIn(b"forbidden", body)
+
+    def test_session_state_is_lightweight_and_confined(self):
+        status, _, body = self.get(
+            "/api/session-state?file=" + quote(str(self.fixture)))
+        self.assertEqual(status, 200)
+        state = json.loads(body)
+        self.assertTrue(state["supported"])
+        self.assertEqual(state["mtime"], self.fixture.stat().st_mtime)
+        self.assertNotIn("events", state)
+
+        status, _, _ = self.get(
+            "/api/session-state?file=" + quote("/etc/hosts"))
+        self.assertEqual(status, 403)
 
     def test_cursor_cli_session_lists_and_parses(self):
         """CLI agent-transcripts under ~/.cursor/projects are visible and readable."""
@@ -664,6 +678,14 @@ class FrontendAssetIntegrityTest(unittest.TestCase):
                 url = re.search(r"""(?:src|href)=["'](https?://[^"']+)""", tag).group(1)
                 self.assertRegex(url, r"@\d+\.\d+\.\d+/",
                                  "CDN URL must pin an exact version (x.y.z)")
+
+    def test_open_transcript_has_separate_fast_poll(self):
+        js = (Path("static") / "app.js").read_text(encoding="utf-8")
+        self.assertIn("const TRANSCRIPT_POLL_MS = 300", js)
+        self.assertIn("const SIDEBAR_POLL_MS = 1000", js)
+        self.assertIn('fetch("/api/session-state?file="', js)
+        self.assertIn("setInterval(pollOpenTranscript, TRANSCRIPT_POLL_MS)", js)
+        self.assertIn("setInterval(pollSidebar, SIDEBAR_POLL_MS)", js)
 
 
 if __name__ == "__main__":

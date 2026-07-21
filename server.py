@@ -277,6 +277,31 @@ def load_session(file_id: str) -> dict | None:
     return _apply_custom_name(data) if data is not None else None
 
 
+def session_file_mtime(file_id: str) -> float | None:
+    """Return a real transcript's mtime without parsing any session content.
+
+    Synthetic Cursor database ids return None; their change detection continues
+    to use the regular session-list refresh.
+    """
+    if file_id.startswith((cursor.SESSION_SCHEME, cursor.CLI_SESSION_SCHEME)):
+        return None
+    target = Path(file_id).expanduser().resolve()
+    if not target.exists():
+        raise FileNotFoundError(file_id)
+    allowed = (
+        _under(target, claude.PROJECTS_DIR)
+        or _under(target, codex.SESSIONS_DIR)
+        or (
+            codex.ARCHIVED_SESSIONS_DIR.exists()
+            and _under(target, codex.ARCHIVED_SESSIONS_DIR)
+        )
+        or cursor.is_cli_transcript(target)
+    )
+    if not allowed:
+        raise PermissionError(file_id)
+    return target.stat().st_mtime
+
+
 def open_local_file(file_id: str, path_value: str) -> Path:
     """Open a transcript-linked workspace file with the OS default app.
 
@@ -591,6 +616,26 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json({"sessions": list_sessions()})
             except Exception as e:  # noqa: BLE001
                 self._send_json({"error": str(e)}, status=500)
+            return
+
+        if route == "/api/session-state":
+            qs = parse_qs(parsed.query)
+            file_arg = qs.get("file", [""])[0]
+            if not file_arg:
+                self._send_json({"error": "missing file param"}, status=400)
+                return
+            try:
+                mtime = session_file_mtime(file_arg)
+            except FileNotFoundError:
+                self._send_json({"error": "not found"}, status=404)
+                return
+            except PermissionError:
+                self._send_json({"error": "forbidden"}, status=403)
+                return
+            if mtime is None:
+                self._send_json({"supported": False})
+            else:
+                self._send_json({"supported": True, "mtime": mtime})
             return
 
         if route == "/api/search":

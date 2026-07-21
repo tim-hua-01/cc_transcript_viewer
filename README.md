@@ -47,8 +47,8 @@ python3 server.py --custom-names-file PATH # different custom transcript names f
 By default the server binds **127.0.0.1** (loopback only), so it isn't reachable from other machines
 unless you deliberately pass `--host 0.0.0.0`.
 
-The viewer **auto-refreshes**: it polls about once a second and updates the sidebar **and the open
-transcript in place** as sessions change on disk, preserving your scroll position and which
+The viewer **auto-refreshes**: it checks the open on-disk transcript about three times a second and
+scans for sidebar changes once a second, preserving your scroll position and which
 thinking/tool blocks you've expanded. So an active session you're watching tails live. Reload the
 page if you ever need a full reset. Session metadata is cached by file mtime, so each poll only
 re-reads the files that actually changed — the cost doesn't grow with how many transcripts you've
@@ -140,8 +140,8 @@ accumulated.
   Bauhaus and Art Deco add broader design-history options through geometry and double rules. All
   are static—no theme animations. The choice is stored in the browser on that machine and restored
   before the page paints.
-- **Live updates.** The sidebar and the transcript you're reading refresh themselves about once a
-  second — new sessions appear, and an in-progress session tails as it's written — without disturbing
+- **Live updates.** The sidebar refreshes about once a second, while an open on-disk transcript is
+  checked about three times a second, so an in-progress session tails quickly without disturbing
   your scroll position or your expanded/collapsed blocks.
 - **Deep-linkable:** the open session is stored in the URL hash, so you can bookmark/share a link.
 

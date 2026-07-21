@@ -265,7 +265,8 @@ let CURRENT_DATA = null;
 let CURRENT_AGENT = "claude";
 let AGENT_FILTER = "all";
 // ---------- live auto-refresh (always on) ----------
-const POLL_MS = 1000;            // how often to rescan disk for changes
+const SIDEBAR_POLL_MS = 1000;    // heavier scan across every transcript source
+const TRANSCRIPT_POLL_MS = 300;  // cheap stat of the open on-disk transcript
 let LAST_RENDERED_MTIME = 0;     // mtime of the open transcript as last rendered
 let LAST_RENDERED_TITLE = "";    // detects custom-name changes without transcript writes
 let LAST_SIG = "";               // cheap fingerprint of the session list
@@ -1003,17 +1004,24 @@ function restoreView(v) {
   main.scrollTop = v.atBottom ? main.scrollHeight : v.top;
 }
 
-async function refreshOpenTranscript() {
+let transcriptRefreshInFlight = false;
+async function refreshOpenTranscript(knownMtime = null) {
   if (!CURRENT_FILE) return;
+  if (transcriptRefreshInFlight) return;
+  transcriptRefreshInFlight = true;
+  const file = CURRENT_FILE;
   const view = captureView();
   try {
-    const res = await fetch("/api/session?file=" + encodeURIComponent(CURRENT_FILE));
+    const res = await fetch("/api/session?file=" + encodeURIComponent(file));
     const data = await res.json();
-    if (data.error) return;
+    if (data.error || CURRENT_FILE !== file) return;
     const rendered = await renderTranscript(data, { keepScroll: true });
-    if (rendered) restoreView(view);
-    LAST_RENDERED_MTIME = sessionMtime(CURRENT_FILE);
+    if (rendered && CURRENT_FILE === file) {
+      restoreView(view);
+      LAST_RENDERED_MTIME = knownMtime == null ? sessionMtime(file) : knownMtime;
+    }
   } catch (e) { /* transient; try again next poll */ }
+  finally { transcriptRefreshInFlight = false; }
 }
 
 // ---------- user-message navigation (outline + jump buttons) ----------
@@ -2011,10 +2019,32 @@ async function refreshSidebar() {
 }
 
 // ---------- live polling (always on) ----------
-let polling = false;
-async function poll() {
-  if (polling) return;
-  polling = true;
+// Real transcript files get a fast, tiny stat request. The full session list
+// remains on a slower loop for sidebar changes and synthetic Cursor sessions.
+function supportsFastTranscriptPoll(file) {
+  return file && !file.startsWith("cursordb:") && !file.startsWith("cursorcli:");
+}
+
+let transcriptStatePolling = false;
+async function pollOpenTranscript() {
+  const file = CURRENT_FILE;
+  if (!supportsFastTranscriptPoll(file) || transcriptStatePolling) return;
+  transcriptStatePolling = true;
+  try {
+    const res = await fetch("/api/session-state?file=" + encodeURIComponent(file));
+    const state = await res.json();
+    if (
+      CURRENT_FILE === file && state.supported &&
+      (state.mtime || 0) > LAST_RENDERED_MTIME
+    ) await refreshOpenTranscript(state.mtime);
+  } catch (e) { /* transient; try again next poll */ }
+  finally { transcriptStatePolling = false; }
+}
+
+let sidebarPolling = false;
+async function pollSidebar() {
+  if (sidebarPolling) return;
+  sidebarPolling = true;
   try {
     let next;
     try {
@@ -2027,18 +2057,22 @@ async function poll() {
       SESSIONS = next;
       await refreshSidebar();
     }
-    // Re-render the open transcript only when its file actually grew/changed.
+    // Synthetic Cursor sessions have no standalone file to stat, so retain
+    // mtime detection here. Title changes for every source also flow here.
     if (CURRENT_FILE) {
       const cur = next.find((s) => s.file === CURRENT_FILE);
       if (cur && (
-        (cur.mtime || 0) > LAST_RENDERED_MTIME || (cur.title || "") !== LAST_RENDERED_TITLE
+        (!supportsFastTranscriptPoll(CURRENT_FILE) &&
+          (cur.mtime || 0) > LAST_RENDERED_MTIME) ||
+        (cur.title || "") !== LAST_RENDERED_TITLE
       )) await refreshOpenTranscript();
     }
   } finally {
-    polling = false;
+    sidebarPolling = false;
   }
 }
-setInterval(poll, POLL_MS);
+setInterval(pollOpenTranscript, TRANSCRIPT_POLL_MS);
+setInterval(pollSidebar, SIDEBAR_POLL_MS);
 
 document.addEventListener("keydown", (e) => {
   if (e.key === "/" && document.activeElement !== $("#search")) {
