@@ -19,6 +19,78 @@ function el(tag, attrs = {}, ...kids) {
 }
 const esc = (s) => (s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 
+// ---------- theme picker ----------
+const THEMES = [
+  { id: "warm", name: "Warm", colors: ["#fffdfa", "#efe8dc", "#c0492a"] },
+  { id: "paper", name: "Paper", colors: ["#ffffff", "#e9ecef", "#315ca8"] },
+  { id: "botanical", name: "Botanical", colors: ["#f8faf6", "#e2e8dd", "#586f5b"] },
+  { id: "lavender", name: "Lavender", colors: ["#faf9fc", "#e6e1e9", "#65557b"] },
+  { id: "sorbet", name: "Sorbet", colors: ["#fff9f5", "#eddcd7", "#8e4b61"] },
+  { id: "night", name: "Night", colors: ["#171a1f", "#292e37", "#e07a5f"] },
+  { id: "terminal", name: "Terminal", colors: ["#111614", "#222c27", "#77c995"] },
+  { id: "highlighter", name: "Highlighter", colors: ["#fffdf2", "#ffe261", "#8a2457"] },
+  { id: "nineties", name: "Nineties", colors: ["#dedede", "#f7f7f7", "#000080"] },
+  { id: "system7", name: "System 7", colors: ["#f7f7f7", "#d7d7d7", "#111111"] },
+  { id: "bauhaus", name: "Bauhaus", colors: ["#f7f2e7", "#d9b52f", "#962f2f"] },
+  { id: "artdeco", name: "Art Deco", colors: ["#faf7ed", "#d8c99f", "#73591f"] },
+];
+
+function currentTheme() {
+  const id = document.documentElement.dataset.theme;
+  return THEMES.some((theme) => theme.id === id) ? id : "warm";
+}
+
+function setTheme(id, persist = true) {
+  if (!THEMES.some((theme) => theme.id === id)) return;
+  document.documentElement.dataset.theme = id;
+  if (persist) {
+    try { localStorage.setItem("transcript-viewer:theme", id); } catch (_error) {}
+  }
+  $$(".theme-option").forEach((option) => {
+    const selected = option.dataset.theme === id;
+    option.setAttribute("aria-checked", selected ? "true" : "false");
+    $(".theme-check", option).textContent = selected ? "✓" : "";
+  });
+}
+
+function closeThemeMenu() {
+  $("#theme-menu").hidden = true;
+  $("#theme-toggle").setAttribute("aria-expanded", "false");
+}
+
+function buildThemePicker() {
+  const menu = $("#theme-menu");
+  const toggle = $("#theme-toggle");
+  for (const theme of THEMES) {
+    const swatches = el("span", { class: "theme-swatches", "aria-hidden": "true" },
+      theme.colors.map((color) => el("span", { class: "theme-swatch", style: `background:${color}` }))
+    );
+    const option = el("button", {
+      class: "theme-option", type: "button", role: "menuitemradio", "data-theme": theme.id,
+      "aria-checked": "false", onclick: () => { setTheme(theme.id); closeThemeMenu(); toggle.focus(); },
+    }, swatches, theme.name, el("span", { class: "theme-check", "aria-hidden": "true" }));
+    menu.append(option);
+  }
+  setTheme(currentTheme(), false);
+  toggle.addEventListener("click", (event) => {
+    event.stopPropagation();
+    const opening = menu.hidden;
+    menu.hidden = !opening;
+    toggle.setAttribute("aria-expanded", opening ? "true" : "false");
+    if (opening) $(".theme-option[aria-checked='true']", menu)?.focus();
+  });
+  menu.addEventListener("click", (event) => event.stopPropagation());
+  menu.addEventListener("keydown", (event) => {
+    const options = $$(".theme-option", menu);
+    const index = options.indexOf(document.activeElement);
+    if (event.key === "Escape") { closeThemeMenu(); toggle.focus(); return; }
+    if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
+    event.preventDefault();
+    const step = event.key === "ArrowDown" ? 1 : -1;
+    options[(index + step + options.length) % options.length].focus();
+  });
+}
+
 // ---------- markdown (with KaTeX math) ----------
 // Pulls $…$, $$…$$, \(…\), \[…\] out of `text` before markdown sees them,
 // so things like $\bm h_\perp$ don't get mangled by italic/asterisk parsing.
@@ -1900,6 +1972,7 @@ document.addEventListener("keydown", (e) => {
   }
   if (e.key === "Escape") {
     $$(".dropdown-panel").forEach((p) => p.classList.add("hidden"));
+    closeThemeMenu();
     hideSessionContextMenu();
   }
 });
@@ -1919,6 +1992,7 @@ $("#main").addEventListener("scroll", () => {
 // click anywhere outside an open dropdown closes it
 document.addEventListener("click", () => {
   $$(".dropdown-panel").forEach((p) => p.classList.add("hidden"));
+  closeThemeMenu();
   hideSessionContextMenu();
 });
 window.addEventListener("scroll", hideSessionContextMenu, true);
@@ -1940,4 +2014,5 @@ window.addEventListener("hashchange", () => {
   if (file && file !== CURRENT_FILE) openSession(file);
 });
 
+buildThemePicker();
 loadSessions().then(openFromHash);

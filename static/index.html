@@ -1,9 +1,22 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-theme="warm">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Transcript Viewer</title>
+  <script>
+    // Apply the saved theme before CSS paints, avoiding a flash of the default theme.
+    try {
+      const savedTheme = localStorage.getItem("transcript-viewer:theme");
+      // Solarized was replaced by the more distinct Botanical palette.
+      const theme = savedTheme === "solarized" ? "botanical" : savedTheme;
+      if (["warm", "paper", "botanical", "lavender", "sorbet", "night", "terminal",
+           "highlighter", "nineties", "system7", "bauhaus", "artdeco"].includes(theme)) {
+        document.documentElement.dataset.theme = theme;
+        if (theme !== savedTheme) localStorage.setItem("transcript-viewer:theme", theme);
+      }
+    } catch (_error) {}
+  </script>
   <link rel="stylesheet" href="/style.css" />
   <!-- markdown + sanitization, loaded from CDN; falls back to plain text if offline.
        Versions are pinned and integrity-hashed (SRI) so a compromised or drifted
@@ -31,6 +44,14 @@
         <div class="brand">
           <span class="brand-mark"></span>
           <span class="brand-name">Transcript Viewer</span>
+          <div class="theme-picker">
+            <button id="theme-toggle" class="theme-toggle" type="button" title="Choose theme"
+                    aria-label="Choose theme" aria-haspopup="menu" aria-expanded="false">
+              <span class="theme-toggle-icon" aria-hidden="true">◐</span>
+              <span class="theme-toggle-label">Theme</span>
+            </button>
+            <div id="theme-menu" class="theme-menu" role="menu" hidden></div>
+          </div>
           <button id="collapse-sidebar" class="panel-toggle" title="Hide sessions" aria-label="Hide sessions">«</button>
         </div>
         <input id="search" type="search" placeholder="Search title, project, id, or content…" autocomplete="off" />

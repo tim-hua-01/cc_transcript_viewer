@@ -128,6 +128,14 @@ accumulated.
   clickable headings and highlights the one you're reading as you scroll. Floating **↑ / ↓** buttons
   jump to the previous/next user prompt, and **Jump to end** (in the transcript controls) skips to
   the bottom. Sidebar and outline panels can be collapsed.
+- **Twelve themes.** Warm, Paper, Botanical, and Lavender cover the quiet solid palettes; Night is
+  the standard dark option. The playful set changes the UI as well as its colors: Sorbet uses soft
+  pills, while Terminal uses crisp monospace controls.
+  Highlighter and Nineties are the two intentionally odd options, with chunky offset borders and
+  classic desktop bevels respectively. System 7 draws from historic Macintosh interfaces, while
+  Bauhaus and Art Deco add broader design-history options through geometry and double rules. All
+  are static—no theme animations. The choice is stored in the browser on that machine and restored
+  before the page paints.
 - **Live updates.** The sidebar and the transcript you're reading refresh themselves about once a
   second — new sessions appear, and an in-progress session tails as it's written — without disturbing
   your scroll position or your expanded/collapsed blocks.
