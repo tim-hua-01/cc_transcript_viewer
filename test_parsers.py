@@ -251,6 +251,88 @@ class QueuedPromptTests(unittest.TestCase):
         self.assertEqual(data["events"][0]["label"], "System reminder")
 
 
+class CodexReasoningSummaryTests(unittest.TestCase):
+    def _parse(self, records):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "rollout.jsonl"
+            _write_jsonl(path, records)
+            return codex.parse_session(path)
+
+    def test_multi_part_response_groups_agent_reasoning_mirrors(self):
+        parts = ["**First**\n\nAlpha", "**Second**\n\nBeta", "**Third**\n\nGamma"]
+        records = [
+            {
+                "timestamp": "2026-01-01T00:00:00.000Z",
+                "type": "event_msg",
+                "payload": {"type": "agent_reasoning", "text": text},
+            }
+            for text in parts
+        ]
+        records.append(
+            {
+                "timestamp": "2026-01-01T00:00:00.002Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "reasoning",
+                    "id": "rs_grouped",
+                    "summary": [{"type": "summary_text", "text": text} for text in parts],
+                    "encrypted_content": "opaque",
+                },
+            }
+        )
+
+        reasoning = [event for event in self._parse(records)["events"] if event["kind"] == "reasoning"]
+
+        self.assertEqual(len(reasoning), 1)
+        self.assertEqual(reasoning[0]["text"], "\n".join(parts))
+        self.assertTrue(reasoning[0]["has_encrypted"])
+
+    def test_non_matching_reasoning_events_remain_separate(self):
+        records = [
+            {
+                "timestamp": "2026-01-01T00:00:00Z",
+                "type": "event_msg",
+                "payload": {"type": "agent_reasoning", "text": "Independent episode"},
+            },
+            {
+                "timestamp": "2026-01-01T00:00:01Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "reasoning",
+                    "summary": [
+                        {"type": "summary_text", "text": "Grouped first"},
+                        {"type": "summary_text", "text": "Grouped second"},
+                    ],
+                },
+            },
+        ]
+
+        reasoning = [event for event in self._parse(records)["events"] if event["kind"] == "reasoning"]
+
+        self.assertEqual(
+            [event["text"] for event in reasoning],
+            ["Independent episode", "Grouped first\nGrouped second"],
+        )
+
+    def test_encrypted_only_reasoning_is_not_rendered(self):
+        records = [
+            {
+                "timestamp": "2026-01-01T00:00:00Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "reasoning",
+                    "id": "rs_opaque",
+                    "summary": [],
+                    "encrypted_content": "opaque continuation state",
+                },
+            }
+        ]
+
+        reasoning = [event for event in self._parse(records)["events"] if event["kind"] == "reasoning"]
+
+        self.assertEqual(reasoning, [])
+
+
 class CodexOrchestrationTests(unittest.TestCase):
     """The JS-literal parser that unpacks generated `tools.name(...)` calls."""
 

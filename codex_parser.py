@@ -629,9 +629,9 @@ def list_sessions() -> list[dict]:
     return out
 
 
-def _summary_text(summary) -> str:
+def _summary_parts(summary) -> list[str]:
     if isinstance(summary, str):
-        return summary
+        return [summary] if summary else []
     if isinstance(summary, list):
         parts = []
         for item in summary:
@@ -639,10 +639,18 @@ def _summary_text(summary) -> str:
                 parts.append(item.get("text") or item.get("summary") or json.dumps(item, ensure_ascii=False))
             else:
                 parts.append(str(item))
-        return "\n".join(p for p in parts if p)
+        return [p for p in parts if p]
     if summary:
-        return str(summary)
-    return ""
+        return [str(summary)]
+    return []
+
+
+def _summary_text(summary) -> str:
+    return "\n".join(_summary_parts(summary))
+
+
+def _normalized_reasoning_text(text: str) -> str:
+    return " ".join((text or "").split())
 
 
 def _patch_text(args) -> str:
@@ -848,6 +856,29 @@ def parse_session(path: Path) -> dict:
     user_event_texts: set[str] = set()
     user_image_fallbacks: dict[str, list[list[dict]]] = {}
 
+    # Codex writes readable summaries twice: first as one `agent_reasoning`
+    # event per summary segment, then as a canonical `response_item/reasoning`
+    # whose `summary` array contains the same ordered segments. Mark exact,
+    # adjacent mirrors so the second pass emits one grouped reasoning episode.
+    mirrored_reasoning_records: set[int] = set()
+    for response_index, rec in enumerate(records):
+        payload = rec.get("payload") or {}
+        if rec.get("type") != "response_item" or payload.get("type") != "reasoning":
+            continue
+        parts = _summary_parts(payload.get("summary"))
+        if not parts or response_index < len(parts):
+            continue
+        candidate_indexes = list(range(response_index - len(parts), response_index))
+        candidates = [records[index] for index in candidate_indexes]
+        if all(
+            candidate.get("type") == "event_msg"
+            and (candidate.get("payload") or {}).get("type") == "agent_reasoning"
+            and _normalized_reasoning_text((candidate.get("payload") or {}).get("text") or "")
+            == _normalized_reasoning_text(part)
+            for candidate, part in zip(candidates, parts)
+        ):
+            mirrored_reasoning_records.update(candidate_indexes)
+
     for rec in records:
         payload = rec.get("payload") or {}
         if rec.get("type") == "session_meta":
@@ -941,12 +972,16 @@ def parse_session(path: Path) -> dict:
     recent_reasoning: list[tuple[str, str]] = []
 
     def append_reasoning(ts: str | None, text: str, has_encrypted: bool) -> None:
-        normalized = " ".join((text or "").split())
-        if normalized:
-            for prev_ts, prev_text in recent_reasoning[-8:]:
-                if prev_text == normalized:
-                    return
-            recent_reasoning.append((ts or "", normalized))
+        normalized = _normalized_reasoning_text(text)
+        # `encrypted_content` is opaque continuation state, not displayable
+        # reasoning. Codex writes many such items with an empty summary between
+        # tool calls; rendering a warning block for each one only adds noise.
+        if not normalized:
+            return
+        for prev_ts, prev_text in recent_reasoning[-8:]:
+            if prev_text == normalized:
+                return
+        recent_reasoning.append((ts or "", normalized))
         events.append(
             _event_payload(
                 "reasoning",
@@ -958,7 +993,7 @@ def parse_session(path: Path) -> dict:
             )
         )
 
-    for rec in records:
+    for record_index, rec in enumerate(records):
         typ = rec.get("type")
         ts = rec.get("timestamp")
         payload = rec.get("payload") or {}
@@ -1102,7 +1137,8 @@ def parse_session(path: Path) -> dict:
                         )
                     )
             elif pt == "agent_reasoning":
-                append_reasoning(ts, payload.get("text") or "", False)
+                if record_index not in mirrored_reasoning_records:
+                    append_reasoning(ts, payload.get("text") or "", False)
             elif pt == "task_started":
                 ctx = turn_contexts.get(payload.get("turn_id"), {})
                 events.append(

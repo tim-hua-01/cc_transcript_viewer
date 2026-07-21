@@ -188,9 +188,9 @@ the default bind is loopback.
   model_reasoning_summary = "detailed"
   ```
 
-  This doesn't backfill old transcripts; records with only encrypted reasoning still show as not
-  readable. Duplicate summaries (written as both `event_msg/agent_reasoning` and
-  `response_item/reasoning.summary`) are deduped.
+  This doesn't backfill old transcripts. Encrypted-only reasoning records contain no displayable
+  text and are omitted; readable duplicates (written as both `event_msg/agent_reasoning` and
+  `response_item/reasoning.summary`) are grouped and deduped.
 - **Web search results aren't stored.** Codex records only the search *queries* it issued (the viewer
   lists all of them); the fetched pages are sent to the model but never written to the rollout. The
   findings survive only as the assistant's prose, with citation links.
