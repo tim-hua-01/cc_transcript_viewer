@@ -262,6 +262,32 @@ class SecurityTest(unittest.TestCase):
             self.assertEqual(status, 403)
             self.assertEqual(run.call_count, 1)
 
+    def test_reveal_transcript_is_confined_to_transcript_roots(self):
+        outside = self.projects_dir.parent / "elsewhere.jsonl"
+        outside.write_text("{}\n", encoding="utf-8")
+
+        with (
+            mock.patch.object(server.sys, "platform", "darwin"),
+            mock.patch.object(server.subprocess, "run") as run,
+        ):
+            status, _, body = self.post_json(
+                "/api/reveal-transcript", {"file": str(self.fixture)}
+            )
+            self.assertEqual(status, 200)
+            self.assertEqual(json.loads(body)["opened"], str(self.fixture.resolve()))
+            self.assertEqual(
+                run.call_args.args[0], ["/usr/bin/open", "-R", str(self.fixture.resolve())]
+            )
+
+            status, _, _ = self.post_json("/api/reveal-transcript", {"file": str(outside)})
+            self.assertEqual(status, 403)
+
+            status, _, _ = self.post_json(
+                "/api/reveal-transcript", {"file": "cursordb:abc123"}
+            )
+            self.assertEqual(status, 404)
+            self.assertEqual(run.call_count, 1)
+
     def test_custom_title_search_outranks_user_message(self):
         data = server.load_session(str(self.fixture))
         server._set_custom_name(data, "priorityword custom name")

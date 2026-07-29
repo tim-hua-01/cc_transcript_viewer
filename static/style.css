@@ -633,6 +633,13 @@ body.outline-collapsed #nav-buttons { right: 24px; }
 .rename-btn:hover { color: var(--accent); border-color: var(--border); background: var(--bg-elev); }
 .t-aititle { font-size: 12px; color: var(--muted); font-weight: 400; margin: 0 0 8px; }
 .t-meta { display: flex; gap: 10px; flex-wrap: wrap; font-size: 12px; color: var(--muted); align-items: center; }
+.reveal-btn {
+  flex: none; margin-left: -6px; padding: 1px 5px; line-height: 1.2;
+  border: 1px solid transparent; border-radius: 6px;
+  background: transparent; color: var(--muted); cursor: pointer; font-size: 12px;
+}
+.reveal-btn:hover { border-color: var(--border); background: var(--bg-elev); }
+.reveal-btn[data-opening="1"] { opacity: .5; }
 .compact-stats { display: flex; gap: 6px; flex-wrap: wrap; margin: 7px 0; }
 .t-controls { margin-top: 10px; display: flex; gap: 8px; flex-wrap: wrap; }
 .btn {

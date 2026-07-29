@@ -277,14 +277,15 @@ def load_session(file_id: str) -> dict | None:
     return _apply_custom_name(data) if data is not None else None
 
 
-def session_file_mtime(file_id: str) -> float | None:
-    """Return a real transcript's mtime without parsing any session content.
+def resolve_transcript_file(file_id: str) -> Path:
+    """Resolve a session id to its on-disk transcript under an allowed root.
 
-    Synthetic Cursor database ids return None; their change detection continues
-    to use the regular session-list refresh.
+    Raises FileNotFoundError if the id is synthetic (Cursor database sessions
+    have no transcript file) or missing, and PermissionError if the path lies
+    outside every transcript root.
     """
     if file_id.startswith((cursor.SESSION_SCHEME, cursor.CLI_SESSION_SCHEME)):
-        return None
+        raise FileNotFoundError(file_id)
     target = Path(file_id).expanduser().resolve()
     if not target.exists():
         raise FileNotFoundError(file_id)
@@ -299,7 +300,38 @@ def session_file_mtime(file_id: str) -> float | None:
     )
     if not allowed:
         raise PermissionError(file_id)
-    return target.stat().st_mtime
+    return target
+
+
+def session_file_mtime(file_id: str) -> float | None:
+    """Return a real transcript's mtime without parsing any session content.
+
+    Synthetic Cursor database ids return None; their change detection continues
+    to use the regular session-list refresh.
+    """
+    if file_id.startswith((cursor.SESSION_SCHEME, cursor.CLI_SESSION_SCHEME)):
+        return None
+    return resolve_transcript_file(file_id).stat().st_mtime
+
+
+def reveal_transcript_file(file_id: str) -> Path:
+    """Reveal a transcript file in Finder.
+
+    Only transcripts under a known root can be revealed, and `open -R` selects
+    the file in Finder rather than launching it, so this cannot be turned into
+    a way to run something.
+    """
+    target = resolve_transcript_file(file_id)
+    if sys.platform != "darwin":
+        raise NotImplementedError("revealing files is currently supported on macOS")
+    subprocess.run(
+        ["/usr/bin/open", "-R", str(target)],
+        check=True,
+        timeout=5,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    )
+    return target
 
 
 def open_local_file(file_id: str, path_value: str) -> Path:
@@ -552,6 +584,10 @@ class Handler(BaseHTTPRequestHandler):
         try:
             self.send_response(200)
             self.send_header("Content-Type", content_type)
+            # The viewer's own assets change under a long-lived server; heuristic
+            # browser caching otherwise serves a stale UI after an edit.
+            if path.parent == STATIC_DIR:
+                self.send_header("Cache-Control", "no-store")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -681,7 +717,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(403, "Host not allowed")
             return
 
-        if urlparse(self.path).path != "/api/open-local":
+        route = urlparse(self.path).path
+        if route not in ("/api/open-local", "/api/reveal-transcript"):
             self.send_error(404)
             return
         # application/json cannot be submitted by a cross-origin HTML form;
@@ -703,15 +740,23 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json({"error": "invalid JSON"}, status=400)
             return
         file_id = body.get("file") if isinstance(body, dict) else None
+        if not isinstance(file_id, str) or not file_id:
+            self._send_json({"error": "file must be a string"}, status=400)
+            return
         path_value = body.get("path") if isinstance(body, dict) else None
-        if not isinstance(file_id, str) or not isinstance(path_value, str):
-            self._send_json({"error": "file and path must be strings"}, status=400)
-            return
-        if not path_value or len(path_value) > 8192 or "\x00" in path_value:
-            self._send_json({"error": "invalid path"}, status=400)
-            return
+        if route == "/api/open-local":
+            if not isinstance(path_value, str):
+                self._send_json({"error": "path must be a string"}, status=400)
+                return
+            if not path_value or len(path_value) > 8192 or "\x00" in path_value:
+                self._send_json({"error": "invalid path"}, status=400)
+                return
         try:
-            opened = open_local_file(file_id, path_value)
+            opened = (
+                reveal_transcript_file(file_id)
+                if route == "/api/reveal-transcript"
+                else open_local_file(file_id, path_value)
+            )
         except FileNotFoundError as e:
             self._send_json({"error": str(e)}, status=404)
             return

@@ -189,6 +189,30 @@ async function openLocalFileLink(event, anchor, target) {
   }
 }
 
+// Reveal the transcript's own .jsonl in Finder. Cursor IDE/CLI database
+// sessions have no file on disk, so the button is only rendered for real paths.
+function hasTranscriptFile(file) {
+  return typeof file === "string" && !!file && !/^cursor(db|cli):/.test(file);
+}
+
+async function revealTranscriptFile(button, file) {
+  if (button.dataset.opening === "1") return;
+  button.dataset.opening = "1";
+  try {
+    const res = await fetch("/api/reveal-transcript", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ file }),
+    });
+    const result = await res.json();
+    if (!res.ok || result.error) throw new Error(result.error || `HTTP ${res.status}`);
+  } catch (error) {
+    window.alert("Could not reveal transcript file: " + String(error));
+  } finally {
+    button.dataset.opening = "0";
+  }
+}
+
 function decorateMarkdownLinks(container, data) {
   const cwd = (data.meta || {}).cwd || "";
   $$(".md a", container).forEach((anchor) => {
@@ -792,6 +816,9 @@ function renderTranscript(data, opts = {}) {
   CURRENT_DATA = data;
 
   const meta = data.meta || {};
+  // Parsed sessions carry no path of their own; the id we loaded them by is one
+  // (except for the synthetic Cursor database schemes).
+  const transcriptFile = data.file || CURRENT_FILE;
   const header = el(
     "div",
     { class: "t-header" },
@@ -878,7 +905,15 @@ function renderTranscript(data, opts = {}) {
       typeof meta.source === "string" ? el("span", {}, "source: " + meta.source) : null,
       meta.version ? el("span", {}, "v" + meta.version) : null,
       el("span", {}, data.events.length + " events"),
-      el("span", { class: "session-id", style: "margin:0", title: "Click to copy", onclick: (e) => copyId(e, data.id) }, "id: " + data.id)
+      el("span", { class: "session-id", style: "margin:0", title: "Click to copy", onclick: (e) => copyId(e, data.id) }, "id: " + data.id),
+      hasTranscriptFile(transcriptFile)
+        ? el("button", {
+            class: "reveal-btn",
+            title: "Show the transcript file in Finder: " + transcriptFile,
+            "aria-label": "Show transcript file in Finder",
+            onclick: (e) => revealTranscriptFile(e.currentTarget, transcriptFile),
+          }, "📂")
+        : null
     ),
     el(
       "div",
