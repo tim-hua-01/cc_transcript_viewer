@@ -635,7 +635,11 @@ function appendCopyEvent(lines, ev, branchLabel = "") {
     if (ev.context) lines.push(ev.context);
     lines.push(JSON.stringify(ev.request || {}, null, 2));
   } else if (ev.kind === "guardian_decision") {
-    lines.push([String(ev.outcome || "").toUpperCase(), ev.risk_level, ev.user_authorization].filter(Boolean).join(" · "));
+    lines.push([
+      String(ev.outcome || "").toUpperCase(),
+      ev.risk_level && "risk: " + ev.risk_level,
+      ev.user_authorization && "user authorization: " + ev.user_authorization,
+    ].filter(Boolean).join(" · "));
     if (ev.rationale) lines.push(ev.rationale);
   } else if (ev.kind === "web_search" || ev.kind === "web_call") {
     const queries = ev.action && Array.isArray(ev.action.queries) ? ev.action.queries : [ev.query || ev.action?.query].filter(Boolean);
@@ -1287,13 +1291,29 @@ function renderGuardianRequest(ev) {
   return turnShell("user", "Review input", ev, body);
 }
 
+// Guardian decisions carry bare values like "low"/"high"; label them so the
+// badges say what they measure.
+const GUARDIAN_DECISION_FACTS = [
+  ["risk", "risk_level"],
+  ["user authorization", "user_authorization"],
+];
+
 function renderGuardianDecision(ev) {
   const outcome = ev.outcome === "deny" ? "deny" : "allow";
   const body = [
     el("div", { class: "guardian-decision guardian-" + outcome }, outcome.toUpperCase()),
   ];
-  const facts = [ev.risk_level, ev.user_authorization].filter(Boolean);
-  if (facts.length) body.push(el("div", { class: "guardian-facts" }, facts.map((x) => el("span", { class: "badge" }, x))));
+  const facts = GUARDIAN_DECISION_FACTS.filter(([, key]) => ev[key]);
+  if (facts.length) {
+    body.push(el("div", { class: "guardian-facts" }, facts.map(([label, key]) =>
+      el(
+        "span",
+        { class: "badge guardian-fact" },
+        el("span", { class: "guardian-fact-label" }, label),
+        String(ev[key])
+      )
+    )));
+  }
   if (ev.rationale) body.push(el("div", { class: "guardian-rationale" }, ev.rationale));
   return turnShell("guardian", "Decision", ev, body);
 }

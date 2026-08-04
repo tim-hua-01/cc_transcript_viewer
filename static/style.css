@@ -686,6 +686,9 @@ body.outline-collapsed #nav-buttons { right: 24px; }
   padding: 1px 6px; border-radius: 4px; background: var(--bg-elev); color: var(--muted);
 }
 .guardian-facts { display: flex; gap: 6px; flex-wrap: wrap; margin: 4px 0 8px; }
+.guardian-fact { font-weight: 600; }
+.guardian-fact-label { font-weight: 400; color: var(--muted); }
+.guardian-fact-label::after { content: ": "; }
 .guardian-justification, .guardian-rationale { margin: 8px 0; }
 .guardian-decision { width: fit-content; font-size: 12px; font-weight: 700; padding: 3px 8px; border-radius: 5px; }
 .guardian-allow { color: var(--tool); background: rgba(31,122,69,.09); border: 1px solid rgba(31,122,69,.24); }
