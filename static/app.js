@@ -644,6 +644,7 @@ function appendCopyEvent(lines, ev, branchLabel = "") {
   } else if (ev.kind === "web_search" || ev.kind === "web_call") {
     const queries = ev.action && Array.isArray(ev.action.queries) ? ev.action.queries : [ev.query || ev.action?.query].filter(Boolean);
     lines.push(...queries);
+    for (const hit of ev.results || []) lines.push("- " + [hit.title, hit.url].filter(Boolean).join(" — "));
   } else if (ev.kind === "attachment") {
     const name = ev.display_path || ev.filename;
     if (name) lines.push(name);
@@ -1596,15 +1597,32 @@ function renderWebSearch(ev) {
   const ul = el("ul", { class: "query-list" });
   for (const q of queries) ul.append(el("li", {}, q));
 
-  block.append(
-    head,
-    el("div", { class: "tool-body" },
-      el("div", { class: "tool-section-label" }, queries.length > 1 ? "Queries" : "Query"),
-      queries.length ? ul : preFrom("(no query recorded)", "payload"),
-      el("div", { class: "attach-meta", style: "margin-top:8px;font-style:italic" },
-        "Codex records only the search queries, not the results returned.")
-    )
+  // Newer Codex builds record the hits alongside the query; older ones don't.
+  const results = Array.isArray(ev.results) ? ev.results : [];
+  const body = el("div", { class: "tool-body" },
+    el("div", { class: "tool-section-label" }, queries.length > 1 ? "Queries" : "Query"),
+    queries.length ? ul : preFrom("(no query recorded)", "payload")
   );
+  if (results.length) {
+    body.append(el("div", { class: "tool-section-label" }, "Results"));
+    const list = el("ul", { class: "result-list" });
+    for (const hit of results) {
+      const title = hit.title || hit.url || "(untitled result)";
+      const url = /^https?:\/\//i.test(hit.url || "") ? hit.url : "";
+      list.append(el("li", {},
+        url
+          ? el("a", { class: "result-title", href: url, target: "_blank", rel: "noreferrer noopener" }, title)
+          : el("span", { class: "result-title" }, title),
+        hit.domain ? el("span", { class: "result-domain" }, hit.domain) : null,
+        hit.snippet ? el("div", { class: "result-snippet" }, hit.snippet) : null
+      ));
+    }
+    body.append(list);
+  } else {
+    body.append(el("div", { class: "attach-meta", style: "margin-top:8px;font-style:italic" },
+      "Codex records only the search queries, not the results returned."));
+  }
+  block.append(head, body);
   return block;
 }
 

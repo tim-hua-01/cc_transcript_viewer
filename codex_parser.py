@@ -310,6 +310,17 @@ def _extract_text_content(content) -> str:
     return ""
 
 
+def _completed_item(payload: dict) -> dict:
+    """The `item` of an `item_completed` event, or {}.
+
+    Codex 0.147 replaced the flat `user_message`/`agent_message`/`agent_reasoning`
+    events with one `item_completed` event carrying a typed item."""
+    if payload.get("type") != "item_completed":
+        return {}
+    item = payload.get("item")
+    return item if isinstance(item, dict) else {}
+
+
 def _instruction_label(role: str, text: str) -> str:
     """Human label for an injected instruction/context message."""
     head = (text or "").lstrip()
@@ -344,6 +355,11 @@ def _first_user_message(records: list[dict]) -> str:
         payload = rec.get("payload") or {}
         if payload.get("type") == "user_message" and payload.get("message"):
             return common.short_title(str(payload["message"]))
+        item = _completed_item(payload)
+        if item.get("type") == "UserMessage":
+            text = _extract_text_content(item.get("content"))
+            if text:
+                return common.short_title(text)
     return ""
 
 
@@ -554,6 +570,16 @@ def _session_summary_uncached(path: Path, thread_row: dict | None = None) -> dic
                 n_reasoning += 1
             elif pt == "web_search_end":
                 n_web += 1
+            elif pt == "item_completed":
+                # Reasoning items are skipped: the mirrored response_item is
+                # already counted below.
+                it = _completed_item(payload).get("type")
+                if it == "UserMessage":
+                    n_user += 1
+                elif it == "AgentMessage":
+                    n_assistant += 1
+                elif it == "Extension":
+                    n_web += 1
         elif typ == "response_item":
             pt = payload.get("type")
             if pt in {"function_call", "custom_tool_call"}:
@@ -565,7 +591,9 @@ def _session_summary_uncached(path: Path, thread_row: dict | None = None) -> dic
 
     st = common.safe_stat(path)
     row = thread_row or {}
-    title = _first_user_message(records) or row.get("title") or row.get("preview") or "(untitled session)"
+    title = _first_user_message(records) or common.short_title(
+        row.get("title") or row.get("preview") or ""
+    ) or "(untitled session)"
     cwd = row.get("cwd") or meta.get("cwd") or ""
     updated_ms = row.get("updated_at_ms") or (row.get("updated_at") * 1000 if row.get("updated_at") else None)
     created_ms = row.get("created_at_ms") or (row.get("created_at") * 1000 if row.get("created_at") else None)
@@ -703,6 +731,25 @@ def _tool_summary(name: str, args) -> str:
         key = next(iter(args))
         return f"{key}: {str(args[key]).splitlines()[0][:160]}"
     return ""
+
+
+def _web_results(results) -> list[dict]:
+    """Search hits from an `Extension`/web.search item, trimmed for display."""
+    out = []
+    if not isinstance(results, list):
+        return out
+    for hit in results:
+        if not isinstance(hit, dict):
+            continue
+        out.append(
+            {
+                "title": hit.get("title") or "",
+                "url": hit.get("url") or "",
+                "domain": hit.get("domain") or "",
+                "snippet": hit.get("snippet") or "",
+            }
+        )
+    return out
 
 
 def _event_payload(kind: str, ts: str | None, payload: dict) -> dict:
@@ -887,6 +934,10 @@ def parse_session(path: Path) -> dict:
             msg = payload.get("message")
             if msg:
                 user_event_texts.add(" ".join(str(msg).split()))
+        elif _completed_item(payload).get("type") == "UserMessage":
+            msg = _extract_text_content(_completed_item(payload).get("content"))
+            if msg:
+                user_event_texts.add(" ".join(msg.split()))
         elif rec.get("type") == "turn_context":
             turn_id = payload.get("turn_id")
             if turn_id:
@@ -953,7 +1004,7 @@ def parse_session(path: Path) -> dict:
 
     row = _read_thread_rows().get(str(path))
     if row:
-        title = row.get("title") or row.get("preview") or ""
+        title = common.short_title(row.get("title") or row.get("preview") or "")
         meta.update(
             {
                 "cwd": row.get("cwd") or meta.get("cwd"),
@@ -989,6 +1040,63 @@ def parse_session(path: Path) -> dict:
                 {
                     "text": text,
                     "has_encrypted": has_encrypted,
+                },
+            )
+        )
+
+    def append_user(ts: str | None, text: str, source: dict) -> None:
+        """A real user prompt. `source` is the flat payload or the typed item;
+        both carry the same optional image/attachment fields."""
+        request = _guardian_request(text) if is_guardian else None
+        if request is not None:
+            events.append(
+                _event_payload("guardian_request", ts, {"request": request, "context": text})
+            )
+            return
+        key = " ".join(text.split())
+        fallback_groups = user_image_fallbacks.get(key) or []
+        fallback_images = fallback_groups.pop(0) if fallback_groups else []
+        local_paths = source.get("local_images") or []
+        images = []
+        unavailable_paths = []
+        if local_paths:
+            for i, local_path in enumerate(local_paths):
+                local = _local_image_payload(local_path)
+                if local:
+                    images.append(local)
+                elif i < len(fallback_images):
+                    images.append(fallback_images[i])
+                else:
+                    unavailable_paths.append(local_path)
+            images.extend(fallback_images[len(local_paths):])
+        else:
+            images = _safe_images(source.get("images") or []) or fallback_images
+        events.append(
+            _event_payload(
+                "user",
+                ts,
+                {
+                    "text": text,
+                    "images": images,
+                    "local_images": unavailable_paths,
+                    "text_elements": source.get("text_elements") or [],
+                },
+            )
+        )
+
+    def append_assistant(ts: str | None, text: str, source: dict) -> None:
+        decision = _guardian_decision(text) if is_guardian else None
+        if decision is not None:
+            events.append(_event_payload("guardian_decision", ts, decision))
+            return
+        events.append(
+            _event_payload(
+                "assistant",
+                ts,
+                {
+                    "text": text,
+                    "phase": source.get("phase"),
+                    "memory_citation": source.get("memory_citation"),
                 },
             )
         )
@@ -1078,67 +1186,43 @@ def parse_session(path: Path) -> dict:
         if typ == "event_msg":
             pt = payload.get("type")
             if pt == "user_message":
-                text = payload.get("message") or ""
-                request = _guardian_request(text) if is_guardian else None
-                if request is not None:
-                    events.append(
-                        _event_payload(
-                            "guardian_request",
-                            ts,
-                            {"request": request, "context": text},
-                        )
-                    )
-                else:
-                    key = " ".join(text.split())
-                    fallback_groups = user_image_fallbacks.get(key) or []
-                    fallback_images = fallback_groups.pop(0) if fallback_groups else []
-                    local_paths = payload.get("local_images") or []
-                    images = []
-                    unavailable_paths = []
-                    if local_paths:
-                        for i, local_path in enumerate(local_paths):
-                            local = _local_image_payload(local_path)
-                            if local:
-                                images.append(local)
-                            elif i < len(fallback_images):
-                                images.append(fallback_images[i])
-                            else:
-                                unavailable_paths.append(local_path)
-                        images.extend(fallback_images[len(local_paths):])
-                    else:
-                        images = _safe_images(payload.get("images") or []) or fallback_images
-                    events.append(
-                        _event_payload(
-                            "user",
-                            ts,
-                            {
-                                "text": text,
-                                "images": images,
-                                "local_images": unavailable_paths,
-                                "text_elements": payload.get("text_elements") or [],
-                            },
-                        )
-                    )
+                append_user(ts, payload.get("message") or "", payload)
             elif pt == "agent_message":
-                text = payload.get("message") or ""
-                decision = _guardian_decision(text) if is_guardian else None
-                if decision is not None:
-                    events.append(_event_payload("guardian_decision", ts, decision))
-                else:
-                    events.append(
-                        _event_payload(
-                            "assistant",
-                            ts,
-                            {
-                                "text": text,
-                                "phase": payload.get("phase"),
-                                "memory_citation": payload.get("memory_citation"),
-                            },
-                        )
-                    )
+                append_assistant(ts, payload.get("message") or "", payload)
             elif pt == "agent_reasoning":
                 if record_index not in mirrored_reasoning_records:
                     append_reasoning(ts, payload.get("text") or "", False)
+            elif pt == "item_completed":
+                # Codex 0.147+ envelope. Only the record types that have no
+                # response_item equivalent are read here: CommandExecution and
+                # FileChange mirror tool calls, ContextCompaction mirrors the
+                # `compacted` record, and emitting them would duplicate blocks.
+                item = _completed_item(payload)
+                it = item.get("type")
+                if it == "UserMessage":
+                    append_user(ts, _extract_text_content(item.get("content")), item)
+                elif it == "AgentMessage":
+                    append_assistant(ts, _extract_text_content(item.get("content")), item)
+                elif it == "Reasoning":
+                    append_reasoning(
+                        ts,
+                        _summary_text(item.get("summary_text"))
+                        or _extract_text_content(item.get("raw_content")),
+                        bool(item.get("encrypted_content")),
+                    )
+                elif it == "Extension" and item.get("kind") == "web.search":
+                    events.append(
+                        _event_payload(
+                            "web_search",
+                            ts,
+                            {
+                                "call_id": item.get("id"),
+                                "query": item.get("query"),
+                                "action": item.get("action") or {},
+                                "results": _web_results(item.get("results")),
+                            },
+                        )
+                    )
             elif pt == "task_started":
                 ctx = turn_contexts.get(payload.get("turn_id"), {})
                 events.append(

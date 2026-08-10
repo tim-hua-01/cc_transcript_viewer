@@ -854,6 +854,11 @@ body.show-tokens .token-event { display: block; }
 
 .query-list { margin: 0; padding-left: 18px; font-family: var(--mono); font-size: 12px; }
 .query-list li { margin: 2px 0; word-break: break-word; }
+.result-list { margin: 0; padding-left: 18px; font-size: 12px; }
+.result-list li { margin: 6px 0; word-break: break-word; }
+.result-title { font-weight: 600; }
+.result-domain { margin-left: 6px; color: var(--muted); font-family: var(--mono); font-size: 11px; }
+.result-snippet { color: var(--muted); margin-top: 2px; }
 
 /* Codex apply_patch / changes diff rendering */
 pre.payload.diff { padding: 0; }

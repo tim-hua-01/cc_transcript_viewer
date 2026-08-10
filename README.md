@@ -198,11 +198,19 @@ the default bind is loopback.
   This doesn't backfill old transcripts. Encrypted-only reasoning records contain no displayable
   text and are omitted; readable duplicates (written as both `event_msg/agent_reasoning` and
   `response_item/reasoning.summary`) are grouped and deduped.
-- **Web search results aren't stored.** Codex records only the search *queries* it issued (the viewer
-  lists all of them); the fetched pages are sent to the model but never written to the rollout. The
-  findings survive only as the assistant's prose, with citation links.
+- **Two rollout formats.** Codex 0.147 replaced the flat `event_msg/user_message`,
+  `agent_message`, and `agent_reasoning` events with a single `event_msg/item_completed`
+  event carrying a typed `item` (`UserMessage`, `AgentMessage`, `Reasoning`, `Extension`,
+  `CommandExecution`, `FileChange`, `ContextCompaction`). The viewer reads both shapes. Only
+  the items with no `response_item` equivalent are rendered from the new envelope; command
+  executions, file changes, and compactions are read from their canonical records so blocks
+  aren't duplicated.
+- **Web search results.** Older rollouts record only the search *queries* Codex issued (the viewer
+  lists all of them) and the findings survive just as the assistant's prose. Newer rollouts store
+  the hits themselves in an `Extension`/`web.search` item, and the viewer lists title, domain, and
+  snippet per result.
 - **Images.** Codex may record a prompt image twice: as an embedded `input_image` data URL in a
-  `response_item/message`, and as a path in the corresponding `event_msg/user_message`'s
+  `response_item/message`, and as a path in the corresponding user-message event's
   `local_images` list. The viewer correlates those records, prefers the original file through
   `/api/local-image`, and falls back to the embedded data URL if the file is gone. `view_image` uses
   the same local-file-first behavior. The parser also reads `~/.codex/state_5.sqlite` for thread
