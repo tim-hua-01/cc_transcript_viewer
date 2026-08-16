@@ -1262,10 +1262,12 @@ function renderAssistant(ev) {
     if (ev.turn_metadata) body.push(renderTurnMetadata(ev.turn_metadata));
     return turnShell("assistant", agentLabel(CURRENT_AGENT), ev, body);
   }
-  // Codex shape (flat text; reasoning/tools are separate events)
+  // Codex shape (flat text; reasoning/tools are separate events). An exported
+  // Cursor/opencode rollout parses as Codex but belongs to the tool it came
+  // from, so name the turn after the session's agent rather than hardcoding it.
   const body = [el("div", { class: "md", html: md(ev.text || "") })];
   if (ev.turn_metadata) body.push(renderTurnMetadata(ev.turn_metadata));
-  return turnShell("assistant", "Codex", ev, body);
+  return turnShell("assistant", agentLabel(CURRENT_AGENT), ev, body);
 }
 
 function renderTurnMetadata(metadata, label = "Turn metadata") {

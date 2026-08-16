@@ -44,10 +44,17 @@ import json
 import re
 import sqlite3
 import sys
-from datetime import datetime, timezone
 from pathlib import Path
 
 import cursor_binary
+from codex_rollout import (
+    as_text as _as_text,
+    iso as _iso,
+    line as _line,
+    output_path,
+    rollout_filename,
+    write_rollout,
+)
 
 DEFAULT_DB_PATH = (
     Path.home()
@@ -214,14 +221,6 @@ def _split_call_id(raw) -> tuple[str, str]:
     return call_id.strip(), item_id.strip()
 
 
-def _as_text(value) -> str:
-    if value is None:
-        return ""
-    if isinstance(value, str):
-        return value
-    return json.dumps(value, ensure_ascii=False)
-
-
 def _image_data_url(image) -> str | None:
     """Cursor stores pasted images as ``{__type: Uint8Array, hex: …}``."""
     if isinstance(image, str):
@@ -242,19 +241,6 @@ def _image_data_url(image) -> str | None:
         value = image.get(key)
         if isinstance(value, str) and value:
             return value if value.startswith("data:") else f"data:image/png;base64,{value}"
-    return None
-
-
-# ---------------------------------------------------------------------------
-# Timestamps
-# ---------------------------------------------------------------------------
-def _iso(value) -> str | None:
-    """Cursor mixes epoch-ms (composer) and ISO strings (bubble headers)."""
-    if isinstance(value, str) and value:
-        return value
-    if isinstance(value, (int, float)) and value > 0:
-        stamp = datetime.fromtimestamp(value / 1000, tz=timezone.utc)
-        return stamp.isoformat(timespec="milliseconds").replace("+00:00", "Z")
     return None
 
 
@@ -317,10 +303,6 @@ def _message_times(messages: list[dict], composer: dict, start: str) -> list[str
 # ---------------------------------------------------------------------------
 # Conversion
 # ---------------------------------------------------------------------------
-def _line(kind: str, timestamp: str, payload: dict) -> dict:
-    return {"timestamp": timestamp, "type": kind, "payload": payload}
-
-
 def _user_payload(message: dict) -> dict:
     content = []
     for block in _blocks(message):
@@ -542,23 +524,6 @@ def build_rollout(
 # ---------------------------------------------------------------------------
 # Export
 # ---------------------------------------------------------------------------
-def rollout_filename(composer_id: str, start: str) -> str:
-    """``rollout-<local-time>-<id>.jsonl``, matching Codex's own naming."""
-    try:
-        stamp = datetime.fromisoformat((start or "").replace("Z", "+00:00")).astimezone()
-    except ValueError:
-        stamp = datetime.now().astimezone()
-    return f"rollout-{stamp.strftime('%Y-%m-%dT%H-%M-%S')}-{composer_id}.jsonl"
-
-
-def output_path(out_dir: Path, composer_id: str, start: str, layout: str) -> Path:
-    name = rollout_filename(composer_id, start)
-    if layout == "flat":
-        return out_dir / name
-    stamp = name[len("rollout-") : len("rollout-") + 10]
-    return out_dir / stamp[:4] / stamp[5:7] / stamp[8:10] / name
-
-
 def select_sessions(
     conn: sqlite3.Connection, *, model_regex: str | None, session_ids: set[str] | None
 ) -> list[tuple[str, dict]]:
@@ -617,13 +582,6 @@ def export_session(
         "dropped_turns": max(0, bubble_turns - prompts),
     }
     return lines, report
-
-
-def write_rollout(path: Path, lines: list[dict]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as fh:
-        for line in lines:
-            fh.write(json.dumps(line, ensure_ascii=False) + "\n")
 
 
 # ---------------------------------------------------------------------------

@@ -270,6 +270,40 @@ newer composers and carried forward otherwise. Non-GPT models store an opaque si
 an OpenAI reasoning item; `--all-models` exports them anyway, putting that string in
 `encrypted_content`.
 
+## Exporting opencode sessions as Codex rollouts
+
+`opencode_to_codex.py` does the same for opencode. opencode's own database already holds a complete
+transcript, so unlike the Cursor exporter this is a format conversion rather than a recovery
+operation — what it buys you is that Codex-aware tooling can read the session, and that the
+provider's **encrypted reasoning travels with it**:
+
+```bash
+python3 opencode_to_codex.py --list                       # sessions + their reasoning format
+python3 opencode_to_codex.py --out ~/opencode-rollouts    # YYYY/MM/DD/rollout-<time>-<id>.jsonl
+python3 opencode_to_codex.py --session <session-id> --out -    # one session to stdout
+python3 opencode_to_codex.py --with-encrypted --out DIR   # only sessions that carry blobs
+```
+
+The reasoning sits inline on the part, in `metadata.<providerID>.reasoning_details`: alongside the
+token-by-token summary fragments is a `reasoning.encrypted` entry with an `rs_…` id and opaque
+`data`. That maps 1:1 onto a Codex `reasoning` response_item — `summary[0].summary_text` plus
+`encrypted_content` — with no blob chain to chase, unlike Cursor.
+
+**The blobs are not necessarily OpenAI's.** Codex rollouts carry OpenAI Responses-API reasoning
+items, but opencode records whatever its provider returned and stamps the shape in `format`. Grok
+through OpenRouter writes `xai-responses-v1`: a faithful record, but *not* replayable against the
+OpenAI Responses API. The formats found are printed on export and stored in
+`session_meta.opencode.reasoning_formats` so an export can't be mistaken for an OpenAI-replayable
+one.
+
+Mapping: the session → `session_meta`; each user turn → `turn_context` + `message` + a
+`user_message` mirror; assistant text → `message` + an `agent_message` mirror; each tool part →
+`function_call` **and** `function_call_output`, since opencode fuses the call and its result into
+one record where Codex keeps two. Tool names and arguments stay opencode's own (`read`/`filePath`)
+rather than being renamed. Every part carries its own clock, so timestamps are exact rather than
+inferred. A call with no result (interrupted, or still running) emits the call alone and is
+reported.
+
 ## Requirements
 
 - **Python 3.9+** (standard library only — no `pip install` needed).
@@ -316,10 +350,13 @@ Restart Claude Code (or run `/config` once) for the change to take effect. Note 
 | `cursor_parser.py` | Cursor parsing library: reads IDE `state.vscdb`; reads CLI `~/.cursor/chats/.../store.db` (with JSONL fallback under `agent-transcripts`); normalizes tool names/inputs; reconstructs IDE `edit_file` diffs; decodes grep/glob results out of Cursor's binary protobuf tool records (`toolCallBinary`) since newer Cursor versions no longer store them as JSON; emits Claude-shaped events. IDE uses `cursordb:<id>`; CLI store uses `cursorcli:<id>`. Call `configure(db_path, projects_dir=…, chats_dir=…)` to retarget. |
 | `cursor_binary.py` | Decoder for Cursor's `toolCallBinary` protobuf records (wire-format only, no schema/dependency): exact grep and glob result reconstruction, plus a generic best-effort string recovery for any other completed call whose result was never written to JSON (e.g. `await`). |
 | `opencode_parser.py` | opencode parsing library: reads the single SQLite database at `~/.local/share/opencode/opencode.db` (`session` / `message` / `part` tables), folds each message's parts into block-shaped events, attaches each tool part's own result, renames opencode's camelCase tool arguments onto the canonical names, links `task` calls to the sub-agent session they spawned, flags thinking whose real reasoning came back encrypted, and drops the per-token provider `reasoning_details` noise. Sessions are addressed as `opencode:<id>`; the list cache is keyed on the database *and* its write-ahead log, so a live session is not served stale. Call `configure(db_path)` to retarget. |
+| `opencode_to_codex.py` | Exports opencode sessions as Codex rollout JSONL, carrying the provider's encrypted reasoning (`reasoning.encrypted` → `encrypted_content`) and splitting opencode's fused tool record into Codex's separate `function_call` / `function_call_output`. Records the provider's reasoning `format` so a non-OpenAI blob isn't mistaken for a replayable one. |
+| `codex_rollout.py` | The parts of writing a Codex rollout that aren't specific to any source — record shape, `rollout-<time>-<id>.jsonl` naming, dated output layout — shared by both exporters so they can't drift. |
 | `common.py` | Helpers shared by the parsers: JSONL iteration, title truncation, timestamp conversion, and the thread-safe fingerprint-keyed `SummaryCache` all of them use. |
 | `event_schema.py` | The written-down (and machine-checked) event contract between the parsers and the frontend: every event kind, both message shapes, and validators the test suite runs over every parser's output. |
 | `static/index.html`, `static/style.css`, `static/app.js` | The single frontend (vanilla JS, no build step). `app.js` dispatches on event kind and renders the Claude Code / Cursor / opencode (block-based) and Codex (flat) shapes, and runs the always-on live-refresh poll loop. CDN assets (marked, DOMPurify, KaTeX) are version-pinned with SRI integrity hashes. |
 | `test_security.py` | Zero-dependency security tests (`python3 -m unittest test_security`): asserts no outbound connections at runtime, no network-client imports, loopback default bind, the `Host`-header rebinding guard, that `/api/session` is confined to the transcript roots while `/api/local-image` serves images only, and that every CDN asset is version-pinned and SRI-hashed. |
+| `test_opencode_to_codex.py` | Tests for the opencode exporter: encrypted reasoning survives, the fused tool record splits into two, timestamps come from the parts' own clocks, and the output reparses through `codex_parser` as a valid `opencode`-labelled session. |
 | `test_parsers.py` | Characterization tests for the parser internals: branch folding, the Codex JS-literal orchestration parser, Cursor blob/JSON extraction and diff reconstruction, queued prompts with images, and opencode's
 part→event mapping (argument renaming, tool states, sub-agent linkage, provider-noise stripping). |
 | `test_event_schema.py` | Conformance tests: every parser's summaries and full parses must satisfy `event_schema.py`, and `app.js` must dispatch on every declared kind. |

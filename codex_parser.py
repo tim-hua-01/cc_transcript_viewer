@@ -357,12 +357,14 @@ def _thread_id_from_path(path: Path) -> str:
 
 
 def _agent_label(meta: dict, thread_row: dict | None = None) -> str:
-    """Cursor-to-Codex JSONL still parses as Codex, but label it Cursor in the UI."""
+    """An exported rollout still parses as Codex; label it by where it came from."""
     row = thread_row or {}
     originator = str(row.get("originator") or meta.get("originator") or "")
     source = row.get("source") or meta.get("source") or ""
     if originator == "cursor-ide" or source == "cursor":
         return "cursor"
+    if originator == "opencode" or source == "opencode":
+        return "opencode"
     return "codex"
 
 

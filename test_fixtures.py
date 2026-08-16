@@ -389,22 +389,25 @@ def _write_opencode_db(db_path: Path) -> tuple[str, str]:
     ]}}
     part("prt_p2b", "msg_p2", parent_id, {
         "type": "reasoning", "text": "Need to look around first.",
-        "time": {"start": 1, "end": 2}, "metadata": token_noise})
-    part("prt_p2c", "msg_p2", parent_id, {"type": "text", "text": "Looking around."})
+        "time": {"start": 1_700_000_000_250, "end": 1_700_000_000_290},
+        "metadata": token_noise})
+    part("prt_p2c", "msg_p2", parent_id, {
+        "type": "text", "text": "Looking around.",
+        "time": {"start": 1_700_000_000_295, "end": 1_700_000_000_299}})
     part("prt_p2d", "msg_p2", parent_id, {
         "type": "tool", "tool": "read", "callID": "call-1",
         "state": {"status": "completed", "title": "main.py",
                   "input": {"filePath": "/tmp/proj/main.py", "offset": 1, "limit": 20},
                   "output": "<path>/tmp/proj/main.py</path>",
                   "metadata": {"preview": "1: x = 1", "truncated": False},
-                  "time": {"start": 1, "end": 2}},
+                  "time": {"start": 1_700_000_000_300, "end": 1_700_000_000_350}},
         "metadata": token_noise})
     part("prt_p2e", "msg_p2", parent_id, {
         "type": "tool", "tool": "edit", "callID": "call-2",
         "state": {"status": "error", "error": "oldString not found",
                   "input": {"filePath": "/tmp/proj/main.py", "oldString": "a",
                             "newString": "b", "replaceAll": True},
-                  "time": {"start": 1, "end": 2}}})
+                  "time": {"start": 1_700_000_000_360, "end": 1_700_000_000_370}}})
     part("prt_p2f", "msg_p2", parent_id, {
         "type": "tool", "tool": "task", "callID": "call-3",
         "state": {"status": "completed", "title": "Explore repo",
@@ -412,7 +415,7 @@ def _write_opencode_db(db_path: Path) -> tuple[str, str]:
                             "prompt": "look at everything"},
                   "output": f'<task id="{child_id}" state="completed">done</task>',
                   "metadata": {"parentSessionId": parent_id, "sessionId": child_id},
-                  "time": {"start": 1, "end": 2}}})
+                  "time": {"start": 1_700_000_000_380, "end": 1_700_000_000_390}}})
     part("prt_p2g", "msg_p2", parent_id, {
         "type": "tool", "tool": "grep", "callID": "call-4",
         "state": {"status": "pending", "input": {}, "raw": ""}})
