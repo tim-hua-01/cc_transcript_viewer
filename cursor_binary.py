@@ -274,3 +274,35 @@ def generic_result_text(tf: dict) -> str:
     if len(lines) > _GENERIC_MAX_LINES:
         lines = lines[:_GENERIC_MAX_LINES] + [f"… ({len(lines) - _GENERIC_MAX_LINES} more lines)"]
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Conversation state (agentKv blob chain)
+# ---------------------------------------------------------------------------
+def conversation_state_hashes(state: str) -> list[str]:
+    """Blob hashes from ``composerData.conversationState``, in message order.
+
+    Cursor keeps the exact provider-format message array (the one it sends to
+    the model, complete with OpenAI ``encrypted_content`` reasoning items) out
+    of line: the composer stores only a protobuf whose repeated field 1 holds
+    one 32-byte sha256 per message, each addressing an ``agentKv:blob:<hex>``
+    row in the same ``cursorDiskKV`` table. The value is base64, prefixed with
+    a literal ``~``.
+    """
+    if not isinstance(state, str) or not state:
+        return []
+    if state.startswith("~"):
+        state = state[1:]
+    try:
+        raw = base64.b64decode(state)
+    except (binascii.Error, ValueError):
+        return []
+    try:
+        fields = _pb_fields(raw)
+    except ValueError:
+        return []
+    return [
+        val.hex()
+        for field, wire, val in fields
+        if field == 1 and wire == 2 and isinstance(val, bytes) and len(val) == 32
+    ]

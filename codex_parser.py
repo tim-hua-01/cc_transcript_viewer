@@ -356,6 +356,16 @@ def _thread_id_from_path(path: Path) -> str:
     return stem
 
 
+def _agent_label(meta: dict, thread_row: dict | None = None) -> str:
+    """Cursor-to-Codex JSONL still parses as Codex, but label it Cursor in the UI."""
+    row = thread_row or {}
+    originator = str(row.get("originator") or meta.get("originator") or "")
+    source = row.get("source") or meta.get("source") or ""
+    if originator == "cursor-ide" or source == "cursor":
+        return "cursor"
+    return "codex"
+
+
 def _subagent_fields(meta: dict) -> dict:
     """Normalize Codex subagent identity and parent linkage from session_meta."""
     source = meta.get("source")
@@ -577,7 +587,7 @@ def _session_summary_uncached(path: Path, thread_row: dict | None = None) -> dic
         title = common.short_title(f"[{subagent_fields['subagent_type']}] {title}")
 
     summary = {
-        "agent": "codex",
+        "agent": _agent_label(meta, row),
         "id": row.get("id") or meta.get("id") or _thread_id_from_path(path),
         "file": str(path),
         "title": title,
@@ -1295,7 +1305,7 @@ def parse_session(path: Path) -> dict:
     meta.pop("base_instructions", None)  # surfaced as an instructions event instead
 
     data = {
-        "agent": "codex",
+        "agent": _agent_label(meta),
         "id": meta.get("id") or _thread_id_from_path(path),
         "title": title or "(untitled session)",
         "meta": meta,

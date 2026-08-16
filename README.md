@@ -232,6 +232,37 @@ Cursor has two product surfaces with different canonical stores; the viewer read
   old/new strings directly in the tool call.
 - **Thinking** where recorded (IDE bubble thinking text; CLI `reasoning` blocks — often signature-only).
 
+## Exporting Cursor GPT sessions as Codex rollouts
+
+`cursor_to_codex.py` converts Cursor's GPT conversations into the Codex rollout JSONL format
+(`~/.codex/sessions/**/rollout-*.jsonl`), so Cursor turns can be read — or replayed — by anything
+that already speaks Codex:
+
+```bash
+python3 cursor_to_codex.py --list                     # matching sessions, one per line
+python3 cursor_to_codex.py --out ~/cursor-rollouts    # YYYY/MM/DD/rollout-<time>-<id>.jsonl
+python3 cursor_to_codex.py --session <composer-id> --out -   # one session to stdout
+```
+
+The rendered bubbles are *not* the source here. Cursor also keeps the exact provider-format message
+array it sends to OpenAI, content-addressed: `composerData:<id>.conversationState` is a protobuf of
+32-byte sha256s, each addressing an `agentKv:blob:<sha256>` row holding one message. In those blobs
+reasoning is intact — the `rs_…` id and the `gAAAAA…` `encrypted_content` live in a JSON-encoded
+`signature` (the bubbles' `thinking.signature` is always empty) — so `response_item` reasoning
+records come out with a real `summary` *and* `encrypted_content`.
+
+Mapping: Cursor's system prompt → `session_meta.base_instructions`; each prompt → `turn_context` +
+`message` + a `user_message` mirror; `tool-call` → `function_call` (Cursor's `call_…\nfc_…` id is
+split into `call_id`/`id`); `tool-result` → `function_call_output`. Tool *names* stay Cursor's
+(`ReadFile`, `ApplyPatch`, …) rather than being renamed to Codex's.
+
+Caveats: `conversationState` is the live context window, so a compacted thread has lost its oldest
+turns there (the export prints how many; the bubbles still have that text, minus the encrypted
+reasoning). Only bubbles carry timestamps, so times are exact for prompts and for tool calls in
+newer composers and carried forward otherwise. Non-GPT models store an opaque signature instead of
+an OpenAI reasoning item; `--all-models` exports them anyway, putting that string in
+`encrypted_content`.
+
 ## Requirements
 
 - **Python 3.9+** (standard library only — no `pip install` needed).
