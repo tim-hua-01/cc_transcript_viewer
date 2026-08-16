@@ -32,6 +32,7 @@ import server
 import claude_parser as claude
 import codex_parser as codex
 import cursor_parser as cursor
+import opencode_parser as opencode
 
 
 # --------------------------------------------------------------------------- #
@@ -64,6 +65,7 @@ from test_fixtures import (
     _write_cli_store,
     _write_fixture_session,
     _write_guardian_sessions,
+    _write_opencode_db,
 )
 
 
@@ -125,6 +127,10 @@ class SecurityTest(unittest.TestCase):
             projects_dir=cls.cursor_projects,
             chats_dir=cls.cursor_chats,
         )
+        cls._old_opencode_db = opencode.DB_PATH
+        cls.opencode_db = tmp / "opencode" / "opencode.db"
+        cls.opencode_parent, cls.opencode_child = _write_opencode_db(cls.opencode_db)
+        opencode.configure(cls.opencode_db)
 
         # Install the outbound-connection guard for the whole class.
         socket.socket.connect = _guard(_real_connect)
@@ -144,6 +150,7 @@ class SecurityTest(unittest.TestCase):
         socket.socket.connect = _real_connect
         socket.socket.connect_ex = _real_connect_ex
         server.CACHE_FILE = cls._old_cache_file
+        opencode.configure(cls._old_opencode_db)
         cls._tmp.cleanup()
 
     def get(self, path: str):

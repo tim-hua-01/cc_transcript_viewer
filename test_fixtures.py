@@ -297,3 +297,153 @@ def _write_guardian_sessions(codex_home: Path) -> tuple[Path, Path, Path]:
     parent.write_text("\n".join(json.dumps(r) for r in parent_records) + "\n")
     guardian.write_text("\n".join(json.dumps(r) for r in guardian_records) + "\n")
     return parent, guardian, image
+
+
+def _write_opencode_db(db_path: Path) -> tuple[str, str]:
+    """A minimal opencode.db holding a parent session and its `task` sub-agent.
+
+    Covers every part type the parser has a branch for — text, reasoning, tool
+    (completed / error / pending), file, synthetic text, subtask, compaction,
+    retry, patch and step-finish — so schema conformance is exercised end to
+    end. Returns the (parent, sub-agent) session ids.
+    """
+    parent_id = "ses_parent000000000000000000"
+    child_id = "ses_child0000000000000000000"
+    model = json.dumps({"providerID": "openrouter", "modelID": "x-ai/grok-test"})
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(db_path)
+    conn.executescript(
+        """
+        CREATE TABLE session (
+            id TEXT PRIMARY KEY, project_id TEXT NOT NULL, parent_id TEXT,
+            slug TEXT NOT NULL, directory TEXT NOT NULL, title TEXT NOT NULL,
+            version TEXT NOT NULL, cost REAL DEFAULT 0 NOT NULL, agent TEXT,
+            model TEXT, time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL
+        );
+        CREATE TABLE message (
+            id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
+            time_created INTEGER NOT NULL, data TEXT NOT NULL
+        );
+        CREATE TABLE part (
+            id TEXT PRIMARY KEY, message_id TEXT NOT NULL, session_id TEXT NOT NULL,
+            data TEXT NOT NULL
+        );
+        """
+    )
+    conn.executemany(
+        "INSERT INTO session (id, project_id, parent_id, slug, directory, title, "
+        "version, cost, agent, model, time_created, time_updated) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+        [
+            (parent_id, "proj1", None, "brisk-otter", "/tmp/proj", "Fixture session",
+             "1.18.18", 0.25, "build", model, 1_700_000_000_000, 1_700_000_100_000),
+            # opencode leaves this placeholder title until the model names the
+            # session; the parser must fall back to the first user prompt.
+            (child_id, "proj1", parent_id, "tidy-cactus", "/tmp/proj",
+             "New session - 2026-01-01T00:00:00.000Z", "1.18.18", 0.05, "explore",
+             model, 1_700_000_010_000, 1_700_000_050_000),
+        ],
+    )
+
+    def message(mid, sid, role, created, **extra):
+        data = {"role": role, "time": {"created": created}, **extra}
+        if role == "assistant":
+            data.setdefault("modelID", "x-ai/grok-test")
+            data.setdefault("providerID", "openrouter")
+            data.setdefault("tokens", {"input": 100, "output": 20, "reasoning": 5,
+                                       "cache": {"read": 10, "write": 0}})
+        conn.execute(
+            "INSERT INTO message (id, session_id, time_created, data) VALUES (?,?,?,?)",
+            (mid, sid, created, json.dumps(data)),
+        )
+
+    def part(pid, mid, sid, data):
+        conn.execute(
+            "INSERT INTO part (id, message_id, session_id, data) VALUES (?,?,?,?)",
+            (pid, mid, sid, json.dumps(data)),
+        )
+
+    # --- parent session -----------------------------------------------------
+    message("msg_p1", parent_id, "user", 1_700_000_000_100, agent="build")
+    part("prt_p1a", "msg_p1", parent_id, {"type": "text", "text": "look at the repo"})
+    part("prt_p1b", "msg_p1", parent_id, {
+        "type": "file", "mime": "image/png", "filename": "shot.png",
+        "url": "data:image/png;base64,iVBORw0KGgo=",
+    })
+    part("prt_p1c", "msg_p1", parent_id, {
+        "type": "text", "synthetic": True, "text": "<task>background result</task>"})
+
+    message("msg_p2", parent_id, "assistant", 1_700_000_000_200,
+            cost=0.2, finish="tool-calls", agent="build", variant="high")
+    part("prt_p2a", "msg_p2", parent_id, {"type": "step-start", "snapshot": "abc123"})
+    # Providers hang a token-by-token `reasoning_details` transcript off parts;
+    # it is many times the size of the text and must never reach the viewer.
+    # …and, for models that return one, an opaque `reasoning.encrypted` blob
+    # that makes the visible text a summary rather than the real reasoning.
+    token_noise = {"openrouter": {"reasoning_details": [
+        {"type": "reasoning.summary", "summary": word, "index": 0}
+        for word in ("Need", " to", " look", " around", " first", ".")
+    ] + [
+        {"type": "reasoning.encrypted", "id": "rs_fixture", "index": 1,
+         "format": "xai-responses-v1", "data": "b3BhcXVl"},
+    ]}}
+    part("prt_p2b", "msg_p2", parent_id, {
+        "type": "reasoning", "text": "Need to look around first.",
+        "time": {"start": 1, "end": 2}, "metadata": token_noise})
+    part("prt_p2c", "msg_p2", parent_id, {"type": "text", "text": "Looking around."})
+    part("prt_p2d", "msg_p2", parent_id, {
+        "type": "tool", "tool": "read", "callID": "call-1",
+        "state": {"status": "completed", "title": "main.py",
+                  "input": {"filePath": "/tmp/proj/main.py", "offset": 1, "limit": 20},
+                  "output": "<path>/tmp/proj/main.py</path>",
+                  "metadata": {"preview": "1: x = 1", "truncated": False},
+                  "time": {"start": 1, "end": 2}},
+        "metadata": token_noise})
+    part("prt_p2e", "msg_p2", parent_id, {
+        "type": "tool", "tool": "edit", "callID": "call-2",
+        "state": {"status": "error", "error": "oldString not found",
+                  "input": {"filePath": "/tmp/proj/main.py", "oldString": "a",
+                            "newString": "b", "replaceAll": True},
+                  "time": {"start": 1, "end": 2}}})
+    part("prt_p2f", "msg_p2", parent_id, {
+        "type": "tool", "tool": "task", "callID": "call-3",
+        "state": {"status": "completed", "title": "Explore repo",
+                  "input": {"description": "Explore repo", "subagent_type": "explore",
+                            "prompt": "look at everything"},
+                  "output": f'<task id="{child_id}" state="completed">done</task>',
+                  "metadata": {"parentSessionId": parent_id, "sessionId": child_id},
+                  "time": {"start": 1, "end": 2}}})
+    part("prt_p2g", "msg_p2", parent_id, {
+        "type": "tool", "tool": "grep", "callID": "call-4",
+        "state": {"status": "pending", "input": {}, "raw": ""}})
+    part("prt_p2h", "msg_p2", parent_id, {
+        "type": "patch", "hash": "deadbeef", "files": ["/tmp/proj/main.py"]})
+    part("prt_p2i", "msg_p2", parent_id, {
+        "type": "retry", "attempt": 1, "time": {"created": 1_700_000_000_150},
+        "error": {"name": "APIError", "data": {"message": "429 slow down"}}})
+    part("prt_p2j", "msg_p2", parent_id, {
+        "type": "step-finish", "reason": "tool-calls", "cost": 0.2,
+        "tokens": {"input": 100, "output": 20, "reasoning": 5,
+                   "cache": {"read": 10, "write": 0}}})
+
+    message("msg_p3", parent_id, "user", 1_700_000_000_300, agent="build")
+    part("prt_p3a", "msg_p3", parent_id, {
+        "type": "subtask", "prompt": "review the diff", "description": "Review",
+        "agent": "plan"})
+    part("prt_p3b", "msg_p3", parent_id, {"type": "compaction", "auto": True})
+
+    # An assistant turn that only failed: no blocks, just the error notice.
+    message("msg_p4", parent_id, "assistant", 1_700_000_000_400,
+            error={"name": "ProviderAuthError",
+                   "data": {"message": "Missing Authentication header"}})
+
+    # --- sub-agent session --------------------------------------------------
+    message("msg_c1", child_id, "user", 1_700_000_010_100, agent="explore")
+    part("prt_c1a", "msg_c1", child_id, {"type": "text", "text": "look at everything"})
+    message("msg_c2", child_id, "assistant", 1_700_000_010_200,
+            cost=0.05, finish="stop", agent="explore")
+    part("prt_c2a", "msg_c2", child_id, {"type": "text", "text": "Here is what I found."})
+
+    conn.commit()
+    conn.close()
+    return parent_id, child_id

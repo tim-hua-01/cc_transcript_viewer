@@ -19,11 +19,13 @@ import claude_parser as claude
 import codex_parser as codex
 import cursor_parser as cursor
 import event_schema
+import opencode_parser as opencode
 from test_fixtures import (
     _write_cli_session,
     _write_cli_store,
     _write_fixture_session,
     _write_guardian_sessions,
+    _write_opencode_db,
 )
 
 
@@ -37,6 +39,7 @@ class EventSchemaConformanceTests(unittest.TestCase):
         cls._old_claude = claude.PROJECTS_DIR
         cls._old_codex = codex.CODEX_HOME
         cls._old_cursor = (cursor.DB_PATH, cursor.PROJECTS_DIR, cursor.CHATS_DIR)
+        cls._old_opencode = opencode.DB_PATH
 
         cls.projects_dir = tmp / "projects"
         cls.projects_dir.mkdir()
@@ -88,19 +91,24 @@ class EventSchemaConformanceTests(unittest.TestCase):
             chats_dir=cls.cursor_chats,
         )
 
+        cls.opencode_db = tmp / "opencode" / "opencode.db"
+        cls.opencode_parent, cls.opencode_child = _write_opencode_db(cls.opencode_db)
+        opencode.configure(cls.opencode_db)
+
     @classmethod
     def tearDownClass(cls):
         claude.configure(cls._old_claude)
         codex.configure(cls._old_codex)
         cursor.configure(cls._old_cursor[0], projects_dir=cls._old_cursor[1],
                          chats_dir=cls._old_cursor[2])
+        opencode.configure(cls._old_opencode)
         cls._tmp.cleanup()
 
     def assertConforms(self, errors):
         self.assertEqual(errors, [], "\n".join(errors))
 
     def test_all_summaries_conform(self):
-        for module in (claude, codex, cursor):
+        for module in (claude, codex, cursor, opencode):
             summaries = module.list_sessions()
             self.assertTrue(summaries, f"{module.__name__} listed no fixtures")
             for s in summaries:
@@ -131,6 +139,11 @@ class EventSchemaConformanceTests(unittest.TestCase):
         self.assertConforms(event_schema.validate_session(data, "cli-jsonl"))
         data = cursor.parse_cli_store(self.cli_store)
         self.assertConforms(event_schema.validate_session(data, "cli-store"))
+
+    def test_opencode_sessions_conform(self):
+        for session_id in (self.opencode_parent, self.opencode_child):
+            data = opencode.parse_session_by_id(session_id)
+            self.assertConforms(event_schema.validate_session(data, session_id))
 
     def test_frontend_dispatches_every_kind(self):
         """renderEvent() in app.js must have a case for every schema kind."""

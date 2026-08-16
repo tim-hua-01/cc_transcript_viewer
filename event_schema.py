@@ -11,7 +11,9 @@ the contract can't silently drift.
 Two message shapes exist for ``user``/``assistant`` events:
 
 - **Block shape** (Claude Code and Cursor): a ``blocks`` list whose items are
-  ``{"type": "text"|"thinking"|"image"|"tool_use", ...}``. Tool calls ride
+  ``{"type": "text"|"thinking"|"image"|"tool_use", ...}``. A ``thinking``
+  block may carry ``has_encrypted`` when the provider also returned an opaque
+  reasoning blob, i.e. the text is a summary. Tool calls ride
   inside the assistant turn, with their result attached on the block.
 - **Flat shape** (Codex): plain ``text`` on the event; reasoning and tool
   calls arrive as separate top-level events (``reasoning``, ``tool``).
@@ -172,7 +174,7 @@ def validate_summary(summary, where: str = "summary") -> list[str]:
         return [f"{where}: summary is not a dict"]
     missing = REQUIRED_SUMMARY_FIELDS - set(summary)
     _check(errors, not missing, where, f"missing required fields {sorted(missing)}")
-    _check(errors, summary.get("agent") in ("claude", "codex", "cursor"), where,
+    _check(errors, summary.get("agent") in ("claude", "codex", "cursor", "opencode"), where,
            f"unknown agent {summary.get('agent')!r}")
     return errors
 
@@ -182,7 +184,7 @@ def validate_session(data, where: str = "session") -> list[str]:
     errors: list[str] = []
     if not isinstance(data, dict):
         return [f"{where}: session is not a dict"]
-    _check(errors, data.get("agent") in ("claude", "codex", "cursor"), where,
+    _check(errors, data.get("agent") in ("claude", "codex", "cursor", "opencode"), where,
            f"unknown agent {data.get('agent')!r}")
     _check(errors, isinstance(data.get("id"), str) and data.get("id"), where, "needs str 'id'")
     _check(errors, isinstance(data.get("title"), str), where, "needs str 'title'")

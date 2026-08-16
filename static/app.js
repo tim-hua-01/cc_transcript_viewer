@@ -257,9 +257,17 @@ function relDays(ts) {
   if (days < 30) return days + "d ago";
   return fmtDateOnly(ts);
 }
+// opencode qualifies every model with the provider it was routed through
+// ("openrouter/x-ai/grok-4.6"). The provider is the same for a whole session
+// list and just crowds the label, so drop that leading segment.
+function stripProvider(m) {
+  const s = String(m || "");
+  const cut = s.indexOf("/");
+  return cut === -1 ? s : s.slice(cut + 1);
+}
 function shortModel(m) {
   if (!m) return "";
-  return String(m)
+  return stripProvider(m)
     .replace(/^claude-/, "")
     .replace(/-\d{8}$/, "")
     .replace(/\[1m\]$/, " (1M)")
@@ -268,6 +276,7 @@ function shortModel(m) {
 function agentLabel(a) {
   if (a === "codex") return "Codex";
   if (a === "cursor") return "Cursor";
+  if (a === "opencode") return "opencode";
   return "Claude";
 }
 function shortPath(p) {
@@ -329,7 +338,9 @@ function sessionMtime(file) {
 
 // ---------- dropdown filters (model / directory) ----------
 function modelFamily(m) {
-  const s = String(m || "").toLowerCase();
+  // Match on the bare model id so provider-qualified opencode models
+  // ("openrouter/anthropic/claude-opus-4") land in the same family as bare ones.
+  const s = String(m || "").toLowerCase().split("/").pop();
   if (s.startsWith("claude")) return "Claude";
   if (s.startsWith("gpt") || s.includes("codex") || s.startsWith("o1") || s.startsWith("o3")) return "GPT";
   return "Other";
@@ -466,11 +477,10 @@ function renderSidebar(query) {
     matches.sort((a, b) => (scoreOf(b) - scoreOf(a)) || ((b.mtime || 0) - (a.mtime || 0)));
   }
 
-  const nClaude = matches.filter((s) => s.agent === "claude").length;
-  const nCodex = matches.filter((s) => s.agent === "codex").length;
-  const nCursor = matches.filter((s) => s.agent === "cursor").length;
-  $("#sidebar-stats").textContent =
-    `${matches.length} sessions · ${nClaude} Claude · ${nCodex} Codex · ${nCursor} Cursor`;
+  const perAgent = ["claude", "codex", "cursor", "opencode"]
+    .map((a) => `${matches.filter((s) => s.agent === a).length} ${agentLabel(a)}`)
+    .join(" · ");
+  $("#sidebar-stats").textContent = `${matches.length} sessions · ${perAgent}`;
 
   const matchedByFile = new Map(matches.map((s) => [s.file, s]));
   const subagentCounts = new Map();
@@ -1325,7 +1335,12 @@ function renderThinking(b) {
     "div",
     { class: "thinking-head" },
     el("span", { class: "chev" }, "▼"),
-    el("span", {}, hasText ? "💭 Thinking" : "💭 Thinking (not recorded)")
+    el("span", {}, hasText ? "💭 Thinking" : "💭 Thinking (not recorded)"),
+    // What's shown is a provider-written summary; the real chain of thought
+    // came back encrypted and is not in the transcript.
+    hasText && b.has_encrypted
+      ? el("span", { class: "tool-caller" }, "summary · full reasoning encrypted")
+      : null
   );
   head.addEventListener("click", () => block.classList.toggle("collapsed"));
   const body = hasText
@@ -1639,6 +1654,16 @@ function renderTool(b) {
   const bodyKids = [];
   bodyKids.push(el("div", { class: "tool-section-label" }, "Input"));
   bodyKids.push(fmt.inputNode);
+  // opencode records which session a `task` call spawned, so the sub-agent's
+  // own transcript is one click away rather than a hunt through the sidebar.
+  if (b.child_file) {
+    bodyKids.push(
+      el("a", {
+        href: "#", class: "parent-link",
+        onclick: (e) => { e.preventDefault(); openSession(b.child_file); },
+      }, "→ open sub-agent session")
+    );
+  }
   if (b.instructions) {
     bodyKids.push(el("div", { class: "tool-section-label" }, "Skill instructions"));
     bodyKids.push(el("pre", { class: "payload truncatable" }, b.instructions));
@@ -1851,6 +1876,8 @@ function formatToolInput(name, input) {
     const cmd = value.command || "";
     const node = el("div", {},
       value.description ? el("div", { class: "muted", style: "margin-bottom:4px" }, value.description) : null,
+      // opencode's bash takes an explicit working directory instead of `cd`.
+      value.workdir ? el("div", { class: "attach-meta", style: "margin-bottom:6px" }, "cwd: " + value.workdir) : null,
       preFrom(cmd, "payload"),
       value.run_in_background ? el("div", { class: "muted", style: "margin-top:4px" }, "(background)") : null
     );

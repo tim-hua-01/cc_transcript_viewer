@@ -1,7 +1,7 @@
-# Claude Code, Codex, and Cursor Transcript Viewer
+# Claude Code, Codex, Cursor, and opencode Transcript Viewer
 
 A tiny, **zero-dependency** local web app for browsing your local coding-agent transcripts —
-**Claude Code, Codex, and Cursor together** in one time-sorted view.
+**Claude Code, Codex, Cursor, and opencode together** in one time-sorted view.
 
 It reads:
 
@@ -12,6 +12,7 @@ It reads:
 - Cursor CLI / agent transcripts from
   `~/.cursor/chats/<workspace-hash>/<session>/store.db` (full fidelity), with a
   lossy JSONL fallback under `~/.cursor/projects/<project>/agent-transcripts/`
+- opencode sessions from its SQLite database at `~/.local/share/opencode/opencode.db`
 
 Nothing is uploaded anywhere. Transcript sources are opened read-only; the only write is the
 viewer-owned custom-names file. The app listens on loopback only, contains no outbound-network code,
@@ -20,7 +21,7 @@ and has a [test suite](#privacy--security) that verifies those guarantees.
 > [!WARNING]
 > **This is vibe-coded.** It was built quickly and iteratively with an AI coding agent, so expect
 > rough edges and the occasional rendering bug. It also depends on the *current* on-disk transcript
-> formats of Claude Code, Codex, and Cursor — if any tool changes how it saves sessions, parts of the
+> formats of Claude Code, Codex, Cursor, and opencode — if any tool changes how it saves sessions, parts of the
 > viewer may silently break or drop records until the parser is updated.
 
 ## Run it
@@ -41,6 +42,7 @@ python3 server.py --codex-home PATH      # different Codex home (default ~/.code
 python3 server.py --cursor-db PATH       # different Cursor state.vscdb (or its Cursor app-support dir)
 python3 server.py --cursor-chats-dir PATH     # different ~/.cursor/chats (CLI store.db sessions)
 python3 server.py --cursor-projects-dir PATH  # different ~/.cursor/projects (CLI JSONL fallback)
+python3 server.py --opencode-db PATH     # different opencode.db (or the opencode data dir holding it)
 python3 server.py --custom-names-file PATH # different custom transcript names file
 ```
 
@@ -56,9 +58,10 @@ accumulated.
 
 ## Features
 
-- **One sidebar, sorted by time.** Every Claude Code, Codex, and Cursor session in a single flat list,
-  newest (most recently modified) first — no per-project grouping. Each entry shows an **agent tag**
-  (Claude / Codex / Cursor), a **CLI** badge for Cursor command-line agent transcripts, the project
+- **One sidebar, sorted by time.** Every Claude Code, Codex, Cursor, and opencode session in a single
+  flat list, newest (most recently modified) first — no per-project grouping. Each entry shows an
+  **agent tag** (Claude / Codex / Cursor / opencode), a **CLI** badge for Cursor command-line agent
+  transcripts, the project
   path, recency, message/tool/web counts, model, and the full session **id** (click to copy).
 - **Readable and custom titles.** Each session is titled with the first ~100 characters of its
   first user message unless the source has an explicit title. Claude Code `/rename`/`--name` titles
@@ -73,7 +76,7 @@ accumulated.
   and ordinary transcript-content matches receive `1×`. Powered by `/api/search` with an
   mtime-keyed cache.
 - **Filters that compose.**
-  - **All / Claude / Codex / Cursor** chips.
+  - **All / Claude / Codex / Cursor / opencode** chips.
   - A **Model** dropdown grouped by family (Claude / GPT / Other): tick a family to select all its
     models, or pick individual ones (e.g. only Sonnet). The family box shows an indeterminate state
     on partial selection.
@@ -96,6 +99,10 @@ accumulated.
       the same renderers as Claude Code, so a Cursor `edit_file` shows the same colorized diff.
     - Cursor CLI: same tool renderers; results come from per-chat `store.db` when
       available. JSONL-only fallbacks omit tool outputs.
+    - opencode: `bash`, `read`, `edit`, `write`, `grep`, `glob`, `webfetch`, `task`, `todowrite`,
+      `skill`, `lsp`, `apply_patch`. opencode's camelCase arguments (`filePath`, `oldString`) are
+      renamed server-side onto the same renderers, and a `task` call links straight through to the
+      sub-agent session it spawned.
   - **Copy all text** copies user/assistant messages, reasoning, and tool calls (including diffs),
     but skips tool results and system/notice noise.
   - Codex task/context/token bookkeeping consolidated into one **Turn metadata** disclosure at the
@@ -303,16 +310,18 @@ Restart Claude Code (or run `/config` once) for the change to take effect. Note 
 
 | File | Role |
 |------|------|
-| `server.py` | The unified stdlib HTTP layer plus everything that spans sources: merges the three parsers' session lists into one time-sorted sidebar list, dispatches `/api/session` to the right parser by transcript root / `cursordb:`/`cursorcli:` scheme, runs full-text search, owns custom names and summary-cache persistence, and serves the JSON API (`/api/sessions`, `/api/session?file=...`, `/api/session-name`, `/api/search?q=...`, `/api/local-image`) plus the static frontend. `/api/session` only serves files under the allowed roots; `/api/session-name` only updates the viewer-owned names file; `/api/local-image` serves only image-typed files; and a `Host`-header allowlist guards the loopback server against DNS rebinding. |
+| `server.py` | The unified stdlib HTTP layer plus everything that spans sources: merges the parsers' session lists into one time-sorted sidebar list, dispatches `/api/session` to the right parser by transcript root / `cursordb:`/`cursorcli:`/`opencode:` scheme, runs full-text search, owns custom names and summary-cache persistence, and serves the JSON API (`/api/sessions`, `/api/session?file=...`, `/api/session-name`, `/api/search?q=...`, `/api/local-image`) plus the static frontend. `/api/session` only serves files under the allowed roots; `/api/session-name` only updates the viewer-owned names file; `/api/local-image` serves only image-typed files; and a `Host`-header allowlist guards the loopback server against DNS rebinding. |
 | `claude_parser.py` | Claude Code parsing library (imported by `server.py`): parses session JSONL into a clean event stream (pairing tool results to calls), detects system-injected "user" records, folds rewound/edited branches into collapsible markers, labels sub-agents from their spawning `Task`/`Agent` calls, and builds sidebar summaries (cold scans use a process pool). Call `configure(projects_dir)` to point it elsewhere. |
 | `codex_parser.py` | Codex parsing library: parses rollout JSONL, reads `state_5.sqlite` metadata, pairs tool calls with outputs, unpacks orchestration-style `exec` calls, correlates local and embedded prompt images, consolidates per-turn bookkeeping, recognizes guardian/sub-agent relationships, and renders `apply_patch` diffs. Call `configure(codex_home)` to point it elsewhere. |
 | `cursor_parser.py` | Cursor parsing library: reads IDE `state.vscdb`; reads CLI `~/.cursor/chats/.../store.db` (with JSONL fallback under `agent-transcripts`); normalizes tool names/inputs; reconstructs IDE `edit_file` diffs; decodes grep/glob results out of Cursor's binary protobuf tool records (`toolCallBinary`) since newer Cursor versions no longer store them as JSON; emits Claude-shaped events. IDE uses `cursordb:<id>`; CLI store uses `cursorcli:<id>`. Call `configure(db_path, projects_dir=…, chats_dir=…)` to retarget. |
 | `cursor_binary.py` | Decoder for Cursor's `toolCallBinary` protobuf records (wire-format only, no schema/dependency): exact grep and glob result reconstruction, plus a generic best-effort string recovery for any other completed call whose result was never written to JSON (e.g. `await`). |
-| `common.py` | Helpers shared by the three parsers: JSONL iteration, title truncation, timestamp conversion, and the thread-safe fingerprint-keyed `SummaryCache` all of them use. |
+| `opencode_parser.py` | opencode parsing library: reads the single SQLite database at `~/.local/share/opencode/opencode.db` (`session` / `message` / `part` tables), folds each message's parts into block-shaped events, attaches each tool part's own result, renames opencode's camelCase tool arguments onto the canonical names, links `task` calls to the sub-agent session they spawned, flags thinking whose real reasoning came back encrypted, and drops the per-token provider `reasoning_details` noise. Sessions are addressed as `opencode:<id>`; the list cache is keyed on the database *and* its write-ahead log, so a live session is not served stale. Call `configure(db_path)` to retarget. |
+| `common.py` | Helpers shared by the parsers: JSONL iteration, title truncation, timestamp conversion, and the thread-safe fingerprint-keyed `SummaryCache` all of them use. |
 | `event_schema.py` | The written-down (and machine-checked) event contract between the parsers and the frontend: every event kind, both message shapes, and validators the test suite runs over every parser's output. |
-| `static/index.html`, `static/style.css`, `static/app.js` | The single frontend (vanilla JS, no build step). `app.js` dispatches on event kind and renders the Claude Code / Cursor (block-based) and Codex (flat) shapes, and runs the always-on live-refresh poll loop. CDN assets (marked, DOMPurify, KaTeX) are version-pinned with SRI integrity hashes. |
+| `static/index.html`, `static/style.css`, `static/app.js` | The single frontend (vanilla JS, no build step). `app.js` dispatches on event kind and renders the Claude Code / Cursor / opencode (block-based) and Codex (flat) shapes, and runs the always-on live-refresh poll loop. CDN assets (marked, DOMPurify, KaTeX) are version-pinned with SRI integrity hashes. |
 | `test_security.py` | Zero-dependency security tests (`python3 -m unittest test_security`): asserts no outbound connections at runtime, no network-client imports, loopback default bind, the `Host`-header rebinding guard, that `/api/session` is confined to the transcript roots while `/api/local-image` serves images only, and that every CDN asset is version-pinned and SRI-hashed. |
-| `test_parsers.py` | Characterization tests for the parser internals: branch folding, the Codex JS-literal orchestration parser, Cursor blob/JSON extraction and diff reconstruction, queued prompts with images. |
+| `test_parsers.py` | Characterization tests for the parser internals: branch folding, the Codex JS-literal orchestration parser, Cursor blob/JSON extraction and diff reconstruction, queued prompts with images, and opencode's
+part→event mapping (argument renaming, tool states, sub-agent linkage, provider-noise stripping). |
 | `test_event_schema.py` | Conformance tests: every parser's summaries and full parses must satisfy `event_schema.py`, and `app.js` must dispatch on every declared kind. |
 | `test_summary_cache.py` | Summary-cache unit tests (round-trip persistence, fingerprint invalidation, dirty-flag races). |
 | `test_fixtures.py` | Shared fixture builders that write minimal-but-valid transcripts for each source. |
@@ -364,6 +373,32 @@ A lossy JSONL export also exists at
 (`text` + `tool_use` only). The viewer uses it only when no `store.db` is present for that UUID.
 Project folder names encode the cwd by replacing `/` and `_` with `-`; cwd for `store.db` sessions
 usually comes from `meta.json` instead.
+
+opencode keeps everything in one SQLite database at `~/.local/share/opencode/opencode.db` — there
+are no per-session files, so sessions are addressed by the synthetic id `opencode:<sessionID>`:
+
+- `session` — one row per conversation: `title`, `directory`, `version`, `agent`, `model`, cost and
+  token totals, and `parent_id`, which is set on the sub-agent sessions the `task` tool spawns.
+- `message` — one row per turn; the `data` column is the JSON message record, either
+  `role: "user"` or `role: "assistant"` (which also carries `modelID`/`providerID`, `cost`,
+  `tokens`, `finish` and any turn-level `error`).
+- `part` — the actual content, one row per part, `data` holding a union discriminated on `type`:
+  `text` (with `synthetic`/`ignored` flags), `reasoning`, `tool`, `file`, `agent`, `subtask`,
+  `step-start`, `step-finish`, `snapshot`, `patch`, `retry`, `compaction`.
+
+Tool calls live on the assistant turn — a `tool` part carries its own result in
+`state` (`pending` / `running` / `completed` / `error`) — so opencode maps onto the same block
+shape as Claude Code and Cursor rather than Codex's flat shape.
+
+Parts also carry a per-provider `metadata` blob holding a `reasoning_details` list. Most of it is
+a token-by-token copy of the summary that dwarfs the text itself, so the parser reads only what it
+renders — but the list also holds any `reasoning.encrypted` entry, an `rs_…` id plus opaque `data`
+only the provider can read. When one is present the visible thinking is a *summary* of a chain of
+thought the transcript doesn't contain, and the viewer labels it as such. Unlike Cursor, opencode
+keeps this inline on the part rather than in an out-of-line blob chain.
+
+The database runs in WAL mode, so change detection has to watch `opencode.db-wal` as well as the
+main file.
 
 ## License
 

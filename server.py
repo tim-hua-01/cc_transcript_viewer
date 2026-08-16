@@ -1,21 +1,23 @@
 #!/usr/bin/env python3
-"""Unified Claude Code + Codex + Cursor transcript browser.
+"""Unified Claude Code + Codex + Cursor + opencode transcript browser.
 
 A zero-dependency local web app for browsing Claude Code session transcripts
 (under ~/.claude/projects), Codex session transcripts (under ~/.codex/sessions),
-Cursor IDE conversations (from Cursor's state.vscdb), and Cursor CLI agent
-transcripts (under ~/.cursor/projects/.../agent-transcripts) in a single,
-time-sorted sidebar. Run it and open the printed URL.
+Cursor IDE conversations (from Cursor's state.vscdb), Cursor CLI agent
+transcripts (under ~/.cursor/projects/.../agent-transcripts), and opencode
+sessions (from ~/.local/share/opencode/opencode.db) in a single, time-sorted
+sidebar. Run it and open the printed URL.
 
-Parsing lives in claude_parser.py / codex_parser.py / cursor_parser.py (one
-module per transcript source, all emitting the same event shapes); this module
-is the HTTP layer plus what spans sources: the unified session list, full-text
-search, viewer-owned custom names, and summary-cache persistence.
+Parsing lives in claude_parser.py / codex_parser.py / cursor_parser.py /
+opencode_parser.py (one module per transcript source, all emitting the same
+event shapes); this module is the HTTP layer plus what spans sources: the
+unified session list, full-text search, viewer-owned custom names, and
+summary-cache persistence.
 
 Usage:
     python server.py [--port 3132] [--projects-dir PATH] [--codex-home PATH]
                      [--cursor-db PATH] [--cursor-projects-dir PATH]
-                     [--cursor-chats-dir PATH]
+                     [--cursor-chats-dir PATH] [--opencode-db PATH]
 """
 
 from __future__ import annotations
@@ -34,8 +36,16 @@ from urllib.parse import parse_qs, urlparse
 import claude_parser as claude
 import codex_parser as codex
 import cursor_parser as cursor
+import opencode_parser as opencode
 
 STATIC_DIR = Path(__file__).parent / "static"
+# Session ids that name a row in a database rather than a file on disk. These
+# never resolve to a transcript path, so every path-based check skips them.
+SYNTHETIC_SCHEMES = (
+    cursor.SESSION_SCHEME,
+    cursor.CLI_SESSION_SCHEME,
+    opencode.SESSION_SCHEME,
+)
 DEFAULT_CUSTOM_NAMES_FILE = (
     Path.home() / ".config" / "cc_transcript_viewer" / "names.json"
 )
@@ -145,6 +155,7 @@ _PARSER_CACHES = {
     "claude": claude.SUMMARY_CACHE,
     "codex": codex.SUMMARY_CACHE,
     "cursor": cursor.SUMMARY_CACHE,
+    "opencode": opencode.SUMMARY_CACHE,
 }
 
 
@@ -189,7 +200,7 @@ def save_summary_caches() -> None:
 # Unified session list / dispatch
 # ---------------------------------------------------------------------------
 def list_sessions() -> list[dict]:
-    """Flat list of every Claude Code, Codex, and Cursor session, newest first."""
+    """Flat list of every Claude Code, Codex, Cursor, and opencode session, newest first."""
     load_summary_caches()
     out: list[dict] = claude.list_sessions()
 
@@ -201,6 +212,11 @@ def list_sessions() -> list[dict]:
     try:
         out.extend(cursor.list_sessions())
     except Exception:  # noqa: BLE001 — never let Cursor errors hide other sessions
+        pass
+
+    try:
+        out.extend(opencode.list_sessions())
+    except Exception:  # noqa: BLE001 — never let opencode errors hide other sessions
         pass
 
     save_summary_caches()
@@ -261,14 +277,18 @@ def load_session(file_id: str) -> dict | None:
     """Resolve a session id to parsed data, for both `/api/session` and search.
 
     Cursor IDE sessions use ``cursordb:<composerId>``; Cursor CLI store.db
-    sessions use ``cursorcli:<sessionId>``. Everything else is a real transcript
-    path that must resolve under an allowed root.
+    sessions use ``cursorcli:<sessionId>``; opencode sessions use
+    ``opencode:<sessionID>``. Everything else is a real transcript path that
+    must resolve under an allowed root.
     """
     if file_id.startswith(cursor.SESSION_SCHEME):
         data = cursor.parse_session_by_id(file_id[len(cursor.SESSION_SCHEME):])
         return _apply_custom_name(data) if data is not None else None
     if file_id.startswith(cursor.CLI_SESSION_SCHEME):
         data = cursor.parse_cli_store_by_id(file_id[len(cursor.CLI_SESSION_SCHEME):])
+        return _apply_custom_name(data) if data is not None else None
+    if file_id.startswith(opencode.SESSION_SCHEME):
+        data = opencode.parse_session_by_id(file_id[len(opencode.SESSION_SCHEME):])
         return _apply_custom_name(data) if data is not None else None
     target = Path(file_id).expanduser().resolve()
     if not target.exists():
@@ -280,11 +300,11 @@ def load_session(file_id: str) -> dict | None:
 def resolve_transcript_file(file_id: str) -> Path:
     """Resolve a session id to its on-disk transcript under an allowed root.
 
-    Raises FileNotFoundError if the id is synthetic (Cursor database sessions
-    have no transcript file) or missing, and PermissionError if the path lies
-    outside every transcript root.
+    Raises FileNotFoundError if the id is synthetic (Cursor and opencode
+    database sessions have no transcript file) or missing, and PermissionError
+    if the path lies outside every transcript root.
     """
-    if file_id.startswith((cursor.SESSION_SCHEME, cursor.CLI_SESSION_SCHEME)):
+    if file_id.startswith(SYNTHETIC_SCHEMES):
         raise FileNotFoundError(file_id)
     target = Path(file_id).expanduser().resolve()
     if not target.exists():
@@ -306,10 +326,10 @@ def resolve_transcript_file(file_id: str) -> Path:
 def session_file_mtime(file_id: str) -> float | None:
     """Return a real transcript's mtime without parsing any session content.
 
-    Synthetic Cursor database ids return None; their change detection continues
-    to use the regular session-list refresh.
+    Synthetic database ids return None; their change detection continues to use
+    the regular session-list refresh.
     """
-    if file_id.startswith((cursor.SESSION_SCHEME, cursor.CLI_SESSION_SCHEME)):
+    if file_id.startswith(SYNTHETIC_SCHEMES):
         return None
     return resolve_transcript_file(file_id).stat().st_mtime
 
@@ -689,12 +709,10 @@ class Handler(BaseHTTPRequestHandler):
             if not file_arg:
                 self._send_json({"error": "missing file param"}, status=400)
                 return
-            # Cursor IDE/CLI sessions use synthetic schemes (no path on disk);
-            # everything else is a real path confined to an allowed root.
-            if not (
-                file_arg.startswith(cursor.SESSION_SCHEME)
-                or file_arg.startswith(cursor.CLI_SESSION_SCHEME)
-            ):
+            # Cursor IDE/CLI and opencode sessions use synthetic schemes (no
+            # path on disk); everything else is a real path confined to an
+            # allowed root.
+            if not file_arg.startswith(SYNTHETIC_SCHEMES):
                 target = Path(file_arg).expanduser().resolve()
                 if not target.exists():
                     self._send_json({"error": "not found"}, status=404)
@@ -851,6 +869,12 @@ def main():
         default=cursor.DEFAULT_CHATS_DIR,
         help="Cursor chats dir containing per-session store.db (default ~/.cursor/chats)",
     )
+    ap.add_argument(
+        "--opencode-db",
+        type=Path,
+        default=opencode.DEFAULT_DB_PATH,
+        help="opencode.db (or the opencode data dir holding it)",
+    )
     args = ap.parse_args()
 
     CUSTOM_NAMES_FILE = args.custom_names_file.expanduser()
@@ -861,18 +885,20 @@ def main():
         projects_dir=args.cursor_projects_dir,
         chats_dir=args.cursor_chats_dir,
     )
+    opencode.configure(args.opencode_db)
     # Enforce the Host allowlist only on the safe loopback default; if the user
     # deliberately binds elsewhere for LAN access, step aside so it still works.
     HOST_CHECK = args.host in LOOPBACK_HOSTS
 
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     url = f"http://{args.host}:{args.port}/"
-    print("Claude Code + Codex + Cursor transcript browser")
+    print("Claude Code + Codex + Cursor + opencode transcript browser")
     print(f"  claude projects: {claude.PROJECTS_DIR}")
     print(f"  codex sessions:  {codex.SESSIONS_DIR}")
     print(f"  cursor db:       {cursor.DB_PATH}")
     print(f"  cursor projects: {cursor.PROJECTS_DIR}")
     print(f"  cursor chats:    {cursor.CHATS_DIR}")
+    print(f"  opencode db:     {opencode.DB_PATH}")
     print(f"  serving at:      {url}")
     print("  (Ctrl-C to stop)")
     try:

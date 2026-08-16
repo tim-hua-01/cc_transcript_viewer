@@ -510,6 +510,7 @@ body.outline-collapsed #nav-buttons { right: 24px; }
 .agent-claude { background: #d4a27f; color: #141414; }
 .agent-codex { background: #141414; color: #fff; }
 .agent-cursor { background: #4a6fa5; color: #fff; }
+.agent-opencode { background: #3d8168; color: #fff; }
 .t-title .agent-tag { vertical-align: middle; margin-right: 8px; font-size: 11px; }
 .session-meta {
   margin-top: 4px; font-size: 11px; color: var(--muted);
