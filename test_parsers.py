@@ -390,6 +390,133 @@ class CodexReasoningSummaryTests(unittest.TestCase):
         self.assertEqual(reasoning, [])
 
 
+class CodexItemCompletedTests(unittest.TestCase):
+    """Codex 0.147 moved messages into an `item_completed` envelope."""
+
+    def _parse(self, records):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "rollout.jsonl"
+            _write_jsonl(path, records)
+            return codex.parse_session(path)
+
+    @staticmethod
+    def _item(ts, item):
+        return {
+            "timestamp": ts,
+            "type": "event_msg",
+            "payload": {"type": "item_completed", "item": item},
+        }
+
+    def test_messages_become_turns_not_injected_instructions(self):
+        prompt = "Summarize the build failure"
+        records = [
+            self._item(
+                "2026-01-01T00:00:00Z",
+                {"type": "UserMessage", "content": [{"type": "text", "text": prompt}]},
+            ),
+            # The mirrored response_items the model actually received.
+            {
+                "timestamp": "2026-01-01T00:00:01Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": prompt}],
+                },
+            },
+            {
+                "timestamp": "2026-01-01T00:00:02Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "<environment_context>cwd</environment_context>"}],
+                },
+            },
+            self._item(
+                "2026-01-01T00:00:03Z",
+                {
+                    "type": "AgentMessage",
+                    "content": [{"type": "Text", "text": "Done — nothing changed."}],
+                    "phase": "commentary",
+                },
+            ),
+        ]
+
+        events = self._parse(records)["events"]
+
+        self.assertEqual([e["text"] for e in events if e["kind"] == "user"], [prompt])
+        self.assertEqual(
+            [e["text"] for e in events if e["kind"] == "assistant"], ["Done — nothing changed."]
+        )
+        # The prompt is not repeated as injected context; only the real one is.
+        self.assertEqual(
+            [e["label"] for e in events if e["kind"] == "instructions"], ["Environment context"]
+        )
+
+    def test_title_comes_from_the_first_user_item(self):
+        records = [
+            self._item(
+                "2026-01-01T00:00:00Z",
+                {"type": "UserMessage", "content": [{"type": "text", "text": "Long " * 200}]},
+            )
+        ]
+
+        title = self._parse(records)["title"]
+
+        self.assertTrue(title.endswith("…"))
+        self.assertLessEqual(len(title), 101)
+
+    def test_command_and_file_items_do_not_duplicate_tool_blocks(self):
+        records = [
+            {
+                "timestamp": "2026-01-01T00:00:00Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "custom_tool_call",
+                    "call_id": "call_1",
+                    "name": "exec",
+                    "input": "ls",
+                },
+            },
+            self._item("2026-01-01T00:00:01Z", {"type": "CommandExecution", "id": "exec-1", "stdout": "a\nb"}),
+            self._item("2026-01-01T00:00:02Z", {"type": "FileChange", "id": "exec-2", "changes": {}}),
+        ]
+
+        events = self._parse(records)["events"]
+
+        self.assertEqual(len([e for e in events if e["kind"] == "tool"]), 1)
+
+    def test_web_search_item_keeps_its_results(self):
+        records = [
+            self._item(
+                "2026-01-01T00:00:00Z",
+                {
+                    "type": "Extension",
+                    "kind": "web.search",
+                    "id": "exec-3",
+                    "query": "codex rollout format",
+                    "action": {"type": "search", "query": "codex rollout format"},
+                    "results": [
+                        {
+                            "type": "text_result",
+                            "title": "Rollouts",
+                            "url": "https://example.com/a",
+                            "domain": "example.com",
+                            "snippet": "…",
+                        }
+                    ],
+                },
+            )
+        ]
+
+        searches = [e for e in self._parse(records)["events"] if e["kind"] == "web_search"]
+
+        self.assertEqual(len(searches), 1)
+        self.assertEqual(searches[0]["query"], "codex rollout format")
+        self.assertEqual(searches[0]["results"][0]["url"], "https://example.com/a")
+
+
 class CodexOrchestrationTests(unittest.TestCase):
     """The JS-literal parser that unpacks generated `tools.name(...)` calls."""
 

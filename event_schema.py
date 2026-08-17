@@ -32,7 +32,8 @@ Kinds
 - ``reasoning``   — Codex reasoning summary: ``text``, ``has_encrypted``.
 - ``tool``        — Codex tool call: ``name``, ``input``, ``summary``,
                     ``result`` (dict or null).
-- ``web_search`` / ``web_call`` — a web search: ``query`` and/or ``action``.
+- ``web_search`` / ``web_call`` — a web search: ``query`` and/or ``action``,
+                    plus ``results`` when the transcript recorded the hits.
 - ``instructions``— injected system prompt/context: ``role``, ``label``,
                     ``text``.
 - ``system``      — system record; ``subtype == "compact_boundary"`` carries
