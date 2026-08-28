@@ -206,8 +206,23 @@ def _bubble_rows(conn: sqlite3.Connection, cid: str):
     return out
 
 
+_NOTICE_PATTERN = re.compile(r"^\s*(?:<timestamp>.*?</timestamp>\s*)?<system_notification>", re.DOTALL)
+
+
+def _synthetic_user_notice(text) -> dict | None:
+    """If a user bubble is actually Cursor injecting a background shell/subagent
+    result rather than a real prompt, return a ``{label, text}`` notice;
+    otherwise ``None``. Mirrors Claude Code's task-notification convention
+    (claude_parser._synthetic_user_notice): the model needs the full text, but
+    it isn't something the person typed, so it renders as a notice, not a
+    user turn."""
+    if not isinstance(text, str) or not _NOTICE_PATTERN.match(text):
+        return None
+    return {"label": "Background task", "text": text.strip()}
+
+
 def _first_user_text(conn: sqlite3.Connection, cid: str, headers: list) -> str:
-    """First user bubble's text (for conversations with no AI-generated name)."""
+    """First real user bubble's text (for conversations with no AI-generated name)."""
     for h in headers:
         if h.get("type") != 1:
             continue
@@ -216,7 +231,8 @@ def _first_user_text(conn: sqlite3.Connection, cid: str, headers: list) -> str:
             (f"bubbleId:{cid}:{h.get('bubbleId')}",),
         ).fetchone()
         b = _loads(row[0]) if row else None
-        if b and (b.get("text") or "").strip():
+        text = (b.get("text") or "").strip() if b else ""
+        if text and not _synthetic_user_notice(text):
             return b["text"]
     return ""
 
@@ -233,7 +249,17 @@ def _model_from_bubble(b: dict | None) -> str:
 
 def _summary_from_composer(conn, cid: str, d: dict, db_mtime: float) -> dict:
     headers = d.get("fullConversationHeadersOnly") or []
-    n_user = sum(1 for h in headers if h.get("type") == 1)
+    n_user = 0
+    for h in headers:
+        if h.get("type") != 1:
+            continue
+        row = conn.execute(
+            "select value from cursorDiskKV where key=?",
+            (f"bubbleId:{cid}:{h.get('bubbleId')}",),
+        ).fetchone()
+        text = (_loads(row[0]).get("text") or "").strip() if row else ""
+        if text and not _synthetic_user_notice(text):
+            n_user += 1
     n_tool = sum(1 for h in headers if (h.get("grouping") or {}).get("toolFormerTool") is not None)
     n_assistant = sum(
         1
@@ -673,6 +699,10 @@ def parse_session_by_id(composer_id: str) -> dict | None:
             if btype == 1:  # user
                 text = b.get("text") or ""
                 if not text.strip():
+                    continue
+                notice = _synthetic_user_notice(text)
+                if notice:
+                    events.append({"kind": "notice", "ts": ts, "is_sidechain": False, **notice})
                     continue
                 events.append(
                     {"kind": "user", "ts": ts, "blocks": [{"type": "text", "text": text}], "is_sidechain": False}

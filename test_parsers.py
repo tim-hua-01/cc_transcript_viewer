@@ -756,6 +756,105 @@ class CursorIdePerTurnModelTests(unittest.TestCase):
         self.assertEqual({e["model"] for e in asst}, {"claude-opus-4-8"})
 
 
+class CursorSyntheticNoticeTests(unittest.TestCase):
+    """Cursor injects finished background-task/subagent results as a user
+    bubble; the viewer must show them as notices, not real prompts."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db_path = Path(self.tmp.name) / "state.vscdb"
+        self.cid = "test-composer-notices"
+        self._old = (cursor.DB_PATH, cursor.PROJECTS_DIR, cursor.CHATS_DIR)
+        self._write_fixture()
+        cursor.configure(self.db_path, projects_dir=Path(self.tmp.name) / "projects",
+                         chats_dir=Path(self.tmp.name) / "chats")
+
+    def tearDown(self):
+        cursor.configure(self._old[0], projects_dir=self._old[1], chats_dir=self._old[2])
+        self.tmp.cleanup()
+
+    def _write_fixture(self):
+        import sqlite3
+
+        headers = [
+            {"bubbleId": "u1", "type": 1},
+            {"bubbleId": "n1", "type": 1},   # timestamp-prefixed shell notification
+            {"bubbleId": "n2", "type": 1},   # bare system_notification, subagent
+            {"bubbleId": "u2", "type": 1},
+        ]
+        composer = {
+            "name": "notices",
+            "modelConfig": {"modelName": "gpt-5.6-sol"},
+            "fullConversationHeadersOnly": headers,
+        }
+        bubbles = {
+            "u1": {"type": 1, "text": "run the tests in the background"},
+            "n1": {"type": 1, "text": (
+                "<timestamp>Thursday, Aug 27, 2026, 11:02 PM (UTC-7)</timestamp>\n"
+                "<system_notification>\nThe following task has finished.\n"
+                "kind: shell\nstatus: success\n</system_notification>"
+            )},
+            "n2": {"type": 1, "text": (
+                "<system_notification>\nThe following task has finished.\n"
+                "kind: subagent\nstatus: success\n</system_notification>"
+            )},
+            "u2": {"type": 1, "text": "great, now clean it up"},
+        }
+        conn = sqlite3.connect(self.db_path)
+        try:
+            conn.execute("create table cursorDiskKV (key text primary key, value text)")
+            conn.execute("insert into cursorDiskKV values (?, ?)",
+                         (f"composerData:{self.cid}", json.dumps(composer)))
+            for bid, bubble in bubbles.items():
+                conn.execute("insert into cursorDiskKV values (?, ?)",
+                             (f"bubbleId:{self.cid}:{bid}", json.dumps(bubble)))
+            conn.commit()
+        finally:
+            conn.close()
+
+    def test_notification_bubbles_become_notices(self):
+        events = cursor.parse_session_by_id(self.cid)["events"]
+        kinds = [e["kind"] for e in events]
+        self.assertEqual(kinds, ["user", "notice", "notice", "user"])
+        notices = [e for e in events if e["kind"] == "notice"]
+        self.assertTrue(all(n["label"] == "Background task" for n in notices))
+        self.assertIn("kind: shell", notices[0]["text"])
+        self.assertIn("kind: subagent", notices[1]["text"])
+
+    def test_real_prompts_are_unaffected(self):
+        events = cursor.parse_session_by_id(self.cid)["events"]
+        prompts = [e["blocks"][0]["text"] for e in events if e["kind"] == "user"]
+        self.assertEqual(prompts, ["run the tests in the background", "great, now clean it up"])
+
+    def test_title_falls_back_past_notices_to_the_real_first_prompt(self):
+        # A composer whose only header is a background-task notification should
+        # not surface it as the session title.
+        import sqlite3
+
+        headers = [{"bubbleId": "n1", "type": 1}, {"bubbleId": "u1", "type": 1}]
+        composer = {"fullConversationHeadersOnly": headers}
+        conn = sqlite3.connect(self.db_path)
+        try:
+            conn.execute("insert into cursorDiskKV values (?, ?)",
+                         (f"composerData:notice-only", json.dumps(composer)))
+            conn.execute("insert into cursorDiskKV values (?, ?)",
+                         ("bubbleId:notice-only:n1", json.dumps({
+                             "type": 1,
+                             "text": "<system_notification>\ndone\n</system_notification>",
+                         })))
+            conn.execute("insert into cursorDiskKV values (?, ?)",
+                         ("bubbleId:notice-only:u1", json.dumps({"type": 1, "text": "the real prompt"})))
+            conn.commit()
+        finally:
+            conn.close()
+        data = cursor.parse_session_by_id("notice-only")
+        self.assertEqual(data["title"], "the real prompt")
+
+    def test_summary_n_user_excludes_notices(self):
+        summaries = {s["id"]: s for s in cursor._list_db_sessions()}
+        self.assertEqual(summaries[self.cid]["n_user"], 2)
+
+
 class CursorOrphanRecoveryTests(unittest.TestCase):
     """Messages Cursor's checkpoint rebuilds dropped come back, badged.
 
