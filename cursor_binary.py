@@ -276,6 +276,18 @@ def generic_result_text(tf: dict) -> str:
     return "\n".join(lines)
 
 
+def call_times_ms(tf: dict) -> tuple[int | None, int | None]:
+    """The call's (start, end) epoch-ms stamps from the binary envelope.
+
+    These are the only per-bubble timestamps that survive Cursor's checkpoint
+    rebuilds (which re-create every bubble with the rebuild time as createdAt),
+    so they anchor recovered orphan messages back into the timeline."""
+    top = _decode(tf)
+    if top is None:
+        return (None, None)
+    return (_pb_int(top, 59), _pb_int(top, 60))
+
+
 # ---------------------------------------------------------------------------
 # Conversation state (agentKv blob chain)
 # ---------------------------------------------------------------------------

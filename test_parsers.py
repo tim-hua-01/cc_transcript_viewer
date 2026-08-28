@@ -756,6 +756,168 @@ class CursorIdePerTurnModelTests(unittest.TestCase):
         self.assertEqual({e["model"] for e in asst}, {"claude-opus-4-8"})
 
 
+class CursorOrphanRecoveryTests(unittest.TestCase):
+    """Messages Cursor's checkpoint rebuilds dropped come back, badged.
+
+    Models the real failure (composer 45f12c5f, Aug 2026): a rebuild re-created
+    every bubble with a uniform fake createdAt and silently dropped an
+    assistant text that never registered server-side. The original bubble
+    survives only as a row no header references; the parser must restore it —
+    placed after the tool call that finished before it streamed and before the
+    next user message — while suppressing orphan rows that merely duplicate or
+    fragment kept content.
+    """
+
+    FAKE_TS = "2026-08-28T17:10:03.368Z"  # rebuild stamp shared by all headers
+
+    @staticmethod
+    def _ms(iso: str) -> int:
+        from datetime import datetime
+        return int(datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp() * 1000)
+
+    @staticmethod
+    def _tool_binary(start_ms: int, end_ms: int) -> str:
+        import base64
+
+        def varint(n):
+            out = bytearray()
+            while True:
+                b = n & 0x7F
+                n >>= 7
+                out.append(b | (0x80 if n else 0))
+                if not n:
+                    return bytes(out)
+
+        return base64.b64encode(
+            varint(59 << 3) + varint(start_ms) + varint(60 << 3) + varint(end_ms)
+        ).decode()
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db_path = Path(self.tmp.name) / "state.vscdb"
+        self.cid = "test-composer-orphans"
+        self._old = (cursor.DB_PATH, cursor.PROJECTS_DIR, cursor.CHATS_DIR)
+        cursor.configure(self.db_path, projects_dir=Path(self.tmp.name) / "projects",
+                         chats_dir=Path(self.tmp.name) / "chats")
+
+    def tearDown(self):
+        cursor.configure(self._old[0], projects_dir=self._old[1], chats_dir=self._old[2])
+        self.tmp.cleanup()
+
+    def _write(self, headers, bubbles):
+        import sqlite3
+
+        composer = {
+            "name": "orphan recovery",
+            "modelConfig": {"modelName": "gpt-5.6-sol"},
+            "fullConversationHeadersOnly": headers,
+        }
+        conn = sqlite3.connect(self.db_path)
+        try:
+            conn.execute("create table cursorDiskKV (key text primary key, value text)")
+            conn.execute("insert into cursorDiskKV values (?, ?)",
+                         (f"composerData:{self.cid}", json.dumps(composer)))
+            for bid, bubble in bubbles.items():
+                conn.execute("insert into cursorDiskKV values (?, ?)",
+                             (f"bubbleId:{self.cid}:{bid}", json.dumps(bubble)))
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _rebuilt_session(self):
+        """u1 → tool (real times in binary) → LOST TEXT → u2 → a2+a3 texts."""
+        tool_end = self._ms("2026-08-28T16:00:36.000Z")
+        headers = [
+            {"bubbleId": "u1", "type": 1, "createdAt": self.FAKE_TS},
+            {"bubbleId": "t1", "type": 2, "createdAt": self.FAKE_TS},
+            {"bubbleId": "u2", "type": 1, "createdAt": self.FAKE_TS},
+            {"bubbleId": "a2", "type": 2, "createdAt": self.FAKE_TS},
+            {"bubbleId": "a3", "type": 2, "createdAt": self.FAKE_TS},
+        ]
+        bubbles = {
+            "u1": {"type": 1, "text": "explain things to me", "createdAt": self.FAKE_TS},
+            "t1": {"type": 2, "createdAt": self.FAKE_TS,
+                   "toolFormerData": {"name": "ripgrep_raw_search", "status": "completed",
+                                      "params": "{}", "result": "{}",
+                                      "toolCallBinary": self._tool_binary(tool_end - 400, tool_end)}},
+            "u2": {"type": 1, "text": "yeah ok for 1", "createdAt": self.FAKE_TS},
+            "a2": {"type": 2, "text": "Here is the clean interpretation.", "createdAt": self.FAKE_TS},
+            "a3": {"type": 2, "text": "And the follow-up detail.", "createdAt": self.FAKE_TS},
+        }
+        orphans = {
+            # the genuinely lost message: streamed 19s after the tool finished
+            "lost": {"type": 2, "text": "Here is the clean version, all sixteen points.",
+                     "createdAt": "2026-08-28T16:00:55.873Z"},
+            # a later rebuild generation's copy of that same lost message
+            "lost-copy": {"type": 2, "text": "Here is the clean version, all sixteen points.",
+                          "createdAt": "2026-08-28T16:48:05.000Z"},
+            # stream debris: a partial snapshot of a kept message
+            "frag": {"type": 2, "text": "Here is the clean",
+                     "createdAt": "2026-08-28T16:27:30.000Z"},
+            # a superseded generation that stored two kept bubbles as one
+            "split": {"type": 2, "text": "Here is the clean interpretation.And the follow-up detail.",
+                      "createdAt": "2026-08-28T16:27:31.000Z"},
+            # an exact copy of a kept message from an older generation
+            "dup": {"type": 2, "text": "And the follow-up detail.",
+                    "createdAt": "2026-08-28T16:27:32.000Z"},
+        }
+        return headers, {**bubbles, **orphans}
+
+    def test_lost_message_is_restored_before_the_next_user_turn(self):
+        self._write(*self._rebuilt_session())
+        events = cursor.parse_session_by_id(self.cid)["events"]
+        recovered = [e for e in events if e.get("recovered")]
+        self.assertEqual(len(recovered), 1)
+        (ev,) = recovered
+        self.assertEqual(ev["blocks"], [{"type": "text", "text": "Here is the clean version, all sixteen points."}])
+        # the earliest copy is the original stream bubble: its timestamp is genuine
+        self.assertEqual(ev["ts"], "2026-08-28T16:00:55.873Z")
+        self.assertEqual(ev["model"], "gpt-5.6-sol")
+        # placed after the anchoring tool call, before the user's reply to it
+        idx = events.index(ev)
+        self.assertEqual(events[idx - 1]["blocks"][0]["type"], "tool_use")
+        self.assertEqual(events[idx + 1]["blocks"], [{"type": "text", "text": "yeah ok for 1"}])
+
+    def test_duplicates_fragments_and_resplits_stay_suppressed(self):
+        self._write(*self._rebuilt_session())
+        events = cursor.parse_session_by_id(self.cid)["events"]
+        texts = [b["text"] for e in events for b in e["blocks"] if b["type"] == "text"]
+        # each kept message appears exactly once; no orphan debris leaks in
+        self.assertEqual(texts.count("Here is the clean interpretation."), 1)
+        self.assertEqual(texts.count("And the follow-up detail."), 1)
+        self.assertNotIn("Here is the clean", texts)
+        self.assertNotIn("Here is the clean interpretation.And the follow-up detail.", texts)
+
+    def test_without_anchors_recovered_text_lands_at_the_end(self):
+        headers = [
+            {"bubbleId": "u1", "type": 1, "createdAt": self.FAKE_TS},
+            {"bubbleId": "a1", "type": 2, "createdAt": self.FAKE_TS},
+        ]
+        bubbles = {
+            "u1": {"type": 1, "text": "hello", "createdAt": self.FAKE_TS},
+            "a1": {"type": 2, "text": "kept reply", "createdAt": self.FAKE_TS},
+            "lost": {"type": 2, "text": "dropped reply", "createdAt": "2026-08-28T16:00:00.000Z"},
+        }
+        self._write(headers, bubbles)
+        events = cursor.parse_session_by_id(self.cid)["events"]
+        self.assertTrue(events[-1].get("recovered"))
+        self.assertEqual(events[-1]["blocks"][0]["text"], "dropped reply")
+
+    def test_untouched_sessions_recover_nothing(self):
+        headers = [
+            {"bubbleId": "u1", "type": 1, "createdAt": "2026-08-28T10:00:00.000Z"},
+            {"bubbleId": "a1", "type": 2, "createdAt": "2026-08-28T10:00:05.000Z"},
+        ]
+        bubbles = {
+            "u1": {"type": 1, "text": "hello", "createdAt": "2026-08-28T10:00:00.000Z"},
+            "a1": {"type": 2, "text": "the reply", "createdAt": "2026-08-28T10:00:05.000Z"},
+        }
+        self._write(headers, bubbles)
+        events = cursor.parse_session_by_id(self.cid)["events"]
+        self.assertFalse(any(e.get("recovered") for e in events))
+        self.assertEqual(len(events), 2)
+
+
 class OpencodeParserTests(unittest.TestCase):
     """opencode's SQLite parts → viewer events."""
 

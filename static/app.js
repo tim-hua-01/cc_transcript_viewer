@@ -1219,6 +1219,12 @@ function turnShell(kind, label, ev, bodyNodes) {
     { class: "turn-head" },
     el("span", {}, label),
     ev.is_sidechain ? el("span", { class: "sidechain-tag" }, "sub-agent") : null,
+    ev.recovered
+      ? el("span", {
+          class: "recovered-tag",
+          title: "Cursor dropped this message from its conversation index during a checkpoint rebuild; recovered from orphaned data — placement in the timeline is approximate.",
+        }, "recovered")
+      : null,
     ev.phase ? el("span", { class: "phase-tag" }, ev.phase) : null,
     ev.status ? el("span", { class: "status-tag" }, ev.status) : null,
     ev.model ? el("span", { class: "muted", style: "font-weight:400" }, shortModel(ev.model)) : null,

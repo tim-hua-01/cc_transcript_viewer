@@ -42,6 +42,7 @@ import difflib
 import json
 import re
 import sqlite3
+from datetime import datetime
 from pathlib import Path
 
 import common
@@ -529,6 +530,90 @@ def _format_generic(result, is_error: bool) -> tuple[str, bool]:
     return json.dumps(result, indent=2), is_error
 
 
+def _parse_ms(ts) -> int | None:
+    """A bubble createdAt (ISO-8601 string or epoch-ms) → epoch-ms."""
+    if isinstance(ts, (int, float)):
+        return int(ts)
+    if isinstance(ts, str) and ts:
+        try:
+            return int(datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp() * 1000)
+        except ValueError:
+            return None
+    return None
+
+
+def _recovered_inserts(headers: list, bubbles: dict) -> dict[int, list[dict]]:
+    """Assistant text bubbles Cursor's checkpoint rebuilds dropped, keyed by
+    the header index to insert them before (len(headers) = append at end).
+
+    cursor-agent threads are periodically rebuilt from the server-side
+    conversation: every kept bubble is re-created (fresh bubbleId, the rebuild
+    time as createdAt) and older generations become rows no header references.
+    A text bubble that never registered server-side (no serverBubbleId — seen
+    with gpt plan-mode clarifying-question turns) is silently dropped by the
+    rebuild and survives only as such an orphan row; Cursor's own UI loses it.
+
+    An orphan whose text is a substring of the kept transcript is stream
+    debris or a superseded generation, not a lost message — matched against
+    the header-order concatenation because rebuilds sometimes re-split one
+    streamed message into adjacent bubbles. Placement uses the only genuine
+    timestamps that survive a rebuild: the orphan's own createdAt and the
+    start/end stamps inside kept tool calls' binary envelopes. A turn-final
+    text belongs directly after the last tool that finished before it was
+    streamed, so it goes just before the next user message after that anchor.
+    """
+    header_ids = {h.get("bubbleId") for h in headers}
+    kept_texts = []
+    for h in headers:
+        text = (bubbles.get(h.get("bubbleId")) or {}).get("text") or ""
+        if text.strip():
+            kept_texts.append(text)
+    joined = "".join(kept_texts)
+
+    by_text: dict[str, dict] = {}
+    for bid, b in bubbles.items():
+        if bid in header_ids or b.get("type") != 2 or b.get("toolFormerData"):
+            continue
+        text = b.get("text") or ""
+        if not text.strip() or text in joined or _parse_ms(b.get("createdAt")) is None:
+            continue
+        prev = by_text.get(text)  # rebuilds can leave several copies: keep the original
+        if prev is None or _parse_ms(b["createdAt"]) < _parse_ms(prev["createdAt"]):
+            by_text[text] = b
+    # a partial stream snapshot of another lost message is not its own message
+    lost = [
+        b for t, b in by_text.items()
+        if not any(t != other and t in other for other in by_text)
+    ]
+    if not lost:
+        return {}
+
+    anchors = []  # (header index, epoch-ms), in header order
+    for i, h in enumerate(headers):
+        tf = (bubbles.get(h.get("bubbleId")) or {}).get("toolFormerData")
+        if isinstance(tf, dict):
+            start_ms, end_ms = cursor_binary.call_times_ms(tf)
+            if end_ms or start_ms:
+                anchors.append((i, end_ms or start_ms))
+
+    inserts: dict[int, list[dict]] = {}
+    for b in sorted(lost, key=lambda b: _parse_ms(b["createdAt"])):
+        t = _parse_ms(b["createdAt"])
+        before = [i for i, ms in anchors if ms <= t]
+        after = [i for i, ms in anchors if ms > t]
+        if before:
+            pos = next(
+                (j for j in range(before[-1] + 1, len(headers)) if headers[j].get("type") == 1),
+                len(headers),
+            )
+            if after:  # never push past chronologically later tool activity
+                pos = min(pos, after[0])
+        else:
+            pos = after[0] if after else len(headers)
+        inserts.setdefault(pos, []).append(b)
+    return inserts
+
+
 def parse_session_by_id(composer_id: str) -> dict | None:
     """Full structured parse of one Cursor conversation, in the Claude Code shape."""
     conn = _connect()
@@ -552,11 +637,29 @@ def parse_session_by_id(composer_id: str) -> dict | None:
         models_seen_set: set[str] = set()
 
         events: list[dict] = []
+        recovered = _recovered_inserts(headers, bubbles)
+
+        def emit_recovered(pos: int):
+            for rb in recovered.get(pos, ()):
+                if current_model and current_model not in models_seen_set:
+                    models_seen_set.add(current_model)
+                    models_seen.append(current_model)
+                events.append(
+                    {
+                        "kind": "assistant",
+                        "ts": rb.get("createdAt"),
+                        "model": current_model,
+                        "blocks": [{"type": "text", "text": rb["text"]}],
+                        "is_sidechain": False,
+                        "recovered": True,
+                    }
+                )
 
         # Each Cursor bubble (a thinking block, a text reply, or a tool call) is
         # emitted as its own event — like Claude Code renders each message as a
         # separate turn — rather than collapsing a whole turn into one box.
-        for h in headers:
+        for hi, h in enumerate(headers):
+            emit_recovered(hi)
             b = bubbles.get(h.get("bubbleId"))
             if not b:
                 continue
@@ -600,6 +703,7 @@ def parse_session_by_id(composer_id: str) -> dict | None:
                     "is_sidechain": False,
                 }
             )
+        emit_recovered(len(headers))
 
         cwd = _composer_cwd(d)
         meta = {}

@@ -28,7 +28,10 @@ Kinds
 - ``user``        — a real user prompt. Block or flat shape; flat shape may
                     carry ``images``/``local_images`` payloads.
 - ``assistant``   — a model turn. Block or flat shape; may carry
-                    ``turn_metadata`` (folded Codex bookkeeping) and ``usage``.
+                    ``turn_metadata`` (folded Codex bookkeeping) and ``usage``;
+                    ``recovered: true`` marks a message Cursor dropped from its
+                    conversation index, restored from an orphaned bubble row
+                    (timeline placement is approximate).
 - ``reasoning``   — Codex reasoning summary: ``text``, ``has_encrypted``.
 - ``tool``        — Codex tool call: ``name``, ``input``, ``summary``,
                     ``result`` (dict or null).

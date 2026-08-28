@@ -686,6 +686,12 @@ body.outline-collapsed #nav-buttons { right: 24px; }
   font-size: 9px; text-transform: uppercase; letter-spacing: .05em;
   padding: 1px 6px; border-radius: 4px; background: var(--bg-elev); color: var(--muted);
 }
+.recovered-tag {
+  font-size: 9px; text-transform: uppercase; letter-spacing: .05em;
+  padding: 1px 6px; border-radius: 4px; cursor: help;
+  color: light-dark(#8a5a00, #e8b45a);
+  background: rgba(217,144,10,.12); border: 1px solid rgba(217,144,10,.3);
+}
 .guardian-facts { display: flex; gap: 6px; flex-wrap: wrap; margin: 4px 0 8px; }
 .guardian-fact { font-weight: 600; }
 .guardian-fact-label { font-weight: 400; color: var(--muted); }
