@@ -346,6 +346,8 @@ let CONTENT_MATCHES = null;
 // Selected values for the dropdown filters; empty set = no constraint (all).
 const SELECTED_MODELS = new Set();
 const SELECTED_DIRS = new Set();
+// Inclusive local-date range over a session's last activity; "" = unbounded.
+const DATE_FILTER = { from: "", to: "" };
 // Parent session file keys whose linked subagent subtrees are hidden.
 // Kept outside renderSidebar so live polling does not reopen collapsed groups.
 const COLLAPSED_SUBAGENT_PARENTS = new Set();
@@ -455,6 +457,86 @@ function makeDropdown(title, groups, selected, onChange) {
   return wrap;
 }
 
+// Local calendar day of an epoch-seconds timestamp, as sortable "YYYY-MM-DD".
+function dayOf(mtime) {
+  const d = new Date((mtime || 0) * 1000);
+  return d.getFullYear() + "-" + String(d.getMonth() + 1).padStart(2, "0") +
+    "-" + String(d.getDate()).padStart(2, "0");
+}
+
+// "YYYY-MM-DD" for the day `back` days before today.
+function dayAgo(back) {
+  return dayOf(Date.now() / 1000 - back * 86400);
+}
+
+function makeDateDropdown(onChange) {
+  const wrap = el("div", { class: "dropdown" });
+  const count = el("span", { class: "dropdown-count" });
+  const btn = el("button", { class: "dropdown-btn" }, "Date", count, el("span", { class: "chev" }, "▾"));
+  const panel = el("div", { class: "dropdown-panel hidden" });
+
+  const fromInput = el("input", { type: "date" });
+  const toInput = el("input", { type: "date" });
+  fromInput.value = DATE_FILTER.from;
+  toInput.value = DATE_FILTER.to;
+
+  const shortDay = (day) => {
+    const [y, m, d] = day.split("-");
+    return Number(m) + "/" + Number(d);
+  };
+  const updateCount = () => {
+    const { from, to } = DATE_FILTER;
+    count.textContent =
+      from && to ? ` (${shortDay(from)}–${shortDay(to)})`
+      : from ? ` (≥ ${shortDay(from)})`
+      : to ? ` (≤ ${shortDay(to)})`
+      : "";
+  };
+  const apply = () => {
+    DATE_FILTER.from = fromInput.value || "";
+    DATE_FILTER.to = toInput.value || "";
+    updateCount(); onChange();
+  };
+  fromInput.addEventListener("change", apply);
+  toInput.addEventListener("change", apply);
+
+  panel.append(
+    el("label", { class: "dd-date-row" }, "From", fromInput),
+    el("label", { class: "dd-date-row" }, "To", toInput)
+  );
+
+  const preset = (label, back) => {
+    const b = el("button", { class: "dd-preset" }, label);
+    b.addEventListener("click", () => {
+      fromInput.value = dayAgo(back);
+      toInput.value = "";
+      apply();
+    });
+    return b;
+  };
+  panel.append(el("div", { class: "dd-presets" },
+    preset("Today", 0), preset("7 days", 7), preset("30 days", 30)));
+
+  const clear = el("button", { class: "dd-clear" }, "Clear");
+  clear.addEventListener("click", () => {
+    fromInput.value = toInput.value = "";
+    apply();
+  });
+  panel.append(clear);
+
+  btn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    const open = !panel.classList.contains("hidden");
+    $$(".dropdown-panel").forEach((p) => p.classList.add("hidden"));
+    panel.classList.toggle("hidden", open);
+  });
+  panel.addEventListener("click", (e) => e.stopPropagation());
+
+  updateCount();
+  wrap.append(btn, panel);
+  return wrap;
+}
+
 function buildFilters() {
   const host = $("#filter-dropdowns");
   host.innerHTML = "";
@@ -485,6 +567,8 @@ function buildFilters() {
     const items = dirs.map((d) => ({ value: d, label: shortPath(d) }));
     host.append(makeDropdown("Directory", [{ label: "", items }], SELECTED_DIRS, () => renderSidebar($("#search").value)));
   }
+
+  host.append(makeDateDropdown(() => renderSidebar($("#search").value)));
 }
 
 function renderSidebar(query) {
@@ -496,6 +580,11 @@ function renderSidebar(query) {
     if (AGENT_FILTER !== "all" && s.agent !== AGENT_FILTER) return false;
     if (SELECTED_MODELS.size && !SELECTED_MODELS.has(s.model || "")) return false;
     if (SELECTED_DIRS.size && !SELECTED_DIRS.has(s.cwd || "")) return false;
+    if (DATE_FILTER.from || DATE_FILTER.to) {
+      const day = dayOf(s.mtime);
+      if (DATE_FILTER.from && day < DATE_FILTER.from) return false;
+      if (DATE_FILTER.to && day > DATE_FILTER.to) return false;
+    }
     if (!q) return true;
     const metaHit = (
       s.title + " " + (s.original_title || "") + " " + (s.ai_title || "") + " " +

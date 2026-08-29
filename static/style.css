@@ -408,6 +408,22 @@ body.standalone.sidebar-collapsed .edge-toggle-left { display: none; }
 .dd-item.nested { padding-left: 22px; }
 .dd-item { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .dd-item input, .dd-group input { flex: none; accent-color: var(--accent); }
+.dd-date-row {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  padding: 4px 6px; font-size: 12px; color: var(--muted);
+}
+.dd-date-row input {
+  font: inherit; color: var(--text);
+  background: var(--bg-elev); border: 1px solid var(--border); border-radius: 6px;
+  padding: 3px 6px; color-scheme: inherit;
+}
+.dd-presets { display: flex; gap: 6px; padding: 4px 6px 2px; }
+.dd-preset {
+  font-size: 11px; padding: 2px 8px; cursor: pointer;
+  color: var(--text); background: var(--bg-elev);
+  border: 1px solid var(--border); border-radius: 999px;
+}
+.dd-preset:hover { border-color: var(--accent); }
 .dd-clear {
   display: block; width: 100%; margin-top: 6px; padding: 5px;
   font-size: 11px; border: 1px solid var(--border); border-radius: 6px;
