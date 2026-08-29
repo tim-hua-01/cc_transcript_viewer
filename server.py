@@ -12,7 +12,8 @@ Parsing lives in claude_parser.py / codex_parser.py / cursor_parser.py /
 opencode_parser.py (one module per transcript source, all emitting the same
 event shapes); this module is the HTTP layer plus what spans sources: the
 unified session list, full-text search, viewer-owned custom names, and
-summary-cache persistence.
+summary-cache persistence. Bundling a session into a shareable single-file
+HTML export lives in export_html.py.
 
 Usage:
     python server.py [--port 3132] [--projects-dir PATH] [--codex-home PATH]
@@ -36,6 +37,7 @@ from urllib.parse import parse_qs, urlparse
 import claude_parser as claude
 import codex_parser as codex
 import cursor_parser as cursor
+import export_html
 import opencode_parser as opencode
 
 STATIC_DIR = Path(__file__).parent / "static"
@@ -726,6 +728,42 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json({"error": "forbidden"}, status=403)
                 return
             self._send_json(data)
+            return
+
+        if route == "/api/export":
+            qs = parse_qs(parsed.query)
+            file_arg = qs.get("file", [""])[0]
+            if not file_arg:
+                self._send_json({"error": "missing file param"}, status=400)
+                return
+            if not file_arg.startswith(SYNTHETIC_SCHEMES):
+                target = Path(file_arg).expanduser().resolve()
+                if not target.exists():
+                    self._send_json({"error": "not found"}, status=404)
+                    return
+            try:
+                data = load_session(file_arg)
+                if data is None:
+                    self._send_json({"error": "forbidden"}, status=403)
+                    return
+                body = export_html.build_standalone_html(data).encode("utf-8")
+                filename = export_html.export_filename(data)
+            except Exception as e:  # noqa: BLE001
+                self._send_json({"error": str(e)}, status=500)
+                return
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                # export_filename() emits only [A-Za-z0-9-] plus ".html", so the
+                # quoted form needs no further escaping.
+                self.send_header(
+                    "Content-Disposition", f'attachment; filename="{filename}"'
+                )
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                self.close_connection = True
             return
 
         self.send_error(404)

@@ -219,6 +219,13 @@ function decorateMarkdownLinks(container, data) {
     const local = localFileLinkTarget(anchor, cwd);
     if (local) {
       anchor.classList.add("local-file-link");
+      // Nothing can open a file on the author's machine from a shared export,
+      // so the link becomes a labelled, unclickable path.
+      if (STANDALONE) {
+        anchor.removeAttribute("href");
+        anchor.title = "Local path on the original machine: " + local.path;
+        return;
+      }
       anchor.href = "#";
       anchor.setAttribute("role", "button");
       anchor.title = "Open with the default app: " + local.path
@@ -289,6 +296,14 @@ function fmtDuration(ms) {
   if (ms < 1000) return ms + "ms";
   return (ms / 1000).toFixed(ms < 10000 ? 1 : 0) + "s";
 }
+
+// ---------- standalone export mode ----------
+// A saved single-file transcript (see export_html.py) embeds its session here.
+// Such a page has no server behind it, so everything that would call one is
+// switched off and the session list is dropped; rendering is otherwise
+// identical, which is the whole reason the export reuses this file.
+const EXPORT_DATA = window.__TRANSCRIPT_EXPORT__ || null;
+const STANDALONE = !!EXPORT_DATA;
 
 // ---------- state ----------
 let SESSIONS = [];
@@ -702,6 +717,47 @@ async function copyAll(e) {
   setTimeout(() => { button.textContent = original; }, 1200);
 }
 
+// Content-Disposition: attachment; filename="foo.html"  ->  foo.html
+function filenameFromDisposition(header) {
+  const m = /filename="([^"]+)"/.exec(header || "");
+  return m ? m[1] : "";
+}
+
+// Download the open transcript as one self-contained HTML file: the viewer's
+// own UI with this session baked in, shareable without the server or the
+// original ~/.claude / ~/.codex / database it was read from.
+async function saveTranscriptHtml(e) {
+  const button = e.currentTarget;
+  const original = button.textContent;
+  if (button.dataset.saving === "1") return;
+  button.dataset.saving = "1";
+  button.textContent = "Saving…";
+  try {
+    const res = await fetch("/api/export?file=" + encodeURIComponent(CURRENT_FILE));
+    if (!res.ok) {
+      let detail = `HTTP ${res.status}`;
+      try { detail = (await res.json()).error || detail; } catch (_error) {}
+      throw new Error(detail);
+    }
+    const blob = await res.blob();
+    const name = filenameFromDisposition(res.headers.get("Content-Disposition")) || "transcript.html";
+    const url = URL.createObjectURL(blob);
+    const anchor = el("a", { href: url, download: name });
+    document.body.append(anchor);
+    anchor.click();
+    anchor.remove();
+    // Revoked late: Safari cancels the download if the blob dies too early.
+    setTimeout(() => URL.revokeObjectURL(url), 30000);
+    button.textContent = "Saved";
+  } catch (error) {
+    button.textContent = "Save failed";
+    button.title = "Could not save transcript: " + String(error);
+  } finally {
+    button.dataset.saving = "0";
+  }
+  setTimeout(() => { button.textContent = original; }, 1400);
+}
+
 function setPanelCollapsed(panel, collapsed) {
   document.body.classList.toggle(panel + "-collapsed", collapsed);
   try { localStorage.setItem("transcript-viewer:" + panel + "-collapsed", collapsed ? "1" : "0"); } catch (_error) {}
@@ -792,6 +848,7 @@ function showSessionContextMenu(e, file) {
 }
 
 async function openSession(file, itemEl) {
+  if (STANDALONE) return;
   CURRENT_FILE = file;
   location.hash = "file=" + encodeURIComponent(file);
   $$(".session-item.active").forEach((n) => n.classList.remove("active"));
@@ -851,7 +908,7 @@ function renderTranscript(data, opts = {}) {
           : null,
         " " + (data.title || "(untitled session)")
       ),
-      el("button", {
+      STANDALONE ? null : el("button", {
         class: "rename-btn",
         title: "Rename transcript",
         "aria-label": "Rename transcript",
@@ -870,19 +927,22 @@ function renderTranscript(data, opts = {}) {
       "div",
       { class: "t-meta" },
       data.is_subagent && data.parent_file
-        ? el(
-            "a",
-            {
-              class: "parent-link",
-              href: "#",
-              onclick: (e) => { e.preventDefault(); openSession(data.parent_file); },
-            },
-            "↑ parent session"
-          )
+        ? (STANDALONE
+            ? el("span", { class: "parent-link", title: "The parent session is not part of this export" },
+                "↑ parent session")
+            : el(
+                "a",
+                {
+                  class: "parent-link",
+                  href: "#",
+                  onclick: (e) => { e.preventDefault(); openSession(data.parent_file); },
+                },
+                "↑ parent session"
+              ))
         : null,
       // Cross-session fork: link back to the session this one branched from.
       data.forked_from
-        ? (data.forked_from.file
+        ? (data.forked_from.file && !STANDALONE
             ? el(
                 "a",
                 {
@@ -920,7 +980,7 @@ function renderTranscript(data, opts = {}) {
       meta.version ? el("span", {}, "v" + meta.version) : null,
       el("span", {}, data.events.length + " events"),
       el("span", { class: "session-id", style: "margin:0", title: "Click to copy", onclick: (e) => copyId(e, data.id) }, "id: " + data.id),
-      hasTranscriptFile(transcriptFile)
+      !STANDALONE && hasTranscriptFile(transcriptFile)
         ? el("button", {
             class: "reveal-btn",
             title: "Show the transcript file in Finder: " + transcriptFile,
@@ -937,6 +997,11 @@ function renderTranscript(data, opts = {}) {
       el("button", { class: "btn", onclick: () => setAll(".tool-block", true) }, "Collapse tools"),
       el("button", { class: "btn", onclick: () => setAll(".tool-block", false) }, "Expand tools"),
       el("button", { class: "btn", onclick: copyAll, title: "Copy transcript as plain text" }, "Copy all text"),
+      STANDALONE ? null : el("button", {
+        class: "btn",
+        onclick: saveTranscriptHtml,
+        title: "Download this transcript as one self-contained HTML file you can share",
+      }, "Save HTML"),
       el("button", { class: "btn", onclick: scrollToEnd }, "⤓ Jump to end")
     )
   );
@@ -1664,7 +1729,8 @@ function renderTool(b) {
   bodyKids.push(fmt.inputNode);
   // opencode records which session a `task` call spawned, so the sub-agent's
   // own transcript is one click away rather than a hunt through the sidebar.
-  if (b.child_file) {
+  // An export carries one session, so there is nothing on the other end of it.
+  if (b.child_file && !STANDALONE) {
     bodyKids.push(
       el("a", {
         href: "#", class: "parent-link",
@@ -2161,11 +2227,13 @@ async function pollSidebar() {
     sidebarPolling = false;
   }
 }
-setInterval(pollOpenTranscript, TRANSCRIPT_POLL_MS);
-setInterval(pollSidebar, SIDEBAR_POLL_MS);
+if (!STANDALONE) {
+  setInterval(pollOpenTranscript, TRANSCRIPT_POLL_MS);
+  setInterval(pollSidebar, SIDEBAR_POLL_MS);
+}
 
 document.addEventListener("keydown", (e) => {
-  if (e.key === "/" && document.activeElement !== $("#search")) {
+  if (e.key === "/" && !STANDALONE && document.activeElement !== $("#search")) {
     e.preventDefault();
     $("#search").focus();
   }
@@ -2213,5 +2281,16 @@ window.addEventListener("hashchange", () => {
   if (file && file !== CURRENT_FILE) openSession(file);
 });
 
+// A saved export already holds its one session, so there is nothing to fetch
+// and nothing to list: render straight from the embedded payload.
+function startStandalone() {
+  document.body.classList.add("standalone");
+  CURRENT_FILE = EXPORT_DATA.file || null;
+  $("#welcome").hidden = true;
+  $("#transcript").hidden = false;
+  renderTranscript(EXPORT_DATA);
+}
+
 buildThemePicker();
-loadSessions().then(openFromHash);
+if (STANDALONE) startStandalone();
+else loadSessions().then(openFromHash);

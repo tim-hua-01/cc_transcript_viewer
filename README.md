@@ -114,6 +114,24 @@ accumulated.
   their trigger, before/after token counts, duration, and preserved message/tool counts. Codex
   boundaries show the context-window number, replacement-item count, and whether the replacement
   summary is encrypted and therefore unreadable from the transcript.
+- **Save transcript as a self-contained HTML file.** **Save HTML**, in the transcript controls,
+  downloads the open session as a single `.html` file you can hand to someone else — no server, no
+  `~/.claude` / `~/.codex` / Cursor or opencode database, no other sessions. It is the viewer's own
+  UI with one transcript baked in: `style.css` and `app.js` are inlined verbatim and the parsed
+  session is embedded as JSON, so the saved page renders through exactly the same code (same themes,
+  outline, collapsible thinking/tools, colorized diffs) rather than a separate export renderer that
+  could drift. Locally-referenced images are re-embedded as `data:` URIs; images that are missing or
+  larger than 4 MB (24 MB across the file) degrade to the viewer's "image omitted" note.
+  Server-backed features switch themselves off in a saved file — no session list, no live polling,
+  no rename, no reveal-in-Finder, and local file paths become labels instead of links. Markdown and
+  math still come from the same pinned, SRI-hashed CDN scripts the app uses, so an offline reader
+  gets plain text rather than rendered Markdown; everything else works with no network at all.
+
+  > [!WARNING]
+  > A saved transcript contains **the whole session** — prompts, replies, reasoning, tool commands
+  > and their output, file contents that were read or written, your `cwd` and branch names, and any
+  > secrets that passed through the conversation. Read it before you share it.
+
 - **Pull-request links.** Claude Code sessions associated with a PR show a safe, clickable PR link in
   the transcript header.
 - **Local source links.** Absolute Markdown links inside a session's workspace open through macOS
@@ -179,6 +197,11 @@ This app reads your private transcripts, so it's built to keep them on your mach
 - **Local opens are confined.** `/api/open-local` accepts only JSON POSTs, resolves the requested
   path inside the selected session's workspace, rejects executables and application-like file types,
   and invokes `/usr/bin/open` directly without a shell. It is unavailable on non-macOS hosts.
+- **Exports are confined, and are the one thing that leaves.** `/api/export` resolves its `file`
+  through the same allowlist as `/api/session`, and embeds only that session plus the image files it
+  already referenced (image-typed only, as with `/api/local-image`). Nothing is uploaded — the file
+  lands in your downloads folder. But a saved transcript *is* the whole session in one shareable
+  file, so sharing one is on you: read it before you send it.
 
 These guarantees are enforced by a zero-dependency test suite — run it yourself:
 
@@ -344,7 +367,7 @@ Restart Claude Code (or run `/config` once) for the change to take effect. Note 
 
 | File | Role |
 |------|------|
-| `server.py` | The unified stdlib HTTP layer plus everything that spans sources: merges the parsers' session lists into one time-sorted sidebar list, dispatches `/api/session` to the right parser by transcript root / `cursordb:`/`cursorcli:`/`opencode:` scheme, runs full-text search, owns custom names and summary-cache persistence, and serves the JSON API (`/api/sessions`, `/api/session?file=...`, `/api/session-name`, `/api/search?q=...`, `/api/local-image`) plus the static frontend. `/api/session` only serves files under the allowed roots; `/api/session-name` only updates the viewer-owned names file; `/api/local-image` serves only image-typed files; and a `Host`-header allowlist guards the loopback server against DNS rebinding. |
+| `server.py` | The unified stdlib HTTP layer plus everything that spans sources: merges the parsers' session lists into one time-sorted sidebar list, dispatches `/api/session` to the right parser by transcript root / `cursordb:`/`cursorcli:`/`opencode:` scheme, runs full-text search, owns custom names and summary-cache persistence, and serves the JSON API (`/api/sessions`, `/api/session?file=...`, `/api/session-name`, `/api/search?q=...`, `/api/local-image`, `/api/export?file=...`) plus the static frontend. `/api/session` only serves files under the allowed roots; `/api/session-name` only updates the viewer-owned names file; `/api/local-image` serves only image-typed files; and a `Host`-header allowlist guards the loopback server against DNS rebinding. |
 | `claude_parser.py` | Claude Code parsing library (imported by `server.py`): parses session JSONL into a clean event stream (pairing tool results to calls), detects system-injected "user" records, folds rewound/edited branches into collapsible markers, labels sub-agents from their spawning `Task`/`Agent` calls, and builds sidebar summaries (cold scans use a process pool). Call `configure(projects_dir)` to point it elsewhere. |
 | `codex_parser.py` | Codex parsing library: parses rollout JSONL, reads `state_5.sqlite` metadata, pairs tool calls with outputs, unpacks orchestration-style `exec` calls, correlates local and embedded prompt images, consolidates per-turn bookkeeping, recognizes guardian/sub-agent relationships, and renders `apply_patch` diffs. Call `configure(codex_home)` to point it elsewhere. |
 | `cursor_parser.py` | Cursor parsing library: reads IDE `state.vscdb`; reads CLI `~/.cursor/chats/.../store.db` (with JSONL fallback under `agent-transcripts`); normalizes tool names/inputs; reconstructs IDE `edit_file` diffs; decodes grep/glob results out of Cursor's binary protobuf tool records (`toolCallBinary`) since newer Cursor versions no longer store them as JSON; emits Claude-shaped events. IDE uses `cursordb:<id>`; CLI store uses `cursorcli:<id>`. Call `configure(db_path, projects_dir=…, chats_dir=…)` to retarget. |
@@ -352,10 +375,12 @@ Restart Claude Code (or run `/config` once) for the change to take effect. Note 
 | `opencode_parser.py` | opencode parsing library: reads the single SQLite database at `~/.local/share/opencode/opencode.db` (`session` / `message` / `part` tables), folds each message's parts into block-shaped events, attaches each tool part's own result, renames opencode's camelCase tool arguments onto the canonical names, links `task` calls to the sub-agent session they spawned, flags thinking whose real reasoning came back encrypted, and drops the per-token provider `reasoning_details` noise. Sessions are addressed as `opencode:<id>`; the list cache is keyed on the database *and* its write-ahead log, so a live session is not served stale. Call `configure(db_path)` to retarget. |
 | `opencode_to_codex.py` | Exports opencode sessions as Codex rollout JSONL, carrying the provider's encrypted reasoning (`reasoning.encrypted` → `encrypted_content`) and splitting opencode's fused tool record into Codex's separate `function_call` / `function_call_output`. Records the provider's reasoning `format` so a non-OpenAI blob isn't mistaken for a replayable one. |
 | `codex_rollout.py` | The parts of writing a Codex rollout that aren't specific to any source — record shape, `rollout-<time>-<id>.jsonl` naming, dated output layout — shared by both exporters so they can't drift. |
+| `export_html.py` | Bundles one parsed session into a self-contained HTML file for `/api/export`: inlines `static/style.css` and `static/app.js` into `static/index.html`, embeds the session as a JSON literal, and re-embeds locally-referenced images as `data:` URIs under a per-image and whole-file size budget. Deliberately has no renderer of its own — the saved page runs the same `app.js`, which detects the embedded payload and switches to standalone mode. |
 | `common.py` | Helpers shared by the parsers: JSONL iteration, title truncation, timestamp conversion, and the thread-safe fingerprint-keyed `SummaryCache` all of them use. |
 | `event_schema.py` | The written-down (and machine-checked) event contract between the parsers and the frontend: every event kind, both message shapes, and validators the test suite runs over every parser's output. |
-| `static/index.html`, `static/style.css`, `static/app.js` | The single frontend (vanilla JS, no build step). `app.js` dispatches on event kind and renders the Claude Code / Cursor / opencode (block-based) and Codex (flat) shapes, and runs the always-on live-refresh poll loop. CDN assets (marked, DOMPurify, KaTeX) are version-pinned with SRI integrity hashes. |
+| `static/index.html`, `static/style.css`, `static/app.js` | The single frontend (vanilla JS, no build step). `app.js` dispatches on event kind and renders the Claude Code / Cursor / opencode (block-based) and Codex (flat) shapes, and runs the always-on live-refresh poll loop. When `window.__TRANSCRIPT_EXPORT__` is present (a saved single-file transcript) it renders that session directly and disables everything that needs the server. CDN assets (marked, DOMPurify, KaTeX) are version-pinned with SRI integrity hashes. |
 | `test_security.py` | Zero-dependency security tests (`python3 -m unittest test_security`): asserts no outbound connections at runtime, no network-client imports, loopback default bind, the `Host`-header rebinding guard, that `/api/session` is confined to the transcript roots while `/api/local-image` serves images only, and that every CDN asset is version-pinned and SRI-hashed. |
+| `test_export.py` | Tests for the single-file export: the document inlines its assets and points at no server, transcript text can't break out of the embedded JSON, local images become `data:` URIs (and degrade to a note when missing, oversized, or not an image), `/api/export` enforces the same path allowlist as `/api/session`, and `app.js`/`style.css` still carry the standalone wiring the export depends on. |
 | `test_opencode_to_codex.py` | Tests for the opencode exporter: encrypted reasoning survives, the fused tool record splits into two, timestamps come from the parts' own clocks, and the output reparses through `codex_parser` as a valid `opencode`-labelled session. |
 | `test_parsers.py` | Characterization tests for the parser internals: branch folding, the Codex JS-literal orchestration parser, Cursor blob/JSON extraction and diff reconstruction, queued prompts with images, and opencode's
 part→event mapping (argument renaming, tool states, sub-agent linkage, provider-noise stripping). |

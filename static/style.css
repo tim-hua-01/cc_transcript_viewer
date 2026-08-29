@@ -158,6 +158,12 @@ body.outline-collapsed #outline { display: none; }
 body.has-outline.outline-collapsed .edge-toggle-right { display: block; }
 body.outline-collapsed #nav-buttons { right: 24px; }
 
+/* Standalone export: one session, no server. The session list and its toggle
+   have nothing to show, so they are removed rather than merely collapsed. */
+body.standalone #sidebar,
+body.standalone .edge-toggle-left,
+body.standalone.sidebar-collapsed .edge-toggle-left { display: none; }
+
 /* ---------- Sidebar ---------- */
 #sidebar {
   width: 340px;
