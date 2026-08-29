@@ -627,7 +627,11 @@ class StoreSummaryCacheTests(unittest.TestCase):
                     again = cursor.cli_store_summary(store)
                 finally:
                     cursor._iter_store_role_messages = original
-                self.assertEqual(again, first)
+                # The recency follows the file (the sidebar sorts by it), but
+                # everything content-derived is reused, not recomputed.
+                self.assertGreater(again["mtime"], first["mtime"])
+                without_mtime = lambda s: {k: v for k, v in s.items() if k != "mtime"}
+                self.assertEqual(without_mtime(again), without_mtime(first))
             finally:
                 cursor.configure(None)
 

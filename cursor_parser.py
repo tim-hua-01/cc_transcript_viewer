@@ -1434,9 +1434,13 @@ def cli_store_summary(path: Path) -> dict | None:
         content = _store_content_fingerprint(conn, path)
         if entry and isinstance(entry[0], list) and len(entry[0]) == 2 and entry[0][1] == content:
             # Only the mtime moved; the store's content is unchanged. Reuse the
-            # summary and refresh the fast fingerprint for the next poll.
-            SUMMARY_CACHE.put(key, [fast, content], entry[1])
-            return entry[1]
+            # summary, but refresh its recency from the file (a full recompute
+            # would have picked the new mtime up, and the sidebar sorts by it)
+            # along with the fast fingerprint for the next poll.
+            summary = dict(entry[1])
+            summary["mtime"] = _store_db_mtime(path)
+            SUMMARY_CACHE.put(key, [fast, content], summary)
+            return summary
         summary = _cli_store_summary_uncached(conn, path)
         if summary is not None:
             SUMMARY_CACHE.put(key, [fast, content], summary)
