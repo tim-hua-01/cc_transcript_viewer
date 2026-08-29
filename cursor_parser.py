@@ -1150,42 +1150,46 @@ def _read_sidecar_meta(store_path: Path) -> dict:
         return {}
 
 
+_JSON_DECODER = json.JSONDecoder()
+
+
 def _extract_json_objects(data: bytes) -> list:
-    """Pull balanced JSON objects out of a blob (plain JSON or binary wrapper)."""
+    """Pull the JSON objects out of a blob (plain JSON or binary wrapper).
+
+    Real messages are valid UTF-8 JSON between stretches of binary framing.
+    Try a real (C-speed) parse at each '{' and jump over whatever parses;
+    a '{' that doesn't start valid JSON is framing noise and the scan hops to
+    the next candidate. This replaced a hand-rolled Python brace balancer that
+    took ~20s over a big chat's store.db; surrogateescape keeps invalid bytes
+    representable, and a parse that covered any is re-checked and dropped,
+    matching the strict json.loads(bytes) behavior of the original.
+    """
+    text = data.decode("utf-8", errors="surrogateescape")
+    scan = _JSON_DECODER.scan_once  # the C scanner; unlike raw_decode, a miss
+    # raises a cheap StopIteration instead of building a JSONDecodeError whose
+    # constructor counts newlines over the whole prefix (quadratic on framing).
     out = []
-    i = 0
-    n = len(data)
-    while i < n:
-        if data[i] != 0x7B:  # '{'
-            i += 1
-            continue
-        depth = 0
-        in_str = False
-        esc = False
-        for j in range(i, n):
-            c = data[j]
-            if in_str:
-                if esc:
-                    esc = False
-                elif c == 0x5C:  # '\\'
-                    esc = True
-                elif c == 0x22:  # '"'
-                    in_str = False
+    n = len(text)
+    pos = text.find("{")
+    while pos != -1:
+        nxt = text[pos + 1] if pos + 1 < n else ""
+        # A JSON object continues with a key, '}', or whitespace — anything
+        # else is framing noise, not worth handing to the scanner.
+        if nxt == '"' or nxt == "}" or nxt.isspace():
+            try:
+                obj, end = scan(text, pos)
+            except (StopIteration, ValueError):
+                pass
             else:
-                if c == 0x22:
-                    in_str = True
-                elif c == 0x7B:
-                    depth += 1
-                elif c == 0x7D:  # '}'
-                    depth -= 1
-                    if depth == 0:
-                        try:
-                            out.append(json.loads(data[i : j + 1]))
-                        except (json.JSONDecodeError, UnicodeDecodeError):
-                            pass
-                        i = j
-                        break
-        i += 1
+                try:
+                    text[pos:end].encode("utf-8")
+                except UnicodeEncodeError:
+                    pass
+                else:
+                    out.append(obj)
+                    pos = text.find("{", end)
+                    continue
+        pos = text.find("{", pos + 1)
     return out
 
 

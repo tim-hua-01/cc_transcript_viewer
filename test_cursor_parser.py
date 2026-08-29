@@ -575,6 +575,31 @@ class CursorOrphanRecoveryTests(unittest.TestCase):
         self.assertFalse(any(e.get("recovered") for e in events))
         self.assertEqual(len(events), 2)
 
+class ExtractJsonObjectsTests(unittest.TestCase):
+    """The blob scanner: real messages are valid UTF-8 JSON between stretches
+    of binary framing, and must be found even when the framing contains stray
+    braces and quotes that would desync a naive brace balancer."""
+
+    def test_finds_objects_between_binary_framing(self):
+        message = {"role": "user", "content": "hello"}
+        blob = b"\x00\x12{\x22junk" + json.dumps(message).encode() + b"\xff{trailing"
+        self.assertIn(message, cursor._extract_json_objects(blob))
+
+    def test_framing_quotes_do_not_swallow_later_messages(self):
+        # A lone '"' in the framing must not put the scanner "inside a string"
+        # and hide everything after it.
+        first = {"role": "assistant", "content": [{"type": "text", "text": "a"}]}
+        second = {"role": "user", "content": "b"}
+        blob = b'\x22\x00{' + json.dumps(first).encode() + b'\x00\x22\x00' + json.dumps(second).encode()
+        found = cursor._extract_json_objects(blob)
+        self.assertIn(first, found)
+        self.assertIn(second, found)
+
+    def test_object_with_invalid_utf8_is_dropped(self):
+        blob = b'{"role": "user", "content": "\xff\xfe"}'
+        self.assertEqual(cursor._extract_json_objects(blob), [])
+
+
 class StoreSummaryCacheTests(unittest.TestCase):
     """The two-level store.db fingerprint: an mtime-only touch (another
     process, a backup tool, a cache-format migration) must revalidate through
