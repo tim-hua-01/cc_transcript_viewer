@@ -23,7 +23,6 @@ claude_parser and cursor_parser use, not Codex's flat shape.
 
 from __future__ import annotations
 
-import json
 import sqlite3
 from pathlib import Path
 
@@ -79,11 +78,9 @@ def _connect() -> sqlite3.Connection | None:
     if not DB_PATH.exists():
         return None
     try:
-        conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True, timeout=2.0)
+        return common.connect_ro(DB_PATH, row_factory=sqlite3.Row)
     except sqlite3.Error:
         return None
-    conn.row_factory = sqlite3.Row
-    return conn
 
 
 def _db_identity() -> tuple | None:
@@ -100,18 +97,8 @@ def _db_identity() -> tuple | None:
     return identity + (common.file_identity(DB_PATH.with_name(DB_PATH.name + "-wal")),)
 
 
-def _loads(value):
-    if value is None:
-        return None
-    try:
-        return json.loads(value)
-    except (json.JSONDecodeError, TypeError):
-        return None
-
-
-def _iso_from_ms(ms) -> str | None:
-    # None (not "") when missing, matching the other database-backed parser.
-    return common.iso_from_ms(ms) or None
+_loads = common.loads_or_none
+_iso_from_ms = common.iso_from_ms_or_none
 
 
 def _model_name(model) -> str:
@@ -189,25 +176,23 @@ def _summary(conn: sqlite3.Connection, row: sqlite3.Row, counts: dict) -> dict:
         title = common.short_title(_first_user_text(conn, session_id)) or "(untitled session)"
     model = _model_name(_loads(row["model"]))
     created, updated = row["time_created"], row["time_updated"] or row["time_created"]
-    summary = {
-        "agent": "opencode",
-        "id": session_id,
-        "file": SESSION_SCHEME + session_id,
-        "title": title,
-        "cwd": row["directory"] or "",
-        "git_branch": "",
-        "version": row["version"] or "",
-        "first_ts": _iso_from_ms(created),
-        "last_ts": _iso_from_ms(updated),
-        "n_user": counts["n_user"],
-        "n_assistant": counts["n_assistant"],
-        "n_tool": counts["n_tool"],
-        "n_web": counts["n_web"],
-        "n_records": counts["n_records"],
-        "model": model,
-        "models": [model] if model else [],
-        "mtime": (updated / 1000) if updated else 0,
-    }
+    summary = common.make_summary(
+        agent="opencode",
+        id=session_id,
+        file=SESSION_SCHEME + session_id,
+        title=title,
+        cwd=row["directory"] or "",
+        version=row["version"] or "",
+        first_ts=_iso_from_ms(created),
+        last_ts=_iso_from_ms(updated),
+        n_user=counts["n_user"],
+        n_assistant=counts["n_assistant"],
+        n_tool=counts["n_tool"],
+        n_web=counts["n_web"],
+        n_records=counts["n_records"],
+        model=model,
+        mtime=(updated / 1000) if updated else 0,
+    )
     if row["parent_id"]:
         summary["is_subagent"] = True
         summary["parent_id"] = row["parent_id"]
@@ -365,7 +350,7 @@ def _error_text(error) -> str:
     return f"{name}: {message}" if message else name
 
 
-def _user_events(message: dict, parts: list[dict], ts) -> list[dict]:
+def _user_events(parts: list[dict], ts) -> list[dict]:
     """Events for one user turn: the prompt itself plus any injected records."""
     events: list[dict] = []
     blocks: list[dict] = []
@@ -548,7 +533,7 @@ def parse_session_by_id(session_id: str) -> dict | None:
         parts = parts_by_message.get(message_row["id"], [])
         ts = _iso_from_ms((message.get("time") or {}).get("created"))
         if message.get("role") == "user":
-            events.extend(_user_events(message, parts, ts))
+            events.extend(_user_events(parts, ts))
         else:
             events.extend(_assistant_events(message, parts, ts))
             model = _model_name({

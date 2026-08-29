@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """The event contract between the parsers and the frontend.
 
-Every parser (claude_parser, codex_parser, cursor_parser) emits a session as
+Every parser (claude_parser, codex_parser, cursor_parser, opencode_parser)
+emits a session as
 ``{"agent", "id", "title", "meta", "events", ...}`` where ``events`` is a flat
 list of dicts, each with a ``kind``. The frontend's renderEvent() dispatches on
 ``kind``; this module is the single written-down description of what each kind
@@ -10,7 +11,7 @@ the contract can't silently drift.
 
 Two message shapes exist for ``user``/``assistant`` events:
 
-- **Block shape** (Claude Code and Cursor): a ``blocks`` list whose items are
+- **Block shape** (Claude Code, Cursor, and opencode): a ``blocks`` list whose items are
   ``{"type": "text"|"thinking"|"image"|"tool_use", ...}``. A ``thinking``
   block may carry ``has_encrypted`` when the provider also returned an opaque
   reasoning blob, i.e. the text is a summary. Tool calls ride
@@ -95,7 +96,7 @@ def _validate_block(b, where: str, errors: list) -> None:
 
 
 def validate_event(ev, where: str = "event") -> list[str]:
-    """Return a list of contract violations for one event ('' problems == valid)."""
+    """Return a list of contract violations for one event (empty == valid)."""
     errors: list[str] = []
     if not isinstance(ev, dict):
         return [f"{where}: event is not a dict"]
@@ -164,10 +165,13 @@ def validate_event(ev, where: str = "event") -> list[str]:
     return errors
 
 
-# Fields every sidebar summary must carry, for every agent and source.
+# Fields every sidebar summary must carry, for every agent and source — the
+# same core that common.make_summary() emits. Per-agent extras (ai_title,
+# cursor_source, tokens_used, sub-agent fields, …) are allowed on top.
 REQUIRED_SUMMARY_FIELDS = {
-    "agent", "id", "file", "title", "cwd", "mtime",
-    "n_user", "n_assistant", "n_tool", "n_records",
+    "agent", "id", "file", "title", "cwd", "git_branch", "version",
+    "first_ts", "last_ts", "n_user", "n_assistant", "n_tool", "n_web",
+    "n_records", "model", "mtime",
 }
 
 

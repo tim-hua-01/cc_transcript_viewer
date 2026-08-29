@@ -115,5 +115,20 @@ class SummaryCacheTests(unittest.TestCase):
         self.assertIsNone(cache.get("bad-types", (1, 2)))
 
 
+    def test_save_merges_with_entries_from_other_processes(self):
+        """Several viewer processes share the cache file; one process's save
+        must not discard entries another process computed."""
+        claude.SUMMARY_CACHE.put("/theirs/session.jsonl", [1, 2], {"title": "theirs"})
+        server.save_summary_caches()
+
+        claude.SUMMARY_CACHE.clear()
+        claude.SUMMARY_CACHE.put("/ours/session.jsonl", [3, 4], {"title": "ours"})
+        server.save_summary_caches()
+
+        payload = json.loads(server.CACHE_FILE.read_text(encoding="utf-8"))
+        self.assertIn("/theirs/session.jsonl", payload["claude"])
+        self.assertIn("/ours/session.jsonl", payload["claude"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -285,8 +285,7 @@ body.standalone.sidebar-collapsed .edge-toggle-left { display: none; }
   border: 2px solid; border-color: #fff #555 #555 #fff; border-radius: 0;
   background: var(--bg-elev); box-shadow: inset 1px 1px #fff, inset -1px -1px #888;
 }
-:root[data-theme="nineties"] .filter-chip.on,
-:root[data-theme="nineties"] .btn.on {
+:root[data-theme="nineties"] .filter-chip.on {
   color: #fff; background: var(--accent); border-color: #555 #fff #fff #555;
 }
 :root[data-theme="nineties"] .theme-menu,
@@ -311,8 +310,7 @@ body.standalone.sidebar-collapsed .edge-toggle-left { display: none; }
   color: var(--text); background: #fff; border: 1px solid #111; border-radius: 5px;
   box-shadow: inset 0 0 0 1px #fff, 1px 1px 0 #111;
 }
-:root[data-theme="system7"] .filter-chip.on,
-:root[data-theme="system7"] .btn.on { color: #fff; background: #111; }
+:root[data-theme="system7"] .filter-chip.on { color: #fff; background: #111; }
 :root[data-theme="system7"] .theme-menu,
 :root[data-theme="system7"] .dropdown-panel { border: 2px solid #111; border-radius: 0; box-shadow: 3px 3px 0 #777; }
 
@@ -370,8 +368,8 @@ body.standalone.sidebar-collapsed .edge-toggle-left { display: none; }
   border-radius: 8px;
   color: var(--text);
   font-size: 13px;
+  transition: border-color var(--ease), box-shadow var(--ease);
 }
-#search { transition: border-color var(--ease), box-shadow var(--ease); }
 #search:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--focus-ring); }
 #sidebar-stats { margin-top: 8px; font-size: 11px; }
 
@@ -655,7 +653,6 @@ body.standalone.sidebar-collapsed .edge-toggle-left { display: none; }
   color: var(--text); cursor: pointer;
 }
 .btn:hover { border-color: var(--accent); }
-.btn.on { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
 .btn, .filter-chip, .dropdown-btn, .dd-clear, .nav-btn {
   transition: background var(--ease), border-color var(--ease), color var(--ease), box-shadow var(--ease), transform var(--ease);
 }
@@ -710,8 +707,11 @@ body.standalone.sidebar-collapsed .edge-toggle-left { display: none; }
 .turn-metadata .tool-head { padding: 7px 0 2px; background: transparent; color: var(--muted); }
 .turn-metadata .tool-name { font-family: var(--sans); font-weight: 500; }
 .turn-metadata .tool-body { padding: 8px 0 0; border-top: 0; }
-.turn-metadata.collapsed .chev { transform: rotate(-90deg); }
-.turn-metadata.collapsed .tool-body { display: none; }
+/* Every chevron-headed block collapses the same way (.collapsible is added
+   by toggleHead in app.js). */
+.collapsible.collapsed .chev { transform: rotate(-90deg); }
+.collapsible.collapsed > .tool-body,
+.collapsible.collapsed > .thinking-body { display: none; }
 pre.guardian-review-context { max-height: 640px; margin: 8px 0 12px; }
 
 /* Markdown body */
@@ -743,8 +743,6 @@ pre.guardian-review-context { max-height: 640px; margin: 8px 0 12px; }
   font-size: 12px; color: var(--thinking); display: flex; align-items: center; gap: 6px;
 }
 .thinking-head .chev { font-size: 9px; transition: transform .15s; }
-.thinking-block.collapsed .chev { transform: rotate(-90deg); }
-.thinking-block.collapsed .thinking-body { display: none; }
 .thinking-body { padding: 0 12px 10px; color: var(--thinking-body); font-size: 13px; }
 .thinking-empty { font-style: italic; color: var(--muted); }
 .thinking-block.empty .thinking-head { color: var(--muted); }
@@ -758,8 +756,6 @@ pre.guardian-review-context { max-height: 640px; margin: 8px 0 12px; }
 }
 .tool-block.error .tool-head { background: rgba(209,36,47,.08); }
 .tool-head .chev { font-size: 9px; transition: transform .15s; color: var(--muted); }
-.tool-block.collapsed .chev { transform: rotate(-90deg); }
-.tool-block.collapsed .tool-body { display: none; }
 .tool-icon { color: var(--tool); }
 .tool-block.error .tool-icon { color: var(--tool-err); }
 .tool-name { font-weight: 600; font-family: var(--mono); }
@@ -805,7 +801,6 @@ pre.payload.truncatable { max-height: 240px; }
   border-color: rgba(107,79,187,.22);
 }
 .turn-tool .turn-head,
-.turn-web_search .turn-head,
 .turn-web_call .turn-head {
   color: var(--tool);
   background: rgba(31,122,69,.07);
@@ -824,9 +819,6 @@ pre.payload.truncatable { max-height: 240px; }
   border-color: rgba(107,79,187,.18);
 }
 
-.token-event { display: none; opacity: .72; }
-body.show-tokens .token-event { display: block; }
-
 .phase-tag, .status-tag {
   font-size: 10px; padding: 1px 6px; border-radius: 4px;
   background: var(--bg-elev); color: var(--muted);
@@ -838,8 +830,6 @@ body.show-tokens .token-event { display: block; }
   padding: 7px 12px; font-size: 12.5px;
 }
 .status-block .tool-head .chev, .instructions-block .tool-head .chev { font-size: 9px; transition: transform .15s; color: var(--muted); }
-.status-block.collapsed .chev, .instructions-block.collapsed .chev { transform: rotate(-90deg); }
-.status-block.collapsed .tool-body, .instructions-block.collapsed .tool-body { display: none; }
 
 /* Abandoned branch (rewound path), folded into a collapsible marker at the fork. */
 .branch-block { margin: 6px 0; border: 1px dashed var(--border); border-radius: 8px; overflow: hidden; background: repeating-linear-gradient(45deg, var(--bg-alt), var(--bg-alt) 10px, transparent 10px, transparent 20px); }
@@ -848,8 +838,6 @@ body.show-tokens .token-event { display: block; }
   padding: 7px 12px; font-size: 12px; color: var(--muted); background: var(--bg-alt);
 }
 .branch-block .tool-head .chev { font-size: 9px; transition: transform .15s; color: var(--muted); }
-.branch-block.collapsed .chev { transform: rotate(-90deg); }
-.branch-block.collapsed .tool-body { display: none; }
 .branch-block .tool-body { padding: 6px 12px 10px; border-top: 1px dashed var(--border); }
 /* Dim the rewound turns so they read as context, not the live thread. */
 .branch-block .turn { opacity: .82; }

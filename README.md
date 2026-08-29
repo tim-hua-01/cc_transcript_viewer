@@ -22,11 +22,18 @@ and has a [test suite](#privacy--security) that verifies those guarantees.
 > **This is vibe-coded.** It was built quickly and iteratively with an AI coding agent, so expect
 > rough edges and the occasional rendering bug. It also depends on the *current* on-disk transcript
 > formats of Claude Code, Codex, Cursor, and opencode — if any tool changes how it saves sessions, parts of the
-> viewer may silently break or drop records until the parser is updated.
+> viewer may silently break or drop records until the parser is updated. If you'd rather not run
+> someone else's vibe-code at all, [prompt_request.md](prompt_request.md) is a build-it-yourself
+> prompt for your own coding agent (it describes the original Claude Code + Codex core; the Cursor
+> and opencode sources came later).
 
 ## Run it
 
+Python 3.9+ and the standard library are all it needs — no `pip install`, no build step:
+
 ```bash
+git clone https://github.com/tim-hua-01/cc_transcript_viewer.git
+cd cc_transcript_viewer
 python3 server.py
 ```
 
@@ -72,7 +79,7 @@ accumulated.
 - **Search across everything.** The search box (press `/` to focus) matches session **content** —
   prompts, replies, reasoning, tool commands/paths/queries/outputs — in addition to titles and
   directories, and shows a snippet of the match. Viewer custom-title matches receive `10,000×`
-  weight, native Claude/Cursor titles receive `5,000×`, every user-message match receives `50×`,
+  weight, native Claude/Cursor/opencode titles receive `5,000×`, every user-message match receives `50×`,
   and ordinary transcript-content matches receive `1×`. Powered by `/api/search` with an
   mtime-keyed cache.
 - **Filters that compose.**
@@ -81,7 +88,7 @@ accumulated.
     models, or pick individual ones (e.g. only Sonnet). The family box shows an indeterminate state
     on partial selection.
   - A **Directory** dropdown to narrow to specific project paths.
-- **Transcript view** — a chronological, color-coded conversation that renders all three agents'
+- **Transcript view** — a chronological, color-coded conversation that renders all four agents'
   formats:
   - User prompts and assistant replies as Markdown, **with LaTeX math** (KaTeX) and inline images.
   - **Thinking / reasoning** blocks (collapsed by default).
@@ -137,7 +144,9 @@ accumulated.
 - **Local source links.** Absolute Markdown links inside a session's workspace open through macOS
   Launch Services in the file's default application. Line suffixes such as `:42` are recognized and
   removed before opening (the default application decides where to position the document). Targets
-  outside the workspace and executable/application files are rejected.
+  outside the workspace and executable/application files are rejected. A 📂 button in the transcript
+  header reveals the transcript file itself in Finder (for sessions that live in a file rather than
+  a database).
 - **Images.** Inline images in prompts/replies and Codex `view_image` are shown. For
   Codex user prompts, the viewer prefers the original `local_images` file and falls back to the
   embedded `input_image` data URL if the file is gone.
@@ -264,14 +273,14 @@ Cursor has two product surfaces with different canonical stores; the viewer read
 
 ## Exporting Cursor GPT sessions as Codex rollouts
 
-`cursor_to_codex.py` converts Cursor's GPT conversations into the Codex rollout JSONL format
+`codex_export/cursor_to_codex.py` converts Cursor's GPT conversations into the Codex rollout JSONL format
 (`~/.codex/sessions/**/rollout-*.jsonl`), so Cursor turns can be read — or replayed — by anything
 that already speaks Codex:
 
 ```bash
-python3 cursor_to_codex.py --list                     # matching sessions, one per line
-python3 cursor_to_codex.py --out ~/cursor-rollouts    # YYYY/MM/DD/rollout-<time>-<id>.jsonl
-python3 cursor_to_codex.py --session <composer-id> --out -   # one session to stdout
+python3 codex_export/cursor_to_codex.py --list                     # matching sessions, one per line
+python3 codex_export/cursor_to_codex.py --out ~/cursor-rollouts    # YYYY/MM/DD/rollout-<time>-<id>.jsonl
+python3 codex_export/cursor_to_codex.py --session <composer-id> --out -   # one session to stdout
 ```
 
 The rendered bubbles are *not* the source here. Cursor also keeps the exact provider-format message
@@ -295,16 +304,16 @@ an OpenAI reasoning item; `--all-models` exports them anyway, putting that strin
 
 ## Exporting opencode sessions as Codex rollouts
 
-`opencode_to_codex.py` does the same for opencode. opencode's own database already holds a complete
+`codex_export/opencode_to_codex.py` does the same for opencode. opencode's own database already holds a complete
 transcript, so unlike the Cursor exporter this is a format conversion rather than a recovery
 operation — what it buys you is that Codex-aware tooling can read the session, and that the
 provider's **encrypted reasoning travels with it**:
 
 ```bash
-python3 opencode_to_codex.py --list                       # sessions + their reasoning format
-python3 opencode_to_codex.py --out ~/opencode-rollouts    # YYYY/MM/DD/rollout-<time>-<id>.jsonl
-python3 opencode_to_codex.py --session <session-id> --out -    # one session to stdout
-python3 opencode_to_codex.py --with-encrypted --out DIR   # only sessions that carry blobs
+python3 codex_export/opencode_to_codex.py --list                       # sessions + their reasoning format
+python3 codex_export/opencode_to_codex.py --out ~/opencode-rollouts    # YYYY/MM/DD/rollout-<time>-<id>.jsonl
+python3 codex_export/opencode_to_codex.py --session <session-id> --out -    # one session to stdout
+python3 codex_export/opencode_to_codex.py --with-encrypted --out DIR   # only sessions that carry blobs
 ```
 
 The reasoning sits inline on the part, in `metadata.<providerID>.reasoning_details`: alongside the
@@ -326,19 +335,6 @@ one record where Codex keeps two. Tool names and arguments stay opencode's own (
 rather than being renamed. Every part carries its own clock, so timestamps are exact rather than
 inferred. A call with no result (interrupted, or still running) emits the call alone and is
 reported.
-
-## Requirements
-
-- **Python 3.9+** (standard library only — no `pip install` needed).
-- Markdown / math rendering uses `marked.js`, `DOMPurify`, and `KaTeX` from a CDN; offline, it falls
-  back to plain text.
-
-## Install
-
-```bash
-git clone https://github.com/tim-hua-01/cc_transcript_viewer.git
-cd cc_transcript_viewer
-```
 
 ## Important: keep your transcripts around
 
@@ -367,25 +363,26 @@ Restart Claude Code (or run `/config` once) for the change to take effect. Note 
 
 | File | Role |
 |------|------|
-| `server.py` | The unified stdlib HTTP layer plus everything that spans sources: merges the parsers' session lists into one time-sorted sidebar list, dispatches `/api/session` to the right parser by transcript root / `cursordb:`/`cursorcli:`/`opencode:` scheme, runs full-text search, owns custom names and summary-cache persistence, and serves the JSON API (`/api/sessions`, `/api/session?file=...`, `/api/session-name`, `/api/search?q=...`, `/api/local-image`, `/api/export?file=...`) plus the static frontend. `/api/session` only serves files under the allowed roots; `/api/session-name` only updates the viewer-owned names file; `/api/local-image` serves only image-typed files; and a `Host`-header allowlist guards the loopback server against DNS rebinding. |
+| `server.py` | The unified stdlib HTTP layer plus everything that spans sources: merges the parsers' session lists into one time-sorted sidebar list, dispatches `/api/session` to the right parser by transcript root / `cursordb:`/`cursorcli:`/`opencode:` scheme, runs full-text search, owns custom names and summary-cache persistence, and serves the JSON API (`/api/sessions`, `/api/session?file=...`, `/api/session-state?file=...`, `/api/session-name`, `/api/search?q=...`, `/api/local-image`, `/api/export?file=...`, `/api/open-local`, `/api/reveal-transcript`) plus the static frontend. `/api/session` only serves files under the allowed roots; `/api/session-name` only updates the viewer-owned names file; `/api/local-image` serves only image-typed files; and a `Host`-header allowlist guards the loopback server against DNS rebinding. |
 | `claude_parser.py` | Claude Code parsing library (imported by `server.py`): parses session JSONL into a clean event stream (pairing tool results to calls), detects system-injected "user" records, folds rewound/edited branches into collapsible markers, labels sub-agents from their spawning `Task`/`Agent` calls, and builds sidebar summaries (cold scans use a process pool). Call `configure(projects_dir)` to point it elsewhere. |
 | `codex_parser.py` | Codex parsing library: parses rollout JSONL, reads `state_5.sqlite` metadata, pairs tool calls with outputs, unpacks orchestration-style `exec` calls, correlates local and embedded prompt images, consolidates per-turn bookkeeping, recognizes guardian/sub-agent relationships, and renders `apply_patch` diffs. Call `configure(codex_home)` to point it elsewhere. |
 | `cursor_parser.py` | Cursor parsing library: reads IDE `state.vscdb`; reads CLI `~/.cursor/chats/.../store.db` (with JSONL fallback under `agent-transcripts`); normalizes tool names/inputs; reconstructs IDE `edit_file` diffs; decodes grep/glob results out of Cursor's binary protobuf tool records (`toolCallBinary`) since newer Cursor versions no longer store them as JSON; emits Claude-shaped events. IDE uses `cursordb:<id>`; CLI store uses `cursorcli:<id>`. Call `configure(db_path, projects_dir=…, chats_dir=…)` to retarget. |
 | `cursor_binary.py` | Decoder for Cursor's `toolCallBinary` protobuf records (wire-format only, no schema/dependency): exact grep and glob result reconstruction, plus a generic best-effort string recovery for any other completed call whose result was never written to JSON (e.g. `await`). |
 | `opencode_parser.py` | opencode parsing library: reads the single SQLite database at `~/.local/share/opencode/opencode.db` (`session` / `message` / `part` tables), folds each message's parts into block-shaped events, attaches each tool part's own result, renames opencode's camelCase tool arguments onto the canonical names, links `task` calls to the sub-agent session they spawned, flags thinking whose real reasoning came back encrypted, and drops the per-token provider `reasoning_details` noise. Sessions are addressed as `opencode:<id>`; the list cache is keyed on the database *and* its write-ahead log, so a live session is not served stale. Call `configure(db_path)` to retarget. |
-| `opencode_to_codex.py` | Exports opencode sessions as Codex rollout JSONL, carrying the provider's encrypted reasoning (`reasoning.encrypted` → `encrypted_content`) and splitting opencode's fused tool record into Codex's separate `function_call` / `function_call_output`. Records the provider's reasoning `format` so a non-OpenAI blob isn't mistaken for a replayable one. |
-| `codex_rollout.py` | The parts of writing a Codex rollout that aren't specific to any source — record shape, `rollout-<time>-<id>.jsonl` naming, dated output layout — shared by both exporters so they can't drift. |
+| `codex_export/cursor_to_codex.py` | Exports Cursor's GPT conversations as Codex rollout JSONL by walking the provider-format message blobs behind `conversationState` (where the real `rs_…` ids and `encrypted_content` live), rather than the rendered bubbles. See [Exporting Cursor GPT sessions](#exporting-cursor-gpt-sessions-as-codex-rollouts). |
+| `codex_export/opencode_to_codex.py` | Exports opencode sessions as Codex rollout JSONL, carrying the provider's encrypted reasoning (`reasoning.encrypted` → `encrypted_content`) and splitting opencode's fused tool record into Codex's separate `function_call` / `function_call_output`. Records the provider's reasoning `format` so a non-OpenAI blob isn't mistaken for a replayable one. |
+| `codex_export/codex_rollout.py` | The parts of writing a Codex rollout that aren't specific to any source — record shape, `rollout-<time>-<id>.jsonl` naming, dated output layout — shared by both exporters so they can't drift. |
 | `export_html.py` | Bundles one parsed session into a self-contained HTML file for `/api/export`: inlines `static/style.css` and `static/app.js` into `static/index.html`, embeds the session as a JSON literal, and re-embeds locally-referenced images as `data:` URIs under a per-image and whole-file size budget. Deliberately has no renderer of its own — the saved page runs the same `app.js`, which detects the embedded payload and switches to standalone mode. |
-| `common.py` | Helpers shared by the parsers: JSONL iteration, title truncation, timestamp conversion, and the thread-safe fingerprint-keyed `SummaryCache` all of them use. |
+| `common.py` | Everything the four parsers share: JSONL iteration, JSON/SQLite access, title truncation, timestamp conversion, the sidebar-summary shape (`make_summary`), and the thread-safe fingerprint-keyed `SummaryCache` (plus its `cached_summary` wrapper) all of them use. |
 | `event_schema.py` | The written-down (and machine-checked) event contract between the parsers and the frontend: every event kind, both message shapes, and validators the test suite runs over every parser's output. |
 | `static/index.html`, `static/style.css`, `static/app.js` | The single frontend (vanilla JS, no build step). `app.js` dispatches on event kind and renders the Claude Code / Cursor / opencode (block-based) and Codex (flat) shapes, and runs the always-on live-refresh poll loop. When `window.__TRANSCRIPT_EXPORT__` is present (a saved single-file transcript) it renders that session directly and disables everything that needs the server. CDN assets (marked, DOMPurify, KaTeX) are version-pinned with SRI integrity hashes. |
 | `test_security.py` | Zero-dependency security tests (`python3 -m unittest test_security`): asserts no outbound connections at runtime, no network-client imports, loopback default bind, the `Host`-header rebinding guard, that `/api/session` is confined to the transcript roots while `/api/local-image` serves images only, and that every CDN asset is version-pinned and SRI-hashed. |
 | `test_export.py` | Tests for the single-file export: the document inlines its assets and points at no server, transcript text can't break out of the embedded JSON, local images become `data:` URIs (and degrade to a note when missing, oversized, or not an image), `/api/export` enforces the same path allowlist as `/api/session`, and `app.js`/`style.css` still carry the standalone wiring the export depends on. |
+| `test_cursor_to_codex.py` | Tests for the Cursor exporter: the `conversationState` blob chain resolves, and the OpenAI reasoning item buried in a JSON-encoded `signature` survives with its `rs_…` id and `encrypted_content` intact. |
 | `test_opencode_to_codex.py` | Tests for the opencode exporter: encrypted reasoning survives, the fused tool record splits into two, timestamps come from the parts' own clocks, and the output reparses through `codex_parser` as a valid `opencode`-labelled session. |
-| `test_parsers.py` | Characterization tests for the parser internals: branch folding, the Codex JS-literal orchestration parser, Cursor blob/JSON extraction and diff reconstruction, queued prompts with images, and opencode's
-part→event mapping (argument renaming, tool states, sub-agent linkage, provider-noise stripping). |
+| `test_claude_parser.py`, `test_codex_parser.py`, `test_cursor_parser.py`, `test_opencode_parser.py` | Characterization tests for each parser's internals — branch folding and queued prompts (Claude), the JS-literal orchestration parser (Codex), blob/JSON extraction and diff reconstruction (Cursor), and the part→event mapping (opencode). |
 | `test_event_schema.py` | Conformance tests: every parser's summaries and full parses must satisfy `event_schema.py`, and `app.js` must dispatch on every declared kind. |
-| `test_summary_cache.py` | Summary-cache unit tests (round-trip persistence, fingerprint invalidation, dirty-flag races). |
+| `test_summary_cache.py`, `test_common.py` | Unit tests for the shared layer: summary-cache round-trip persistence, fingerprint invalidation and dirty-flag races, plus the small helpers in `common.py`. |
 | `test_fixtures.py` | Shared fixture builders that write minimal-but-valid transcripts for each source. |
 
 ### Transcript format notes

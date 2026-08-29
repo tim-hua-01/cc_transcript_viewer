@@ -164,5 +164,29 @@ class EventSchemaConformanceTests(unittest.TestCase):
             {"kind": "user", "blocks": [{"type": "text", "text": "hi"}]}), [])
 
 
+class ThemeBootstrapSyncTest(unittest.TestCase):
+    """index.html's pre-paint theme bootstrap duplicates the theme id list from
+    app.js by necessity (it must run before app.js loads). A theme added to one
+    but not the other fails silently — the saved theme just stops restoring —
+    so keep the two lists identical."""
+
+    def test_bootstrap_theme_list_matches_app_js(self):
+        js = (Path("static") / "app.js").read_text(encoding="utf-8")
+        html = (Path("static") / "index.html").read_text(encoding="utf-8")
+        app_ids = re.findall(r'\{ id: "([a-z0-9]+)"', js)
+        self.assertGreaterEqual(len(app_ids), 5, "THEMES not found in app.js")
+        bootstrap = re.search(r"if \(\[([^\]]+)\]\.includes\(theme\)\)", html)
+        self.assertIsNotNone(bootstrap, "theme bootstrap not found in index.html")
+        boot_ids = re.findall(r'"([a-z0-9]+)"', bootstrap.group(1))
+        self.assertEqual(boot_ids, app_ids)
+
+    def test_theme_storage_key_matches(self):
+        js = (Path("static") / "app.js").read_text(encoding="utf-8")
+        html = (Path("static") / "index.html").read_text(encoding="utf-8")
+        key = '"transcript-viewer:theme"'
+        self.assertIn(key, js)
+        self.assertIn(key, html)
+
+
 if __name__ == "__main__":
     unittest.main()

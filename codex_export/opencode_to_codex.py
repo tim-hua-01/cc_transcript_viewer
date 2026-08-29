@@ -43,9 +43,9 @@ rather than inferred from neighbouring records.
 
 Usage::
 
-    python3 opencode_to_codex.py --list
-    python3 opencode_to_codex.py --out ~/opencode-rollouts
-    python3 opencode_to_codex.py --session <session-id> --out -
+    python3 codex_export/opencode_to_codex.py --list
+    python3 codex_export/opencode_to_codex.py --out ~/opencode-rollouts
+    python3 codex_export/opencode_to_codex.py --session <session-id> --out -
 """
 
 from __future__ import annotations
@@ -56,7 +56,10 @@ import sqlite3
 import sys
 from pathlib import Path
 
-from codex_rollout import as_text, iso, line, output_path, write_rollout
+try:
+    from .codex_rollout import as_text, iso, line, output_path, write_rollout
+except ImportError:  # run directly as a script, not imported as a package
+    from codex_rollout import as_text, iso, line, output_path, write_rollout
 
 DEFAULT_DB_PATH = Path.home() / ".local" / "share" / "opencode" / "opencode.db"
 

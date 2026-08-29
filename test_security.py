@@ -16,16 +16,13 @@ import ast
 import json
 import re
 import socket
-import sqlite3
 import tempfile
-import threading
 import unittest
 import urllib.error
 import urllib.request
 from unittest import mock
 from urllib.parse import quote
 from http.client import HTTPConnection
-from http.server import ThreadingHTTPServer
 from pathlib import Path
 
 import server
@@ -66,6 +63,10 @@ from test_fixtures import (
     _write_fixture_session,
     _write_guardian_sessions,
     _write_opencode_db,
+    http_get,
+    patch_server_files,
+    start_http_server,
+    stop_http_server,
 )
 
 
@@ -110,12 +111,9 @@ class SecurityTest(unittest.TestCase):
             ),
         )
         claude.configure(cls.projects_dir)
-        server.CUSTOM_NAMES_FILE = tmp / "viewer" / "names.json"
-        server._CUSTOM_NAMES_CACHE = None
-        # Keep the persisted summary cache hermetic too — never touch the
-        # user's real ~/.cache file from the test suite.
-        cls._old_cache_file = server.CACHE_FILE
-        server.CACHE_FILE = tmp / "cache" / "summaries.json"
+        # Hermetic viewer-owned files — never touch the user's real names.json
+        # or ~/.cache summary file from the test suite.
+        cls._old_cache_file = patch_server_files(server, tmp)
         cls.codex_parent, cls.codex_guardian, cls.codex_image = _write_guardian_sessions(tmp / "codex")
         codex.configure(tmp / "codex")
         cls.cursor_projects = tmp / "cursor-projects"
@@ -137,16 +135,11 @@ class SecurityTest(unittest.TestCase):
         socket.socket.connect_ex = _guard(_real_connect_ex)
 
         # Serve on an ephemeral loopback port in a background thread.
-        cls.httpd = ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
-        cls.port = cls.httpd.server_address[1]
-        cls.thread = threading.Thread(target=cls.httpd.serve_forever, daemon=True)
-        cls.thread.start()
+        cls.httpd, cls.port, cls.thread = start_http_server(server.Handler)
 
     @classmethod
     def tearDownClass(cls):
-        cls.httpd.shutdown()
-        cls.httpd.server_close()
-        cls.thread.join(timeout=5)
+        stop_http_server(cls.httpd, cls.thread)
         socket.socket.connect = _real_connect
         socket.socket.connect_ex = _real_connect_ex
         server.CACHE_FILE = cls._old_cache_file
@@ -154,12 +147,7 @@ class SecurityTest(unittest.TestCase):
         cls._tmp.cleanup()
 
     def get(self, path: str):
-        url = f"http://127.0.0.1:{self.port}{path}"
-        try:
-            with urllib.request.urlopen(url, timeout=5) as r:
-                return r.status, r.headers, r.read()
-        except urllib.error.HTTPError as e:
-            return e.code, e.headers, e.read()
+        return http_get(self.port, path, timeout=5)
 
     def test_json_response_ignores_disconnected_client(self):
         """A cancelled browser poll should not raise or trigger a second response."""
@@ -170,6 +158,7 @@ class SecurityTest(unittest.TestCase):
         class FakeHandler:
             wfile = BrokenWriter()
             close_connection = False
+            _send_bytes = server.Handler._send_bytes
 
             def send_response(self, _status):
                 pass
@@ -493,7 +482,10 @@ class SecurityTest(unittest.TestCase):
         # can't silently skip the scan. (Tests themselves use urllib as the
         # loopback client, so they're excluded.)
         modules = sorted(
-            p for p in Path(".").glob("*.py") if not p.name.startswith("test_")
+            p
+            for pattern in ("*.py", "codex_export/*.py")
+            for p in Path(".").glob(pattern)
+            if not p.name.startswith("test_")
         )
         self.assertGreaterEqual(len(modules), 5, f"suspiciously few modules: {modules}")
         for mod_path in modules:

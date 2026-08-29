@@ -13,17 +13,19 @@ import base64
 import json
 import re
 import tempfile
-import threading
 import unittest
-import urllib.error
-import urllib.request
-from http.server import ThreadingHTTPServer
 from pathlib import Path
 
 import claude_parser as claude
 import export_html
 import server
-from test_fixtures import _write_fixture_session
+from test_fixtures import (
+    _write_fixture_session,
+    http_get,
+    patch_server_files,
+    start_http_server,
+    stop_http_server,
+)
 
 
 class BuildStandaloneTest(unittest.TestCase):
@@ -195,30 +197,17 @@ class ExportRouteTest(unittest.TestCase):
         cls.projects_dir.mkdir()
         cls.fixture = _write_fixture_session(cls.projects_dir)
         claude.configure(cls.projects_dir)
-        server.CUSTOM_NAMES_FILE = tmp / "viewer" / "names.json"
-        server._CUSTOM_NAMES_CACHE = None
-        cls._old_cache_file = server.CACHE_FILE
-        server.CACHE_FILE = tmp / "cache" / "summaries.json"
-        cls.httpd = ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
-        cls.port = cls.httpd.server_address[1]
-        cls.thread = threading.Thread(target=cls.httpd.serve_forever, daemon=True)
-        cls.thread.start()
+        cls._old_cache_file = patch_server_files(server, tmp)
+        cls.httpd, cls.port, cls.thread = start_http_server(server.Handler)
 
     @classmethod
     def tearDownClass(cls):
-        cls.httpd.shutdown()
-        cls.httpd.server_close()
-        cls.thread.join(timeout=5)
+        stop_http_server(cls.httpd, cls.thread)
         server.CACHE_FILE = cls._old_cache_file
         cls._tmp.cleanup()
 
     def get(self, path: str):
-        url = f"http://127.0.0.1:{self.port}{path}"
-        try:
-            with urllib.request.urlopen(url, timeout=10) as r:
-                return r.status, r.headers, r.read()
-        except urllib.error.HTTPError as e:
-            return e.code, e.headers, e.read()
+        return http_get(self.port, path)
 
     def test_export_returns_a_downloadable_html_document(self):
         from urllib.parse import quote
@@ -275,18 +264,19 @@ class StandaloneModeTest(unittest.TestCase):
         self.assertIn("if (STANDALONE) return;", self.js)          # openSession
         self.assertIn("data.forked_from.file && !STANDALONE", self.js)
         self.assertIn("b.child_file && !STANDALONE", self.js)
-        self.assertIn(
-            'el("span", { class: "parent-link", title: "The parent session is not part of this export" }',
+        self.assertRegex(
             self.js,
+            r'el\("span", \{\s*class: "parent-link",'
+            r'\s*title: "The parent session is not part of this export"',
         )
 
     def test_standalone_hides_server_backed_buttons(self):
         for guard in (
-            "STANDALONE ? null : el(\"button\", {\n        class: \"rename-btn\"",
-            "!STANDALONE && hasTranscriptFile(transcriptFile)",
+            r'STANDALONE \? null : el\("button", \{\s*class: "rename-btn"',
+            r"!STANDALONE && hasTranscriptFile\(transcriptFile\)",
         ):
             with self.subTest(guard=guard):
-                self.assertIn(guard, self.js)
+                self.assertRegex(self.js, guard)
 
     def test_standalone_hides_the_session_list(self):
         css = (Path("static") / "style.css").read_text(encoding="utf-8")

@@ -70,19 +70,7 @@ _SYNTHETIC_USER_LABELS = {
 }
 
 
-def _content_text(content) -> str:
-    """Concatenated text of a user-message content (a string or a block list).
-    Ignores images and tool-result blocks; returns '' when there is no text."""
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts = [
-            b.get("text") or ""
-            for b in content
-            if isinstance(b, dict) and b.get("type") == "text"
-        ]
-        return "\n".join(p for p in parts if p)
-    return ""
+_content_text = common.content_text
 
 
 def _user_record_text(rec: dict) -> str:
@@ -281,17 +269,10 @@ def _prefill_summaries(files: list[Path]) -> None:
 
 def session_summary(path: Path) -> dict:
     """Lightweight metadata for a Claude Code session, cached by file identity."""
-    key = str(path)
-    identity = common.file_identity(path)
-    if identity is not None:
-        cached = SUMMARY_CACHE.get(key, identity)
-        if cached is not None:
-            return cached
-
-    summary = _session_summary_uncached(path)
-    if identity is not None:
-        SUMMARY_CACHE.put(key, identity, summary)
-    return summary
+    return common.cached_summary(
+        SUMMARY_CACHE, str(path), common.file_identity(path),
+        lambda: _session_summary_uncached(path),
+    )
 
 
 def _session_summary_uncached(path: Path) -> dict:
@@ -358,34 +339,33 @@ def _session_summary_uncached(path: Path) -> dict:
     else:
         cwd = cwd or decode_project_name(path.parent.name)
 
-    summary = {
-        "agent": "claude",
-        "id": path.stem,
-        "file": str(path),
-        "title": claude_title
+    st = common.safe_stat(path)
+    summary = common.make_summary(
+        agent="claude",
+        id=path.stem,
+        file=str(path),
+        title=claude_title
         or (sub_meta["title"] if sub_meta else "")
         or _first_user_text(records)
         or ai_title
         or "(untitled session)",
+        cwd=cwd,
+        git_branch=git_branch,
+        version=version,
+        first_ts=first_ts,
+        last_ts=last_ts,
+        n_user=n_user,
+        n_assistant=n_assistant,
+        n_tool=n_tool,
+        n_records=len(records),
+        model=sorted(models)[0] if models else "",
+        mtime=st.st_mtime if st else 0,
         # Latest Claude Code AI-generated session title (the one its /resume
         # picker shows); "" if none yet.
-        "ai_title": ai_title,
-        "claude_title": claude_title,
-        "agent_name": agent_name,
-        "cwd": cwd,
-        "git_branch": git_branch,
-        "version": version,
-        "first_ts": first_ts,
-        "last_ts": last_ts,
-        "n_user": n_user,
-        "n_assistant": n_assistant,
-        "n_tool": n_tool,
-        "n_web": 0,
-        "n_records": len(records),
-        "model": sorted(models)[0] if models else "",
-        "models": sorted(models),
-        "mtime": path.stat().st_mtime,
-    }
+        ai_title=ai_title,
+        claude_title=claude_title,
+        agent_name=agent_name,
+    )
     if sub_meta:
         summary.update({key: value for key, value in sub_meta.items() if key != "title"})
     return summary
@@ -461,7 +441,7 @@ def _notice_event(notice: dict, ts, is_sidechain: bool) -> dict:
 
 def _strip_event(ev: dict) -> dict:
     """Drop the internal branch-folding bookkeeping fields from an event."""
-    for k in ("_uuid", "_parent", "_idx"):
+    for k in ("_uuid", "_idx"):
         ev.pop(k, None)
     return ev
 
@@ -615,12 +595,11 @@ def parse_session(path: Path) -> dict:
     meta = {}
     active_leaf = None
 
-    # Tag each emitted event with its record's uuid/parentUuid (and file order)
-    # so branch folding can reorganize them afterward. `rec` is read from the
-    # loop scope at call time.
+    # Tag each emitted event with its record's uuid (and file order) so branch
+    # folding can reorganize them afterward. `rec` is read from the loop scope
+    # at call time.
     def emit(ev):
         ev["_uuid"] = rec.get("uuid")
-        ev["_parent"] = rec.get("parentUuid")
         ev["_idx"] = len(events)
         events.append(ev)
 

@@ -1,16 +1,84 @@
 #!/usr/bin/env python3
-"""Shared transcript fixtures for the test suite.
+"""Shared fixtures and harness helpers for the test suite.
 
 Builders that write minimal-but-valid on-disk transcripts for each source
-(Claude Code JSONL, Codex rollout JSONL, Cursor CLI JSONL and store.db), used
-by both the security tests and the event-schema conformance tests.
+(Claude Code JSONL, Codex rollout JSONL, Cursor CLI JSONL and store.db), plus
+the loopback HTTP harness the server-backed test classes share.
 """
 
 from __future__ import annotations
 
 import json
 import sqlite3
+import threading
+import urllib.error
+import urllib.request
+from http.server import ThreadingHTTPServer
 from pathlib import Path
+
+
+def patch_server_files(server_module, tmp: Path):
+    """Point the viewer-owned files (custom names, summary cache) into tmp so
+    tests never touch the user's real ones. Returns the previous CACHE_FILE for
+    tearDownClass to restore."""
+    server_module.CUSTOM_NAMES_FILE = tmp / "viewer" / "names.json"
+    server_module._CUSTOM_NAMES_CACHE = None
+    old_cache_file = server_module.CACHE_FILE
+    server_module.CACHE_FILE = tmp / "cache" / "summaries.json"
+    return old_cache_file
+
+
+def start_http_server(handler):
+    """Serve `handler` on an ephemeral loopback port in a daemon thread."""
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    return httpd, httpd.server_address[1], thread
+
+
+def stop_http_server(httpd, thread):
+    httpd.shutdown()
+    httpd.server_close()
+    thread.join(timeout=5)
+
+
+def http_get(port: int, path: str, timeout: float = 10):
+    """(status, headers, body) for a GET against the test server; HTTP errors
+    come back as a normal tuple instead of raising."""
+    url = f"http://127.0.0.1:{port}{path}"
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as r:
+            return r.status, r.headers, r.read()
+    except urllib.error.HTTPError as e:
+        return e.code, e.headers, e.read()
+
+
+def _write_jsonl(path: Path, records: list[dict]) -> None:
+    path.write_text("\n".join(json.dumps(r) for r in records) + "\n", encoding="utf-8")
+
+
+def _user(uuid, parent, text, ts):
+    return {
+        "type": "user",
+        "uuid": uuid,
+        "parentUuid": parent,
+        "timestamp": ts,
+        "message": {"role": "user", "content": text},
+    }
+
+
+def _assistant(uuid, parent, text, ts):
+    return {
+        "type": "assistant",
+        "uuid": uuid,
+        "parentUuid": parent,
+        "timestamp": ts,
+        "message": {
+            "role": "assistant",
+            "model": "claude-test",
+            "content": [{"type": "text", "text": text}],
+        },
+    }
 
 
 def _write_fixture_session(

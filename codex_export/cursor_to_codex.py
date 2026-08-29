@@ -31,9 +31,9 @@ replayed against the Responses API.
 
 Usage::
 
-    python3 cursor_to_codex.py --list
-    python3 cursor_to_codex.py --out ~/cursor-rollouts
-    python3 cursor_to_codex.py --session <composer-id> --out -
+    python3 codex_export/cursor_to_codex.py --list
+    python3 codex_export/cursor_to_codex.py --out ~/cursor-rollouts
+    python3 codex_export/cursor_to_codex.py --session <composer-id> --out -
 """
 
 from __future__ import annotations
@@ -46,15 +46,31 @@ import sqlite3
 import sys
 from pathlib import Path
 
+# cursor_binary lives at the repo root; when run directly as a script
+# (python3 codex_export/cursor_to_codex.py) only this directory is on
+# sys.path, so add the root before importing it.
+_REPO_ROOT = str(Path(__file__).resolve().parent.parent)
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
 import cursor_binary
-from codex_rollout import (
-    as_text as _as_text,
-    iso as _iso,
-    line as _line,
-    output_path,
-    rollout_filename,
-    write_rollout,
-)
+
+try:
+    from .codex_rollout import (
+        as_text as _as_text,
+        iso as _iso,
+        line as _line,
+        output_path,
+        write_rollout,
+    )
+except ImportError:  # run directly as a script, not imported as a package
+    from codex_rollout import (
+        as_text as _as_text,
+        iso as _iso,
+        line as _line,
+        output_path,
+        write_rollout,
+    )
 
 DEFAULT_DB_PATH = (
     Path.home()

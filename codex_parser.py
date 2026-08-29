@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Codex transcript parsing library.
 
-Reads Codex session transcripts stored under ~/.codex/sessions. This module is
-imported by server.py (the unified Claude Code + Codex transcript browser); it
-exposes list_sessions() / parse_session() and the helpers they need.
+Reads Codex rollout JSONL under ~/.codex/sessions and ~/.codex/archived_sessions,
+plus thread metadata from ~/.codex/state_5.sqlite when present. This module is
+imported by server.py (the unified transcript browser); it exposes
+list_sessions() / parse_session() and the helpers they need.
 
 Call configure(codex_home) once at startup to point it at a Codex home other
 than the default ~/.codex.
@@ -508,8 +509,7 @@ def _read_thread_rows() -> dict[str, dict]:
     """
     rows: dict[str, dict] = {}
     try:
-        conn = sqlite3.connect(f"file:{STATE_DB}?mode=ro", uri=True)
-        conn.row_factory = sqlite3.Row
+        conn = common.connect_ro(STATE_DB, row_factory=sqlite3.Row)
         try:
             for row in conn.execute(query):
                 d = dict(row)
@@ -525,16 +525,13 @@ def _read_thread_rows() -> dict[str, dict]:
 def session_summary(path: Path, thread_row: dict | None = None) -> dict:
     """Lightweight metadata for a Codex session, cached by file identity plus a
     fingerprint of the SQLite thread row (which can change without the JSONL)."""
-    st = common.safe_stat(path)
-    identity = (st.st_mtime_ns, st.st_size) if st else (0, 0)
-    fingerprint = (identity[0], identity[1], _thread_signature(thread_row))
-    cached = SUMMARY_CACHE.get(str(path), fingerprint)
-    if cached is not None:
-        return cached
-
-    summary = _session_summary_uncached(path, thread_row)
-    SUMMARY_CACHE.put(str(path), fingerprint, summary)
-    return summary
+    identity = common.file_identity(path) or (0, 0)
+    return common.cached_summary(
+        SUMMARY_CACHE,
+        str(path),
+        identity + (_thread_signature(thread_row),),
+        lambda: _session_summary_uncached(path, thread_row),
+    )
 
 
 def _session_summary_uncached(path: Path, thread_row: dict | None = None) -> dict:
@@ -588,30 +585,30 @@ def _session_summary_uncached(path: Path, thread_row: dict | None = None) -> dic
     elif subagent_fields:
         title = common.short_title(f"[{subagent_fields['subagent_type']}] {title}")
 
-    summary = {
-        "agent": _agent_label(meta, row),
-        "id": row.get("id") or meta.get("id") or _thread_id_from_path(path),
-        "file": str(path),
-        "title": title,
-        "cwd": cwd,
-        "source": row.get("source") or meta.get("source") or meta.get("originator") or "",
-        "thread_source": row.get("thread_source") or meta.get("thread_source") or "",
-        "version": row.get("cli_version") or meta.get("cli_version") or "",
-        "model_provider": row.get("model_provider") or meta.get("model_provider") or "",
-        "model": row.get("model") or model,
-        "reasoning_effort": row.get("reasoning_effort") or "",
-        "tokens_used": row.get("tokens_used") or 0,
-        "first_ts": first_ts or common.iso_from_ms(created_ms),
-        "last_ts": last_ts or common.iso_from_ms(updated_ms),
-        "n_user": n_user,
-        "n_assistant": n_assistant,
-        "n_tool": n_tool,
-        "n_reasoning": n_reasoning,
-        "n_web": n_web,
-        "n_records": len(records),
-        "mtime": st.st_mtime if st else 0,
-        "archived": bool(row.get("archived", 0)),
-    }
+    summary = common.make_summary(
+        agent=_agent_label(meta, row),
+        id=row.get("id") or meta.get("id") or _thread_id_from_path(path),
+        file=str(path),
+        title=title,
+        cwd=cwd,
+        version=row.get("cli_version") or meta.get("cli_version") or "",
+        first_ts=first_ts or common.iso_from_ms(created_ms),
+        last_ts=last_ts or common.iso_from_ms(updated_ms),
+        n_user=n_user,
+        n_assistant=n_assistant,
+        n_tool=n_tool,
+        n_web=n_web,
+        n_records=len(records),
+        model=row.get("model") or model,
+        mtime=st.st_mtime if st else 0,
+        source=row.get("source") or meta.get("source") or meta.get("originator") or "",
+        thread_source=row.get("thread_source") or meta.get("thread_source") or "",
+        model_provider=row.get("model_provider") or meta.get("model_provider") or "",
+        reasoning_effort=row.get("reasoning_effort") or "",
+        tokens_used=row.get("tokens_used") or 0,
+        n_reasoning=n_reasoning,
+        archived=bool(row.get("archived", 0)),
+    )
     summary.update(subagent_fields)
     return summary
 
@@ -760,7 +757,7 @@ def _local_image_payload(path_value) -> dict | None:
     st = common.safe_stat(resolved)
     return {
         "kind": "local",
-        "src": "/api/local-image?path=" + quote(str(resolved), safe=""),
+        "src": common.LOCAL_IMAGE_ROUTE + "?path=" + quote(str(resolved), safe=""),
         "path": str(resolved),
         "bytes": st.st_size if st else 0,
         "content_type": content_type,

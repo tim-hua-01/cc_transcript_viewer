@@ -89,7 +89,7 @@ _TOOL_NAME_MAP = {
 
 # Cursor CLI agent tool names (store.db / agent-transcripts JSONL).
 _CLI_TOOL_NAME_MAP = {
-    "Shell": "Shell",  # frontend already formats lowercase "shell"
+    "Shell": "Shell",
     "Read": "Read",
     "ReadFile": "Read",
     "StrReplace": "Edit",
@@ -118,6 +118,9 @@ _CLI_SYSTEM_REMINDER_RE = re.compile(
 SUMMARY_CACHE = common.SummaryCache()
 # session id -> store.db path, refreshed whenever we scan chats.
 _CLI_STORE_INDEX: dict[str, Path] = {}
+# Whole IDE session list, keyed by the DB file mtime so the 1s /api/sessions
+# poll doesn't re-read 100+ composers every tick.
+_LIST_CACHE: tuple[float, list] | None = None
 
 
 def configure(
@@ -155,23 +158,13 @@ def _connect() -> sqlite3.Connection | None:
     if not DB_PATH.exists():
         return None
     try:
-        return sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True, timeout=2.0)
+        return common.connect_ro(DB_PATH)
     except sqlite3.Error:
         return None
 
 
-def _loads(value):
-    if value is None:
-        return None
-    try:
-        return json.loads(value)
-    except (json.JSONDecodeError, TypeError):
-        return None
-
-
-def _iso_from_ms(ms) -> str | None:
-    # None (not "") when missing, matching what this module has always emitted.
-    return common.iso_from_ms(ms) or None
+_loads = common.loads_or_none
+_iso_from_ms = common.iso_from_ms_or_none
 
 
 def _composer_cwd(d: dict) -> str:
@@ -189,11 +182,6 @@ def _composer_cwd(d: dict) -> str:
 # ---------------------------------------------------------------------------
 # Session list
 # ---------------------------------------------------------------------------
-# Cache the whole IDE session list, keyed by the DB file mtime so the 1s
-# /api/sessions poll doesn't re-read 100+ composers every tick.
-_LIST_CACHE: tuple[float, list] | None = None
-
-
 def _bubble_rows(conn: sqlite3.Connection, cid: str):
     """All bubbles for a composer, as {bubbleId: parsed}."""
     out = {}
@@ -271,25 +259,21 @@ def _summary_from_composer(conn, cid: str, d: dict, db_mtime: float) -> dict:
     created = d.get("createdAt")
     updated = d.get("lastUpdatedAt") or created
     mtime = (updated / 1000) if updated else db_mtime
-    return {
-        "agent": "cursor",
-        "id": cid,
-        "file": SESSION_SCHEME + cid,
-        "title": title,
-        "cwd": _composer_cwd(d),
-        "git_branch": "",
-        "version": "",
-        "first_ts": _iso_from_ms(created),
-        "last_ts": _iso_from_ms(updated),
-        "n_user": n_user,
-        "n_assistant": n_assistant,
-        "n_tool": n_tool,
-        "n_web": 0,
-        "n_records": len(headers),
-        "model": model,
-        "models": [model] if model else [],
-        "mtime": mtime,
-    }
+    return common.make_summary(
+        agent="cursor",
+        id=cid,
+        file=SESSION_SCHEME + cid,
+        title=title,
+        cwd=_composer_cwd(d),
+        first_ts=_iso_from_ms(created),
+        last_ts=_iso_from_ms(updated),
+        n_user=n_user,
+        n_assistant=n_assistant,
+        n_tool=n_tool,
+        n_records=len(headers),
+        model=model,
+        mtime=mtime,
+    )
 
 
 def _list_db_sessions() -> list[dict]:
@@ -866,7 +850,7 @@ def _normalize_cli_tool(name: str, args: dict) -> dict:
     args = args if isinstance(args, dict) else {}
     inp: dict = {}
 
-    if raw in {"Shell"}:
+    if raw == "Shell":
         inp = {
             "command": args.get("command") or "",
             "description": args.get("description") or "",
@@ -970,107 +954,93 @@ def _cli_paths() -> list[Path]:
     return out
 
 
+def _cli_transcript_context(path: Path) -> dict:
+    """Where a CLI JSONL transcript sits: its cwd, and sub-agent parentage.
+
+    Sub-agents live at …/agent-transcripts/<parent-id>/subagents/<id>.jsonl,
+    regular sessions at …/agent-transcripts/<id>/<id>.jsonl.
+    """
+    is_subagent = path.parent.name == "subagents"
+    if is_subagent:
+        project_dir = path.parent.parent.parent.parent
+        parent_id = path.parent.parent.name
+        parent_file = path.parent.parent / f"{parent_id}.jsonl"
+    else:
+        project_dir = path.parent.parent.parent
+        parent_id = ""
+        parent_file = None
+    return {
+        "is_subagent": is_subagent,
+        "cwd": cwd_for_project_dir(project_dir) if project_dir else "",
+        "parent_id": parent_id,
+        "parent_file": parent_file,
+    }
+
+
+def _apply_cli_subagent_fields(out: dict, ctx: dict) -> None:
+    """Stamp sub-agent linkage onto a summary or full parse, in place."""
+    if not ctx["is_subagent"]:
+        return
+    out["is_subagent"] = True
+    out["subagent_type"] = "cursor-cli"
+    if ctx["parent_file"] is not None:
+        try:
+            out["parent_file"] = str(ctx["parent_file"].resolve())
+        except OSError:
+            out["parent_file"] = str(ctx["parent_file"])
+        out["parent_id"] = ctx["parent_id"]
+
+
 def _cli_session_summary_uncached(path: Path) -> dict:
     records = list(common.iter_jsonl(path))
-    is_subagent = path.parent.name == "subagents"
     n_user = n_assistant = n_tool = 0
     first_user = ""
 
     for rec in records:
         role = rec.get("role")
+        content = (rec.get("message") or {}).get("content")
         if role == "user":
-            content = (rec.get("message") or {}).get("content")
-            text = ""
-            if isinstance(content, str):
-                text = content
-            elif isinstance(content, list):
-                text = "\n".join(
-                    b.get("text", "")
-                    for b in content
-                    if isinstance(b, dict) and b.get("type") == "text"
-                )
-            cleaned = _clean_cli_user_text(text)
+            cleaned = _clean_cli_user_text(common.content_text(content))
             if cleaned:
                 n_user += 1
                 if not first_user:
                     first_user = cleaned
         elif role == "assistant":
             n_assistant += 1
-            content = (rec.get("message") or {}).get("content")
             if isinstance(content, list):
                 for b in content:
                     if isinstance(b, dict) and b.get("type") == "tool_use":
                         n_tool += 1
 
-    if is_subagent:
-        # …/agent-transcripts/<parent-id>/subagents/<id>.jsonl
-        project_dir = path.parent.parent.parent.parent
-        parent_id = path.parent.parent.name
-        parent_file = path.parent.parent / f"{parent_id}.jsonl"
-    else:
-        # …/agent-transcripts/<id>/<id>.jsonl
-        project_dir = path.parent.parent.parent
-        parent_id = ""
-        parent_file = None
-
-    cwd = cwd_for_project_dir(project_dir) if project_dir else ""
-    try:
-        mtime = path.stat().st_mtime
-    except OSError:
-        mtime = 0
-
-    summary = {
-        "agent": "cursor",
-        "cursor_source": "cli-jsonl",
-        "id": path.stem,
-        "file": str(path.resolve()),
-        "title": common.short_title(first_user) or "(untitled session)",
-        "cwd": cwd,
-        "git_branch": "",
-        "version": "",
-        "first_ts": None,
-        "last_ts": None,
-        "n_user": n_user,
-        "n_assistant": n_assistant,
-        "n_tool": n_tool,
-        "n_web": 0,
-        "n_records": len(records),
-        "model": "",
-        "models": [],
-        "mtime": mtime,
-    }
-    if is_subagent:
-        summary["is_subagent"] = True
-        summary["subagent_type"] = "cursor-cli"
-        if parent_file is not None:
-            try:
-                summary["parent_file"] = str(parent_file.resolve())
-            except OSError:
-                summary["parent_file"] = str(parent_file)
-            summary["parent_id"] = parent_id
+    ctx = _cli_transcript_context(path)
+    st = common.safe_stat(path)
+    summary = common.make_summary(
+        agent="cursor",
+        cursor_source="cli-jsonl",
+        id=path.stem,
+        file=str(path.resolve()),
+        title=common.short_title(first_user) or "(untitled session)",
+        cwd=ctx["cwd"],
+        n_user=n_user,
+        n_assistant=n_assistant,
+        n_tool=n_tool,
+        n_records=len(records),
+        mtime=st.st_mtime if st else 0,
+    )
+    _apply_cli_subagent_fields(summary, ctx)
     return summary
 
 
 def cli_session_summary(path: Path) -> dict:
-    """Lightweight metadata for one CLI JSONL transcript, cached by mtime/size."""
-    key = str(path)
-    st = common.safe_stat(path)
-    identity = (st.st_mtime, st.st_size) if st else None
-    if identity is not None:
-        cached = SUMMARY_CACHE.get(key, identity)
-        if cached is not None:
-            return cached
-    summary = _cli_session_summary_uncached(path)
-    if identity is not None:
-        SUMMARY_CACHE.put(key, identity, summary)
-    return summary
+    """Lightweight metadata for one CLI JSONL transcript, cached by file identity."""
+    return common.cached_summary(
+        SUMMARY_CACHE, str(path), common.file_identity(path),
+        lambda: _cli_session_summary_uncached(path),
+    )
 
 
-def _iter_cli_summaries(skip_ids: set[str] | None = None):
-    skip = skip_ids or set()
+def _iter_cli_summaries():
     for path in _cli_paths():
-        if path.stem in skip:
-            continue
         try:
             yield cli_session_summary(path)
         except (OSError, ValueError):
@@ -1082,7 +1052,6 @@ def parse_cli_session(path: Path) -> dict | None:
     if not path.exists():
         return None
     records = list(common.iter_jsonl(path))
-    is_subagent = path.parent.name == "subagents"
     events: list[dict] = []
 
     for rec in records:
@@ -1122,16 +1091,7 @@ def parse_cli_session(path: Path) -> dict | None:
             }
         )
 
-    if is_subagent:
-        project_dir = path.parent.parent.parent.parent
-        parent_id = path.parent.parent.name
-        parent_file = path.parent.parent / f"{parent_id}.jsonl"
-    else:
-        project_dir = path.parent.parent.parent
-        parent_id = ""
-        parent_file = None
-
-    cwd = cwd_for_project_dir(project_dir) if project_dir else ""
+    ctx = _cli_transcript_context(path)
     first_user = ""
     for ev in events:
         if ev["kind"] == "user":
@@ -1147,19 +1107,11 @@ def parse_cli_session(path: Path) -> dict | None:
         "cursor_source": "cli-jsonl",
         "id": path.stem,
         "title": common.short_title(first_user) or "(untitled session)",
-        "meta": {"cwd": cwd} if cwd else {},
+        "meta": {"cwd": ctx["cwd"]} if ctx["cwd"] else {},
         "events": events,
         "n_records": len(records),
     }
-    if is_subagent:
-        out["is_subagent"] = True
-        out["subagent_type"] = "cursor-cli"
-        if parent_file is not None:
-            try:
-                out["parent_file"] = str(parent_file.resolve())
-            except OSError:
-                out["parent_file"] = str(parent_file)
-            out["parent_id"] = parent_id
+    _apply_cli_subagent_fields(out, ctx)
     return out
 
 
@@ -1260,19 +1212,10 @@ def _iter_store_role_messages(conn: sqlite3.Connection):
             if key in seen:
                 continue
             seen.add(key)
-            yield rowid, obj
+            yield obj
 
 
-def _store_user_text(content) -> str:
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        return "\n".join(
-            b.get("text", "")
-            for b in content
-            if isinstance(b, dict) and b.get("type") == "text" and b.get("text")
-        )
-    return ""
+_store_user_text = common.content_text
 
 
 def _store_subagent_fields(meta: dict) -> dict:
@@ -1350,104 +1293,162 @@ def _store_db_mtime(path: Path) -> float:
     return mtime
 
 
-def _cli_store_summary_uncached(path: Path) -> dict | None:
-    try:
-        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=2.0)
-    except sqlite3.Error:
+def _open_store(path: Path) -> sqlite3.Connection | None:
+    """Read-only connection to one CLI store.db, or None if unopenable."""
+    if not path.exists():
         return None
     try:
-        meta = _read_store_meta(conn)
-        side = _read_sidecar_meta(path)
-        session_id = meta.get("agentId") or path.parent.name
-        model = meta.get("lastUsedModel") or ""
-        title = (meta.get("name") or side.get("title") or "").strip()
-        cwd = (side.get("cwd") or "").strip()
-        created = meta.get("createdAt") or side.get("createdAtMs")
-        updated = side.get("updatedAtMs") or created
-        subagent_fields = _store_subagent_fields(meta)
+        return common.connect_ro(path)
+    except sqlite3.Error:
+        return None
 
-        n_user = n_assistant = n_tool = 0
-        first_user = ""
-        for _rowid, msg in _iter_store_role_messages(conn):
-            role = msg.get("role")
-            content = msg.get("content")
-            if role == "user":
-                text = _store_user_text(content)
-                cleaned = _store_prompt_text(text)
-                if cleaned and "<user_info>" not in text:
-                    n_user += 1
-                    if not first_user:
-                        first_user = cleaned
-                elif _CLI_SYSTEM_REMINDER_RE.search(text) and not _CLI_USER_QUERY_RE.search(text):
-                    pass  # mode notices don't count as user prompts
-            elif role == "assistant":
-                n_assistant += 1
-                if isinstance(content, list):
-                    for b in content:
-                        if isinstance(b, dict) and b.get("type") == "tool-call":
-                            n_tool += 1
-            elif role == "tool":
-                pass
-        if subagent_fields and (not title or title == "New Agent"):
-            task_title = _store_subagent_title(first_user)
-            title = common.short_title(
-                f"[{subagent_fields['subagent_type']}] {task_title or first_user or '(sub-agent)'}"
-            )
-        elif not title:
-            title = common.short_title(first_user) or "(untitled session)"
 
-        mtime = _store_db_mtime(path)
-        summary = {
-            "agent": "cursor",
-            "cursor_source": "cli",
-            "id": session_id,
-            "file": CLI_SESSION_SCHEME + session_id,
-            "title": title,
-            "cwd": cwd,
-            "git_branch": "",
-            "version": "",
-            "first_ts": _iso_from_ms(created),
-            "last_ts": _iso_from_ms(updated),
-            "n_user": n_user,
-            "n_assistant": n_assistant,
-            "n_tool": n_tool,
-            "n_web": 0,
-            "n_records": n_user + n_assistant + n_tool,
-            "model": model,
-            "models": [model] if model else [],
-            "mtime": mtime,
-        }
-        summary.update(subagent_fields)
+def _store_header(conn: sqlite3.Connection, path: Path) -> dict:
+    """The identity fields the summary and the full parse both read."""
+    meta = _read_store_meta(conn)
+    side = _read_sidecar_meta(path)
+    return {
+        "meta": meta,
+        "side": side,
+        "session_id": meta.get("agentId") or path.parent.name,
+        "model": meta.get("lastUsedModel") or "",
+        "title": (meta.get("name") or side.get("title") or "").strip(),
+        "cwd": (side.get("cwd") or "").strip(),
+        "subagent_fields": _store_subagent_fields(meta),
+    }
+
+
+def _store_title(title: str, first_user: str, subagent_fields: dict) -> str:
+    """Store sessions are often unnamed ('New Agent'); derive a title."""
+    if subagent_fields and (not title or title == "New Agent"):
+        task_title = _store_subagent_title(first_user)
+        return common.short_title(
+            f"[{subagent_fields['subagent_type']}] {task_title or first_user or '(sub-agent)'}"
+        )
+    if not title:
+        return common.short_title(first_user) or "(untitled session)"
+    return title
+
+
+def _store_content_fingerprint(conn: sqlite3.Connection, path: Path) -> list:
+    """Cheap content identity for one store.db: blob count, last rowid, total
+    payload bytes, the raw meta row, and the sidecar meta.json identity.
+
+    Costs a few milliseconds, versus ~1.5s for the full blob scan a summary
+    needs — so a store whose mtime was touched without a real change (another
+    process, a backup tool, a cache fingerprint format change) revalidates
+    cheaply instead of forcing the scan.
+    """
+    try:
+        n, last, total = conn.execute(
+            "SELECT count(*), coalesce(max(rowid), 0), coalesce(sum(length(data)), 0) FROM blobs"
+        ).fetchone()
+    except sqlite3.Error:
+        n = last = total = -1
+    try:
+        row = conn.execute("SELECT value FROM meta WHERE key='0'").fetchone()
+        meta_raw = row[0] if row else b""
+        if isinstance(meta_raw, bytes):
+            meta_raw = meta_raw.decode("utf-8", errors="ignore")
+    except sqlite3.Error:
+        meta_raw = ""
+    sidecar = common.file_identity(path.parent / "meta.json")
+    return [n, last, total, str(meta_raw), list(sidecar) if sidecar else None]
+
+
+def _cli_store_summary_uncached(conn: sqlite3.Connection, path: Path) -> dict | None:
+    header = _store_header(conn, path)
+    meta, side = header["meta"], header["side"]
+    subagent_fields = header["subagent_fields"]
+    created = meta.get("createdAt") or side.get("createdAtMs")
+    updated = side.get("updatedAtMs") or created
+
+    n_user = n_assistant = n_tool = 0
+    first_user = ""
+    for msg in _iter_store_role_messages(conn):
+        role = msg.get("role")
+        content = msg.get("content")
+        if role == "user":
+            text = _store_user_text(content)
+            cleaned = _store_prompt_text(text)
+            if cleaned and "<user_info>" not in text:
+                n_user += 1
+                if not first_user:
+                    first_user = cleaned
+            elif _CLI_SYSTEM_REMINDER_RE.search(text) and not _CLI_USER_QUERY_RE.search(text):
+                pass  # mode notices don't count as user prompts
+        elif role == "assistant":
+            n_assistant += 1
+            if isinstance(content, list):
+                for b in content:
+                    if isinstance(b, dict) and b.get("type") == "tool-call":
+                        n_tool += 1
+        elif role == "tool":
+            pass
+
+    summary = common.make_summary(
+        agent="cursor",
+        cursor_source="cli",
+        id=header["session_id"],
+        file=CLI_SESSION_SCHEME + header["session_id"],
+        title=_store_title(header["title"], first_user, subagent_fields),
+        cwd=header["cwd"],
+        first_ts=_iso_from_ms(created),
+        last_ts=_iso_from_ms(updated),
+        n_user=n_user,
+        n_assistant=n_assistant,
+        n_tool=n_tool,
+        n_records=n_user + n_assistant + n_tool,
+        model=header["model"],
+        mtime=_store_db_mtime(path),
+    )
+    summary.update(subagent_fields)
+    return summary
+
+
+def cli_store_summary(path: Path) -> dict | None:
+    """Lightweight metadata for one CLI store.db.
+
+    Two-level cache: the fast fingerprint is the store file's (mtime, size);
+    when that misses, a cheap in-database content fingerprint is compared
+    before paying for the full blob scan. Fingerprints are stored as
+    ``[fast, content]`` so either level can validate an entry.
+    """
+    key = str(path)
+    ident = common.file_identity(path)
+    if ident is None:
+        return None
+    fast = list(ident)
+    entry = SUMMARY_CACHE.peek(key)
+    if entry and isinstance(entry[0], list) and len(entry[0]) == 2 and entry[0][0] == fast:
+        return entry[1]
+
+    conn = _open_store(path)
+    if conn is None:
+        return None
+    try:
+        content = _store_content_fingerprint(conn, path)
+        if entry and isinstance(entry[0], list) and len(entry[0]) == 2 and entry[0][1] == content:
+            # Only the mtime moved; the store's content is unchanged. Reuse the
+            # summary and refresh the fast fingerprint for the next poll.
+            SUMMARY_CACHE.put(key, [fast, content], entry[1])
+            return entry[1]
+        summary = _cli_store_summary_uncached(conn, path)
+        if summary is not None:
+            SUMMARY_CACHE.put(key, [fast, content], summary)
         return summary
     finally:
         conn.close()
 
 
-def cli_store_summary(path: Path) -> dict | None:
-    """Lightweight metadata for one CLI store.db, cached by mtime/size."""
-    key = str(path)
-    st = common.safe_stat(path)
-    identity = (st.st_mtime, st.st_size) if st else None
-    if identity is not None:
-        cached = SUMMARY_CACHE.get(key, identity)
-        if cached is not None:
-            return cached
-    summary = _cli_store_summary_uncached(path)
-    if summary is not None and identity is not None:
-        SUMMARY_CACHE.put(key, identity, summary)
-    return summary
-
-
-def _iter_cli_store_summaries(skip_ids: set[str] | None = None):
-    skip = skip_ids or set()
+def _iter_cli_store_summaries():
     for path in _cli_store_paths():
         try:
             summary = cli_store_summary(path)
         except (OSError, ValueError, sqlite3.Error):
             continue
-        if not summary or summary.get("id") in skip:
-            continue
-        yield summary
+        if summary:
+            yield summary
 
 
 def _tool_result_text(result) -> str:
@@ -1465,26 +1466,21 @@ def _tool_result_text(result) -> str:
 
 def parse_cli_store(path: Path) -> dict | None:
     """Full structured parse of a Cursor CLI store.db into Claude-shaped events."""
-    if not path.exists():
+    conn = _open_store(path)
+    if conn is None:
         return None
     try:
-        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=2.0)
-    except sqlite3.Error:
-        return None
-    try:
-        meta = _read_store_meta(conn)
-        side = _read_sidecar_meta(path)
-        session_id = meta.get("agentId") or path.parent.name
-        model = meta.get("lastUsedModel") or ""
-        title = (meta.get("name") or side.get("title") or "").strip()
-        cwd = (side.get("cwd") or "").strip()
-        subagent_fields = _store_subagent_fields(meta)
+        header = _store_header(conn, path)
+        session_id = header["session_id"]
+        model = header["model"]
+        cwd = header["cwd"]
+        subagent_fields = header["subagent_fields"]
 
         messages = list(_iter_store_role_messages(conn))
 
         # First pass: collect tool results by toolCallId.
         results: dict[str, dict] = {}
-        for _rowid, msg in messages:
+        for msg in messages:
             if msg.get("role") != "tool":
                 continue
             content = msg.get("content")
@@ -1504,7 +1500,7 @@ def parse_cli_store(path: Path) -> dict | None:
 
         events: list[dict] = []
         first_user = ""
-        for _rowid, msg in messages:
+        for msg in messages:
             role = msg.get("role")
             content = msg.get("content")
 
@@ -1597,13 +1593,7 @@ def parse_cli_store(path: Path) -> dict | None:
                 }
             )
 
-        if subagent_fields and (not title or title == "New Agent"):
-            task_title = _store_subagent_title(first_user)
-            title = common.short_title(
-                f"[{subagent_fields['subagent_type']}] {task_title or first_user or '(sub-agent)'}"
-            )
-        elif not title:
-            title = common.short_title(first_user) or "(untitled session)"
+        title = _store_title(header["title"], first_user, subagent_fields)
         out_meta = {}
         if cwd:
             out_meta["cwd"] = cwd

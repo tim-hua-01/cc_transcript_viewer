@@ -22,11 +22,12 @@ from __future__ import annotations
 
 import base64
 import json
-import mimetypes
 import re
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
+
+import common
 
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -43,7 +44,7 @@ TITLE_TAG = "<title>Transcript Viewer</title>"
 MAX_IMAGE_BYTES = 4 * 1024 * 1024
 MAX_IMAGE_TOTAL_BYTES = 24 * 1024 * 1024
 
-_LOCAL_IMAGE_PREFIX = "/api/local-image?path="
+_LOCAL_IMAGE_PREFIX = common.LOCAL_IMAGE_ROUTE + "?path="
 
 
 def _local_image_path(src: str) -> Path | None:
@@ -58,7 +59,7 @@ def _local_image_path(src: str) -> Path | None:
 
 
 def _data_uri(path: Path, declared_type: str = "") -> str | None:
-    content_type = declared_type or mimetypes.guess_type(str(path))[0] or ""
+    content_type = declared_type or common.image_mime(path)
     if not content_type.startswith("image/"):
         return None
     try:

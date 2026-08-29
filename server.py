@@ -16,16 +16,17 @@ summary-cache persistence. Bundling a session into a shareable single-file
 HTML export lives in export_html.py.
 
 Usage:
-    python server.py [--port 3132] [--projects-dir PATH] [--codex-home PATH]
+    python server.py [--port 3132] [--host 127.0.0.1]
+                     [--projects-dir PATH] [--codex-home PATH]
                      [--cursor-db PATH] [--cursor-projects-dir PATH]
                      [--cursor-chats-dir PATH] [--opencode-db PATH]
+                     [--custom-names-file PATH]
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-import mimetypes
 import os
 import subprocess
 import sys
@@ -36,18 +37,33 @@ from urllib.parse import parse_qs, urlparse
 
 import claude_parser as claude
 import codex_parser as codex
+import common
 import cursor_parser as cursor
 import export_html
 import opencode_parser as opencode
 
-STATIC_DIR = Path(__file__).parent / "static"
+STATIC_DIR = export_html.STATIC_DIR
+
+# The transcript sources, in sidebar merge order. Every parser module exposes
+# configure() / list_sessions() / SUMMARY_CACHE; sessions that live in a
+# database rather than a file on disk are additionally routed by the scheme
+# table below, real transcript paths by _path_parser().
+PARSERS = {
+    "claude": claude,
+    "codex": codex,
+    "cursor": cursor,
+    "opencode": opencode,
+}
+
+# Scheme prefix -> parse-by-id, for database-backed sessions.
+SCHEME_PARSERS = {
+    cursor.SESSION_SCHEME: cursor.parse_session_by_id,
+    cursor.CLI_SESSION_SCHEME: cursor.parse_cli_store_by_id,
+    opencode.SESSION_SCHEME: opencode.parse_session_by_id,
+}
 # Session ids that name a row in a database rather than a file on disk. These
 # never resolve to a transcript path, so every path-based check skips them.
-SYNTHETIC_SCHEMES = (
-    cursor.SESSION_SCHEME,
-    cursor.CLI_SESSION_SCHEME,
-    opencode.SESSION_SCHEME,
-)
+SYNTHETIC_SCHEMES = tuple(SCHEME_PARSERS)
 DEFAULT_CUSTOM_NAMES_FILE = (
     Path.home() / ".config" / "cc_transcript_viewer" / "names.json"
 )
@@ -153,12 +169,7 @@ def _set_custom_name(session: dict, name: str) -> None:
 _CACHE_VERSION = 2
 _CACHE_LOCK = threading.Lock()
 _CACHE_LOADED = False
-_PARSER_CACHES = {
-    "claude": claude.SUMMARY_CACHE,
-    "codex": codex.SUMMARY_CACHE,
-    "cursor": cursor.SUMMARY_CACHE,
-    "opencode": opencode.SUMMARY_CACHE,
-}
+_PARSER_CACHES = {name: parser.SUMMARY_CACHE for name, parser in PARSERS.items()}
 
 
 def load_summary_caches() -> None:
@@ -179,12 +190,29 @@ def load_summary_caches() -> None:
 
 
 def save_summary_caches() -> None:
-    """Atomically persist a snapshot of every parser's summary cache, best effort."""
+    """Atomically persist a snapshot of every parser's summary cache, best effort.
+
+    Merged over what is already on disk, never a blind overwrite: several
+    viewer processes can share this file (two servers, a CLI run), and each
+    holds summaries only for what it has looked at. Overwriting with one
+    process's view would silently discard the others' entries and force full
+    rescans on their next start. A stale merged-in entry costs nothing — its
+    fingerprint just misses and that one file is recomputed.
+    """
     if not any(cache.dirty for cache in _PARSER_CACHES.values()):
         return
     snapshots = {name: cache.snapshot() for name, cache in _PARSER_CACHES.items()}
+    try:
+        existing = json.loads(CACHE_FILE.read_text(encoding="utf-8"))
+        if existing.get("version") != _CACHE_VERSION:
+            existing = {}
+    except (OSError, json.JSONDecodeError):
+        existing = {}
     payload: dict = {"version": _CACHE_VERSION}
-    payload.update({name: data for name, (_gen, data) in snapshots.items()})
+    for name, (_gen, data) in snapshots.items():
+        merged = dict(existing.get(name) or {})
+        merged.update(data)
+        payload[name] = merged
     try:
         CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
         temp = CACHE_FILE.with_name(CACHE_FILE.name + ".tmp")
@@ -202,24 +230,14 @@ def save_summary_caches() -> None:
 # Unified session list / dispatch
 # ---------------------------------------------------------------------------
 def list_sessions() -> list[dict]:
-    """Flat list of every Claude Code, Codex, Cursor, and opencode session, newest first."""
+    """Flat list of every session from every source, newest first."""
     load_summary_caches()
-    out: list[dict] = claude.list_sessions()
-
-    try:
-        out.extend(codex.list_sessions())
-    except Exception:  # noqa: BLE001 — never let Codex errors hide CC sessions
-        pass
-
-    try:
-        out.extend(cursor.list_sessions())
-    except Exception:  # noqa: BLE001 — never let Cursor errors hide other sessions
-        pass
-
-    try:
-        out.extend(opencode.list_sessions())
-    except Exception:  # noqa: BLE001 — never let opencode errors hide other sessions
-        pass
+    out: list[dict] = []
+    for parser in PARSERS.values():
+        try:
+            out.extend(parser.list_sessions())
+        except Exception:  # noqa: BLE001 — one broken source must not hide the rest
+            pass
 
     save_summary_caches()
 
@@ -259,20 +277,27 @@ def _under(target: Path, root: Path) -> bool:
     return target == root or root in target.parents
 
 
+def _path_parser(target: Path):
+    """The parse function that owns a real transcript path, or None if the
+    path lies outside every allowed transcript root."""
+    if _under(target, claude.PROJECTS_DIR):
+        return claude.parse_session
+    if _under(target, codex.SESSIONS_DIR) or (
+        codex.ARCHIVED_SESSIONS_DIR.exists() and _under(target, codex.ARCHIVED_SESSIONS_DIR)
+    ):
+        return codex.parse_session
+    if cursor.is_cli_transcript(target):
+        return cursor.parse_cli_session
+    return None
+
+
 def parse_session(target: Path) -> dict | None:
     """Dispatch to the right parser based on which transcript root owns the file.
 
     Returns None if the file is outside every allowed root.
     """
-    if _under(target, claude.PROJECTS_DIR):
-        return claude.parse_session(target)
-    if _under(target, codex.SESSIONS_DIR) or (
-        codex.ARCHIVED_SESSIONS_DIR.exists() and _under(target, codex.ARCHIVED_SESSIONS_DIR)
-    ):
-        return codex.parse_session(target)
-    if cursor.is_cli_transcript(target):
-        return cursor.parse_cli_session(target)
-    return None
+    parse = _path_parser(target)
+    return parse(target) if parse else None
 
 
 def load_session(file_id: str) -> dict | None:
@@ -283,15 +308,10 @@ def load_session(file_id: str) -> dict | None:
     ``opencode:<sessionID>``. Everything else is a real transcript path that
     must resolve under an allowed root.
     """
-    if file_id.startswith(cursor.SESSION_SCHEME):
-        data = cursor.parse_session_by_id(file_id[len(cursor.SESSION_SCHEME):])
-        return _apply_custom_name(data) if data is not None else None
-    if file_id.startswith(cursor.CLI_SESSION_SCHEME):
-        data = cursor.parse_cli_store_by_id(file_id[len(cursor.CLI_SESSION_SCHEME):])
-        return _apply_custom_name(data) if data is not None else None
-    if file_id.startswith(opencode.SESSION_SCHEME):
-        data = opencode.parse_session_by_id(file_id[len(opencode.SESSION_SCHEME):])
-        return _apply_custom_name(data) if data is not None else None
+    for scheme, parse_by_id in SCHEME_PARSERS.items():
+        if file_id.startswith(scheme):
+            data = parse_by_id(file_id[len(scheme):])
+            return _apply_custom_name(data) if data is not None else None
     target = Path(file_id).expanduser().resolve()
     if not target.exists():
         return None
@@ -311,16 +331,7 @@ def resolve_transcript_file(file_id: str) -> Path:
     target = Path(file_id).expanduser().resolve()
     if not target.exists():
         raise FileNotFoundError(file_id)
-    allowed = (
-        _under(target, claude.PROJECTS_DIR)
-        or _under(target, codex.SESSIONS_DIR)
-        or (
-            codex.ARCHIVED_SESSIONS_DIR.exists()
-            and _under(target, codex.ARCHIVED_SESSIONS_DIR)
-        )
-        or cursor.is_cli_transcript(target)
-    )
-    if not allowed:
+    if _path_parser(target) is None:
         raise PermissionError(file_id)
     return target
 
@@ -399,7 +410,8 @@ def open_local_file(file_id: str, path_value: str) -> Path:
 # ---------------------------------------------------------------------------
 # Full-text search across transcript content
 # ---------------------------------------------------------------------------
-# Cache: path -> (mtime, all_user_message_text, rest_of_text)
+# Cache: session file id -> (mtime, all_user_message_text, rest_of_text).
+# Ids are transcript paths or synthetic database schemes, matching /api/session.
 _TEXT_CACHE: dict[str, tuple[float, str, str]] = {}
 
 # User prompts should outrank generated/tool output without overwhelming a
@@ -407,6 +419,11 @@ _TEXT_CACHE: dict[str, tuple[float, str, str]] = {}
 USER_MSG_WEIGHT = 50
 CUSTOM_TITLE_WEIGHT = 10_000
 NATIVE_TITLE_WEIGHT = CUSTOM_TITLE_WEIGHT // 2
+
+
+# Input fields worth indexing on a flat-shape (Codex) tool call, including the
+# nested calls an orchestration-style exec unpacks into.
+_FLAT_INPUT_SEARCH_KEYS = ("cmd", "command", "file_path", "query", "prompt")
 
 
 def _event_text(ev: dict) -> list[str]:
@@ -417,7 +434,7 @@ def _event_text(ev: dict) -> list[str]:
         if x and isinstance(x, str):
             parts.append(x)
 
-    if ev.get("blocks"):  # Claude Code shape
+    if ev.get("blocks"):  # block shape (Claude Code / Cursor / opencode)
         for b in ev["blocks"]:
             add(b.get("text"))
             if b.get("type") == "tool_use":
@@ -436,14 +453,14 @@ def _event_text(ev: dict) -> list[str]:
         if isinstance(inp, str):
             add(inp)
         elif isinstance(inp, dict):
-            for k in ("cmd", "command", "file_path", "query", "prompt"):
+            for k in _FLAT_INPUT_SEARCH_KEYS:
                 add(inp.get(k))
             for call in inp.get("calls") or []:
                 nested = call.get("input") if isinstance(call, dict) else None
                 if isinstance(nested, str):
                     add(nested)
                 elif isinstance(nested, dict):
-                    for k in ("cmd", "command", "file_path", "query", "prompt"):
+                    for k in _FLAT_INPUT_SEARCH_KEYS:
                         add(nested.get(k))
         res = ev.get("result")
         if isinstance(res, dict):
@@ -496,8 +513,9 @@ def _session_segments(data: dict) -> tuple[str, str]:
 def session_segments(s: dict) -> tuple[str, str]:
     """(user messages, rest) for one session, cached by its mtime.
 
-    Works for both real transcript files and synthetic-id sessions (Cursor's
-    `cursordb:` scheme); the session summary already carries a stable mtime.
+    Works for both real transcript files and synthetic-id sessions (the
+    `cursordb:` / `cursorcli:` / `opencode:` schemes); the session summary
+    already carries a stable mtime.
     """
     key = s.get("file", "")
     mtime = s.get("mtime") or 0
@@ -517,7 +535,9 @@ def _search_title_segments(session: dict) -> tuple[str, str]:
     """Return viewer-custom and native-title text as distinct score tiers."""
     custom = session.get("custom_title") or ""
     native_titles = []
-    if session.get("agent") in {"claude", "cursor"}:
+    # Sources whose stored titles are AI- or user-authored names (as opposed
+    # to Codex's, which is usually just the first prompt again).
+    if session.get("agent") in {"claude", "cursor", "opencode"}:
         for title in (
             session.get("original_title"),
             session.get("claude_title"),
@@ -580,15 +600,26 @@ def search_sessions(query: str) -> list[dict]:
 # ---------------------------------------------------------------------------
 # HTTP server
 # ---------------------------------------------------------------------------
+# The frontend's three files, served with explicit types (see _send_file for
+# the no-store rationale).
+_STATIC_ROUTES = {
+    "/": ("index.html", "text/html; charset=utf-8"),
+    "/index.html": ("index.html", "text/html; charset=utf-8"),
+    "/app.js": ("app.js", "application/javascript; charset=utf-8"),
+    "/style.css": ("style.css", "text/css; charset=utf-8"),
+}
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args):  # quieter logs
         pass
 
-    def _send_json(self, obj, status=200):
-        body = json.dumps(obj).encode("utf-8")
+    def _send_bytes(self, body: bytes, content_type: str, status=200, extra_headers=()):
         try:
             self.send_response(status)
-            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Type", content_type)
+            for name, value in extra_headers:
+                self.send_header(name, value)
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -597,24 +628,19 @@ class Handler(BaseHTTPRequestHandler):
             # reload/navigation. There is no client left to receive an error.
             self.close_connection = True
 
+    def _send_json(self, obj, status=200):
+        self._send_bytes(json.dumps(obj).encode("utf-8"), "application/json", status)
+
     def _send_file(self, path: Path, content_type: str):
         try:
             body = path.read_bytes()
         except OSError:
             self.send_error(404)
             return
-        try:
-            self.send_response(200)
-            self.send_header("Content-Type", content_type)
-            # The viewer's own assets change under a long-lived server; heuristic
-            # browser caching otherwise serves a stale UI after an edit.
-            if path.parent == STATIC_DIR:
-                self.send_header("Cache-Control", "no-store")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
-            self.close_connection = True
+        # The viewer's own assets change under a long-lived server; heuristic
+        # browser caching otherwise serves a stale UI after an edit.
+        headers = (("Cache-Control", "no-store"),) if path.parent == STATIC_DIR else ()
+        self._send_bytes(body, content_type, extra_headers=headers)
 
     def _host_allowed(self) -> bool:
         """True if the request's Host header names this loopback server.
@@ -633,6 +659,53 @@ class Handler(BaseHTTPRequestHandler):
             hostname = host
         return hostname in LOOPBACK_HOSTS
 
+    def _read_json_body(self, max_len: int) -> dict | None:
+        """The parsed JSON object body of a POST/PUT, or None after answering
+        with the right 4xx.
+
+        application/json cannot be submitted by a cross-origin HTML form, and
+        browser fetches from another origin require a CORS preflight this
+        server never authorizes — so requiring it keeps the write endpoints
+        unreachable from the web.
+        """
+        if not self.headers.get("Content-Type", "").lower().startswith("application/json"):
+            self._send_json({"error": "expected application/json"}, status=415)
+            return None
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            length = 0
+        if length <= 0 or length > max_len:
+            self._send_json({"error": "invalid request size"}, status=400)
+            return None
+        try:
+            body = json.loads(self.rfile.read(length))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            self._send_json({"error": "invalid JSON"}, status=400)
+            return None
+        if not isinstance(body, dict):
+            self._send_json({"error": "expected a JSON object"}, status=400)
+            return None
+        return body
+
+    def _session_file_arg(self, parsed) -> str | None:
+        """The ?file= session id, or None after answering with the 400/404 the
+        shared /api/session-shaped preamble owes the client.
+
+        Cursor IDE/CLI and opencode sessions use synthetic schemes (no path on
+        disk); everything else is a real path confined to an allowed root.
+        """
+        file_arg = parse_qs(parsed.query).get("file", [""])[0]
+        if not file_arg:
+            self._send_json({"error": "missing file param"}, status=400)
+            return None
+        if not file_arg.startswith(SYNTHETIC_SCHEMES):
+            target = Path(file_arg).expanduser().resolve()
+            if not target.exists():
+                self._send_json({"error": "not found"}, status=404)
+                return None
+        return file_arg
+
     def do_GET(self):
         if HOST_CHECK and not self._host_allowed():
             self.send_error(403, "Host not allowed")
@@ -641,17 +714,12 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         route = parsed.path
 
-        if route == "/" or route == "/index.html":
-            self._send_file(STATIC_DIR / "index.html", "text/html; charset=utf-8")
-            return
-        if route == "/app.js":
-            self._send_file(STATIC_DIR / "app.js", "application/javascript; charset=utf-8")
-            return
-        if route == "/style.css":
-            self._send_file(STATIC_DIR / "style.css", "text/css; charset=utf-8")
+        static = _STATIC_ROUTES.get(route)
+        if static:
+            self._send_file(STATIC_DIR / static[0], static[1])
             return
 
-        if route == "/api/local-image":
+        if route == common.LOCAL_IMAGE_ROUTE:
             qs = parse_qs(parsed.query)
             path_arg = qs.get("path", [""])[0]
             if not path_arg:
@@ -662,8 +730,8 @@ class Handler(BaseHTTPRequestHandler):
             # original local path, which may live anywhere (project dirs, /tmp,
             # external volumes), so we don't constrain the location — the
             # Host-header check above is what keeps this off-limits to the web.
-            content_type = mimetypes.guess_type(str(t))[0] or ""
-            if not content_type.startswith("image/"):
+            content_type = common.image_mime(t)
+            if not content_type:
                 self._send_json({"error": "not an image"}, status=400)
                 return
             self._send_file(t, content_type)
@@ -706,19 +774,9 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if route == "/api/session":
-            qs = parse_qs(parsed.query)
-            file_arg = qs.get("file", [""])[0]
-            if not file_arg:
-                self._send_json({"error": "missing file param"}, status=400)
+            file_arg = self._session_file_arg(parsed)
+            if file_arg is None:
                 return
-            # Cursor IDE/CLI and opencode sessions use synthetic schemes (no
-            # path on disk); everything else is a real path confined to an
-            # allowed root.
-            if not file_arg.startswith(SYNTHETIC_SCHEMES):
-                target = Path(file_arg).expanduser().resolve()
-                if not target.exists():
-                    self._send_json({"error": "not found"}, status=404)
-                    return
             try:
                 data = load_session(file_arg)
             except Exception as e:  # noqa: BLE001
@@ -731,16 +789,9 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if route == "/api/export":
-            qs = parse_qs(parsed.query)
-            file_arg = qs.get("file", [""])[0]
-            if not file_arg:
-                self._send_json({"error": "missing file param"}, status=400)
+            file_arg = self._session_file_arg(parsed)
+            if file_arg is None:
                 return
-            if not file_arg.startswith(SYNTHETIC_SCHEMES):
-                target = Path(file_arg).expanduser().resolve()
-                if not target.exists():
-                    self._send_json({"error": "not found"}, status=404)
-                    return
             try:
                 data = load_session(file_arg)
                 if data is None:
@@ -751,19 +802,13 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:  # noqa: BLE001
                 self._send_json({"error": str(e)}, status=500)
                 return
-            try:
-                self.send_response(200)
-                self.send_header("Content-Type", "text/html; charset=utf-8")
-                # export_filename() emits only [A-Za-z0-9-] plus ".html", so the
-                # quoted form needs no further escaping.
-                self.send_header(
-                    "Content-Disposition", f'attachment; filename="{filename}"'
-                )
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
-                self.close_connection = True
+            # export_filename() emits only [A-Za-z0-9-] plus ".html", so the
+            # quoted form needs no further escaping.
+            self._send_bytes(
+                body,
+                "text/html; charset=utf-8",
+                extra_headers=(("Content-Disposition", f'attachment; filename="{filename}"'),),
+            )
             return
 
         self.send_error(404)
@@ -777,29 +822,14 @@ class Handler(BaseHTTPRequestHandler):
         if route not in ("/api/open-local", "/api/reveal-transcript"):
             self.send_error(404)
             return
-        # application/json cannot be submitted by a cross-origin HTML form;
-        # browser fetches from another origin require a CORS preflight, which
-        # this server does not authorize.
-        if not self.headers.get("Content-Type", "").lower().startswith("application/json"):
-            self._send_json({"error": "expected application/json"}, status=415)
+        body = self._read_json_body(max_len=16384)
+        if body is None:
             return
-        try:
-            length = int(self.headers.get("Content-Length", "0"))
-        except ValueError:
-            length = 0
-        if length <= 0 or length > 16384:
-            self._send_json({"error": "invalid request size"}, status=400)
-            return
-        try:
-            body = json.loads(self.rfile.read(length))
-        except (json.JSONDecodeError, UnicodeDecodeError):
-            self._send_json({"error": "invalid JSON"}, status=400)
-            return
-        file_id = body.get("file") if isinstance(body, dict) else None
+        file_id = body.get("file")
         if not isinstance(file_id, str) or not file_id:
             self._send_json({"error": "file must be a string"}, status=400)
             return
-        path_value = body.get("path") if isinstance(body, dict) else None
+        path_value = body.get("path")
         if route == "/api/open-local":
             if not isinstance(path_value, str):
                 self._send_json({"error": "path must be a string"}, status=400)
@@ -835,23 +865,11 @@ class Handler(BaseHTTPRequestHandler):
         if urlparse(self.path).path != "/api/session-name":
             self.send_error(404)
             return
-        if not self.headers.get("Content-Type", "").lower().startswith("application/json"):
-            self._send_json({"error": "expected application/json"}, status=415)
+        body = self._read_json_body(max_len=4096)
+        if body is None:
             return
-        try:
-            length = int(self.headers.get("Content-Length", "0"))
-        except ValueError:
-            length = 0
-        if length <= 0 or length > 4096:
-            self._send_json({"error": "invalid request size"}, status=400)
-            return
-        try:
-            body = json.loads(self.rfile.read(length))
-        except (json.JSONDecodeError, UnicodeDecodeError):
-            self._send_json({"error": "invalid JSON"}, status=400)
-            return
-        file_id = body.get("file") if isinstance(body, dict) else None
-        name = body.get("name") if isinstance(body, dict) else None
+        file_id = body.get("file")
+        name = body.get("name")
         if not isinstance(file_id, str) or not isinstance(name, str):
             self._send_json({"error": "file and name must be strings"}, status=400)
             return

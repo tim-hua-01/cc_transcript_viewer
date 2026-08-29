@@ -17,6 +17,15 @@ function el(tag, attrs = {}, ...kids) {
   }
   return n;
 }
+// Chevron head for a collapsed-by-default block: clicking it toggles the
+// block, and the shared .collapsible class carries the collapse CSS.
+function toggleHead(block, cls, ...kids) {
+  block.classList.add("collapsible");
+  const head = el("div", { class: cls }, el("span", { class: "chev" }, "▼"), ...kids);
+  head.addEventListener("click", () => block.classList.toggle("collapsed"));
+  return head;
+}
+
 const esc = (s) => (s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 
 // ---------- theme picker ----------
@@ -165,22 +174,26 @@ function localFileLinkTarget(anchor, cwd) {
   return { path: href, line };
 }
 
+// Send JSON to a server endpoint; throws with the server's error message.
+async function requestJson(url, body, method = "POST") {
+  const res = await fetch(url, {
+    method,
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const result = await res.json();
+  if (!res.ok || result.error) throw new Error(result.error || `HTTP ${res.status}`);
+  return result;
+}
+
 async function openLocalFileLink(event, anchor, target) {
   event.preventDefault();
   if (anchor.dataset.opening === "1") return;
   anchor.dataset.opening = "1";
   anchor.classList.add("opening");
   try {
-    const res = await fetch("/api/open-local", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ file: CURRENT_FILE, path: target.path }),
-    });
-    const result = await res.json();
-    if (!res.ok || result.error) throw new Error(result.error || `HTTP ${res.status}`);
-    anchor.classList.add("opened");
+    const result = await requestJson("/api/open-local", { file: CURRENT_FILE, path: target.path });
     anchor.title = "Opened with the default app: " + result.opened;
-    setTimeout(() => anchor.classList.remove("opened"), 1400);
   } catch (error) {
     window.alert("Could not open local file: " + String(error));
   } finally {
@@ -189,23 +202,19 @@ async function openLocalFileLink(event, anchor, target) {
   }
 }
 
-// Reveal the transcript's own .jsonl in Finder. Cursor IDE/CLI database
-// sessions have no file on disk, so the button is only rendered for real paths.
+// Session ids that name a database row rather than a transcript file on disk
+// (Cursor IDE/CLI and opencode) — nothing to reveal in Finder, nothing to stat.
+const SYNTHETIC_ID_RE = /^(cursordb|cursorcli|opencode):/;
+
 function hasTranscriptFile(file) {
-  return typeof file === "string" && !!file && !/^cursor(db|cli):/.test(file);
+  return typeof file === "string" && !!file && !SYNTHETIC_ID_RE.test(file);
 }
 
 async function revealTranscriptFile(button, file) {
   if (button.dataset.opening === "1") return;
   button.dataset.opening = "1";
   try {
-    const res = await fetch("/api/reveal-transcript", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ file }),
-    });
-    const result = await res.json();
-    if (!res.ok || result.error) throw new Error(result.error || `HTTP ${res.status}`);
+    await requestJson("/api/reveal-transcript", { file });
   } catch (error) {
     window.alert("Could not reveal transcript file: " + String(error));
   } finally {
@@ -280,6 +289,20 @@ function shortModel(m) {
     .replace(/\[1m\]$/, " (1M)")
     .replace(/-codex$/, "");
 }
+// The agent / sub-agent / CLI badge trio shown before a session title, in the
+// sidebar and in the transcript header. `s` is a summary or a parsed session.
+function agentTags(s) {
+  return [
+    el("span", { class: "agent-tag agent-" + s.agent }, agentLabel(s.agent)),
+    s.is_subagent
+      ? el("span", { class: "sidechain-tag" }, s.subagent_type === "guardian" ? "guardian" : "sub-agent")
+      : null,
+    s.cursor_source && String(s.cursor_source).startsWith("cli") && !s.is_subagent
+      ? el("span", { class: "sidechain-tag", title: "Cursor CLI agent transcript" }, "CLI")
+      : null,
+  ];
+}
+
 function agentLabel(a) {
   if (a === "codex") return "Codex";
   if (a === "cursor") return "Cursor";
@@ -553,13 +576,7 @@ function renderSidebar(query) {
       el(
         "div",
         { class: "session-toprow" },
-        el("span", { class: "agent-tag agent-" + s.agent }, agentLabel(s.agent)),
-        s.is_subagent
-          ? el("span", { class: "sidechain-tag" }, s.subagent_type === "guardian" ? "guardian" : "sub-agent")
-          : null,
-        s.cursor_source && String(s.cursor_source).startsWith("cli") && !s.is_subagent
-          ? el("span", { class: "sidechain-tag", title: "Cursor CLI agent transcript" }, "CLI")
-          : null,
+        ...agentTags(s),
         el("span", { class: "session-title" }, s.title)
       ),
       s.cwd ? el("div", { class: "session-cwd", title: s.cwd }, shortPath(s.cwd)) : null,
@@ -600,14 +617,16 @@ function renderSidebar(query) {
   }
 }
 
+// Briefly show `text` on a control, then put its label back.
+function flashLabel(node, text, ms, restore = node.textContent) {
+  node.textContent = text;
+  setTimeout(() => { node.textContent = restore; }, ms);
+}
+
 function copyId(e, id) {
   e.stopPropagation();
   const node = e.currentTarget;
-  const restore = node.textContent;
-  navigator.clipboard?.writeText(id).then(
-    () => { node.textContent = "copied ✓"; setTimeout(() => (node.textContent = restore), 900); },
-    () => {}
-  );
+  navigator.clipboard?.writeText(id).then(() => flashLabel(node, "copied ✓", 900), () => {});
 }
 
 const COPY_ALLOWED_KINDS = new Set(["user", "assistant", "reasoning", "tool"]);
@@ -625,14 +644,7 @@ function appendCopyEvent(lines, ev, branchLabel = "") {
   // Skip system messages, tool results, and other non-conversational noise.
   if (!COPY_ALLOWED_KINDS.has(ev.kind)) return;
 
-  const labels = {
-    user: "User", assistant: "Assistant", reasoning: "Reasoning",
-    tool: "Tool", web_search: "Web search", web_call: "Web search",
-    instructions: "Instructions", system: "System", notice: "Notice",
-    attachment: "Attachment", guardian_request: "Review input",
-    guardian_decision: "Review decision", status: "Status", context: "Context",
-    tokens: "Token usage", raw: "Raw event",
-  };
+  const labels = { user: "User", assistant: "Assistant", reasoning: "Reasoning", tool: "Tool" };
   const details = [ev.model, ev.phase, ev.status, branchLabel].filter(Boolean);
   lines.push("## " + (labels[ev.kind] || ev.kind || "Event") + (details.length ? " · " + details.join(" · ") : ""));
 
@@ -656,27 +668,6 @@ function appendCopyEvent(lines, ev, branchLabel = "") {
   if (ev.kind === "tool") {
     lines.push("Tool: " + (ev.name || "tool"));
     lines.push(...toolCallToText(ev.name, ev.input));
-  } else if (ev.kind === "guardian_request") {
-    if (ev.context) lines.push(ev.context);
-    lines.push(JSON.stringify(ev.request || {}, null, 2));
-  } else if (ev.kind === "guardian_decision") {
-    lines.push([
-      String(ev.outcome || "").toUpperCase(),
-      ev.risk_level && "risk: " + ev.risk_level,
-      ev.user_authorization && "user authorization: " + ev.user_authorization,
-    ].filter(Boolean).join(" · "));
-    if (ev.rationale) lines.push(ev.rationale);
-  } else if (ev.kind === "web_search" || ev.kind === "web_call") {
-    const queries = ev.action && Array.isArray(ev.action.queries) ? ev.action.queries : [ev.query || ev.action?.query].filter(Boolean);
-    lines.push(...queries);
-  } else if (ev.kind === "attachment") {
-    const name = ev.display_path || ev.filename;
-    if (name) lines.push(name);
-    if (ev.command) lines.push("$ " + ev.command);
-    lines.push(...[ev.content, ev.stdout, ev.stderr].filter(Boolean));
-  } else if (["status", "context", "tokens", "raw"].includes(ev.kind)) {
-    const payload = ev.kind === "raw" ? ev.payload : ev;
-    lines.push(JSON.stringify(payload || {}, null, 2));
   }
   for (const _image of ev.images || []) lines.push("[image]");
   for (const image of ev.local_images || []) lines.push("[local image: " + image + "]");
@@ -707,14 +698,12 @@ async function writeClipboard(text) {
 
 async function copyAll(e) {
   const button = e.currentTarget;
-  const original = button.textContent;
   try {
     await writeClipboard(transcriptToText(CURRENT_DATA || {}));
-    button.textContent = "Copied";
+    flashLabel(button, "Copied", 1200);
   } catch (_error) {
-    button.textContent = "Copy failed";
+    flashLabel(button, "Copy failed", 1200);
   }
-  setTimeout(() => { button.textContent = original; }, 1200);
 }
 
 // Content-Disposition: attachment; filename="foo.html"  ->  foo.html
@@ -748,14 +737,13 @@ async function saveTranscriptHtml(e) {
     anchor.remove();
     // Revoked late: Safari cancels the download if the blob dies too early.
     setTimeout(() => URL.revokeObjectURL(url), 30000);
-    button.textContent = "Saved";
+    flashLabel(button, "Saved", 1400, original);
   } catch (error) {
-    button.textContent = "Save failed";
     button.title = "Could not save transcript: " + String(error);
+    flashLabel(button, "Save failed", 1400, original);
   } finally {
     button.dataset.saving = "0";
   }
-  setTimeout(() => { button.textContent = original; }, 1400);
 }
 
 function setPanelCollapsed(panel, collapsed) {
@@ -781,13 +769,7 @@ async function renameSession(data) {
   );
   if (entered === null) return;
   try {
-    const res = await fetch("/api/session-name", {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ file, name: entered }),
-    });
-    const result = await res.json();
-    if (!res.ok || result.error) throw new Error(result.error || `HTTP ${res.status}`);
+    const result = await requestJson("/api/session-name", { file, name: entered }, "PUT");
     Object.assign(data, result);
     const summary = SESSIONS.find((s) => s.file === file);
     if (summary) Object.assign(summary, result);
@@ -863,17 +845,17 @@ async function openSession(file, itemEl) {
   $("#nav-buttons").hidden = true;
   const t = $("#transcript");
   t.hidden = false;
-  t.innerHTML = `<div class="spinner">Loading transcript…</div>`;
+  t.replaceChildren(el("div", { class: "spinner" }, "Loading transcript…"));
 
   try {
     const res = await fetch("/api/session?file=" + encodeURIComponent(file));
     const data = await res.json();
     if (CURRENT_FILE !== file) return;
-    if (data.error) { t.innerHTML = `<div class="empty-note">Error: ${esc(data.error)}</div>`; return; }
+    if (data.error) { t.replaceChildren(el("div", { class: "empty-note" }, "Error: " + data.error)); return; }
     const rendered = await renderTranscript(data);
     if (rendered && CURRENT_FILE === file) LAST_RENDERED_MTIME = sessionMtime(file);
   } catch (e) {
-    t.innerHTML = `<div class="empty-note">Failed to load: ${esc(String(e))}</div>`;
+    t.replaceChildren(el("div", { class: "empty-note" }, "Failed to load: " + String(e)));
   }
 }
 
@@ -899,13 +881,7 @@ function renderTranscript(data, opts = {}) {
       el(
         "h1",
         { class: "t-title" },
-        el("span", { class: "agent-tag agent-" + data.agent }, agentLabel(data.agent)),
-        data.is_subagent
-          ? el("span", { class: "sidechain-tag" }, data.subagent_type === "guardian" ? "guardian" : "sub-agent")
-          : null,
-        data.cursor_source && String(data.cursor_source).startsWith("cli") && !data.is_subagent
-          ? el("span", { class: "sidechain-tag", title: "Cursor CLI agent transcript" }, "CLI")
-          : null,
+        ...agentTags(data),
         " " + (data.title || "(untitled session)")
       ),
       STANDALONE ? null : el("button", {
@@ -1401,53 +1377,43 @@ function renderGuardianDecision(ev) {
   return turnShell("guardian", "Decision", ev, body);
 }
 
-function renderThinking(b) {
-  const hasText = b.text && b.text.trim();
+// Thinking (a block inside a turn) and reasoning (a Codex top-level event)
+// render identically; only the labels and the empty-state sentence differ.
+function thoughtBlock(text, { label, emptyLabel, emptyText, pill }) {
+  const hasText = text && text.trim();
   const block = el("div", { class: "thinking-block collapsed" + (hasText ? "" : " empty") });
-  const head = el(
-    "div",
-    { class: "thinking-head" },
-    el("span", { class: "chev" }, "▼"),
-    el("span", {}, hasText ? "💭 Thinking" : "💭 Thinking (not recorded)"),
-    // What's shown is a provider-written summary; the real chain of thought
-    // came back encrypted and is not in the transcript.
-    hasText && b.has_encrypted
-      ? el("span", { class: "tool-caller" }, "summary · full reasoning encrypted")
-      : null
+  const head = toggleHead(
+    block,
+    "thinking-head",
+    el("span", {}, hasText ? label : emptyLabel),
+    hasText && pill ? el("span", { class: "tool-caller" }, pill) : null
   );
-  head.addEventListener("click", () => block.classList.toggle("collapsed"));
   const body = hasText
-    ? el("div", { class: "thinking-body md", html: md(b.text) })
-    : el(
-        "div",
-        { class: "thinking-body thinking-empty" },
-        "Claude Code doesn't save thinking text to the transcript — only an encrypted signature is stored, so there's nothing to display here."
-      );
+    ? el("div", { class: "thinking-body md", html: md(text) })
+    : el("div", { class: "thinking-body thinking-empty" }, emptyText);
   block.append(head, body);
   return block;
 }
 
+function renderThinking(b) {
+  return thoughtBlock(b.text, {
+    label: "💭 Thinking",
+    emptyLabel: "💭 Thinking (not recorded)",
+    // What's shown is a provider-written summary; the real chain of thought
+    // came back encrypted and is not in the transcript.
+    pill: b.has_encrypted ? "summary · full reasoning encrypted" : "",
+    emptyText: "Claude Code doesn't save thinking text to the transcript — only an encrypted signature is stored, so there's nothing to display here.",
+  });
+}
+
 function renderReasoning(ev) {
-  const hasText = ev.text && ev.text.trim();
-  const block = el("div", { class: "thinking-block collapsed" + (hasText ? "" : " empty") });
-  const head = el(
-    "div",
-    { class: "thinking-head" },
-    el("span", { class: "chev" }, "▼"),
-    el("span", {}, hasText ? "💭 Reasoning summary" : "💭 Reasoning not readable")
-  );
-  head.addEventListener("click", () => block.classList.toggle("collapsed"));
-  const body = hasText
-    ? el("div", { class: "thinking-body md", html: md(ev.text) })
-    : el(
-        "div",
-        { class: "thinking-body thinking-empty" },
-        ev.has_encrypted
-          ? "Codex saved encrypted reasoning content for continuation, not readable reasoning text."
-          : "No reasoning text was recorded."
-      );
-  block.append(head, body);
-  return block;
+  return thoughtBlock(ev.text, {
+    label: "💭 Reasoning summary",
+    emptyLabel: "💭 Reasoning not readable",
+    emptyText: ev.has_encrypted
+      ? "Codex saved encrypted reasoning content for continuation, not readable reasoning text."
+      : "No reasoning text was recorded.",
+  });
 }
 
 // Codex injected system prompt / context (developer instructions, base prompt,
@@ -1556,13 +1522,7 @@ function renderBranch(ev) {
       ? `⑂ ${count} messages on ${groups.length} abandoned branches`
       : `⑂ ${count} message${count === 1 ? "" : "s"} on an abandoned branch`;
   const block = el("div", { class: "branch-block collapsed" });
-  const head = el(
-    "div",
-    { class: "tool-head" },
-    el("span", { class: "chev" }, "▼"),
-    el("span", { class: "tool-name" }, label)
-  );
-  head.addEventListener("click", () => block.classList.toggle("collapsed"));
+  const head = toggleHead(block, "tool-head", el("span", { class: "tool-name" }, label));
   const body = el("div", { class: "tool-body" });
   groups.forEach((g, i) => {
     if (groups.length > 1) body.append(el("div", { class: "tool-section-label" }, "branch " + (i + 1)));
@@ -1577,14 +1537,10 @@ function renderBranch(ev) {
 
 function collapsibleBlock(cls, label, bodyNodes) {
   const block = el("div", { class: cls });
-  const head = el(
-    "div",
-    { class: "tool-head" },
-    el("span", { class: "chev" }, "▼"),
-    el("span", { class: "tool-name" }, label)
+  block.append(
+    toggleHead(block, "tool-head", el("span", { class: "tool-name" }, label)),
+    el("div", { class: "tool-body" }, ...bodyNodes)
   );
-  head.addEventListener("click", () => block.classList.toggle("collapsed"));
-  block.append(head, el("div", { class: "tool-body" }, ...bodyNodes));
   return block;
 }
 
@@ -1624,9 +1580,7 @@ function renderTokens(ev) {
   );
   const extra = ev.context_window ? el("div", { class: "attach-meta", style: "margin-top:8px" }, "context window: " + ev.context_window.toLocaleString()) : null;
   const block = collapsibleBlock("status-block collapsed", "Token usage", [body, extra]);
-  const node = turnShell("tokens", "Usage", ev, [block]);
-  node.classList.add("token-event");
-  return node;
+  return turnShell("tokens", "Usage", ev, [block]);
 }
 
 // ---------- images (Codex) ----------
@@ -1670,16 +1624,14 @@ function renderWebSearch(ev) {
     ? action.queries
     : [ev.query || action.query].filter(Boolean);
   const block = el("div", { class: "tool-block collapsed" });
-  const head = el(
-    "div",
-    { class: "tool-head" },
-    el("span", { class: "chev" }, "▼"),
+  const head = toggleHead(
+    block,
+    "tool-head",
     el("span", { class: "tool-icon" }, "🌐"),
     el("span", { class: "tool-name" }, "web_search"),
     queries.length > 1 ? el("span", { class: "status-tag" }, queries.length + " queries") : null,
     el("span", { class: "tool-summary", title: queries.join("  •  ") }, queries[0] || "(no query recorded)")
   );
-  head.addEventListener("click", () => block.classList.toggle("collapsed"));
 
   const ul = el("ul", { class: "query-list" });
   for (const q of queries) ul.append(el("li", {}, q));
@@ -1706,23 +1658,27 @@ function callerLabel(caller) {
 }
 
 // ---------- tool rendering ----------
+// The disclosure shell both tool renderers share: error styling, the icon/name
+// head with per-source extras, and the body. What goes *in* the body differs
+// per source and stays in the callers.
+function toolShell(name, isErr, headExtras, bodyKids) {
+  const block = el("div", { class: "tool-block collapsed" + (isErr ? " error" : "") });
+  const head = toggleHead(
+    block,
+    "tool-head",
+    el("span", { class: "tool-icon" }, isErr ? "✗" : "🔧"),
+    el("span", { class: "tool-name" }, name),
+    ...headExtras
+  );
+  block.append(head, el("div", { class: "tool-body" }, ...bodyKids));
+  return block;
+}
+
 // Claude Code tool (input formatted client-side; result attached on the block).
 function renderTool(b) {
   const name = b.name || "tool";
   const fmt = formatToolInput(name, b.input || {});
   const isErr = b.result && b.result.is_error;
-
-  const block = el("div", { class: "tool-block collapsed" + (isErr ? " error" : "") });
-  const head = el(
-    "div",
-    { class: "tool-head" },
-    el("span", { class: "chev" }, "▼"),
-    el("span", { class: "tool-icon" }, isErr ? "✗" : "🔧"),
-    el("span", { class: "tool-name" }, name),
-    el("span", { class: "tool-summary", title: fmt.summary }, fmt.summary),
-    callerLabel(b.caller) ? el("span", { class: "tool-caller" }, callerLabel(b.caller)) : null
-  );
-  head.addEventListener("click", () => block.classList.toggle("collapsed"));
 
   const bodyKids = [];
   bodyKids.push(el("div", { class: "tool-section-label" }, "Input"));
@@ -1756,25 +1712,16 @@ function renderTool(b) {
     bodyKids.push(el("div", { class: "tool-section-label muted" }, "No result recorded"));
   }
 
-  block.append(head, el("div", { class: "tool-body" }, ...bodyKids));
-  return block;
+  return toolShell(name, isErr, [
+    el("span", { class: "tool-summary", title: fmt.summary }, fmt.summary),
+    callerLabel(b.caller) ? el("span", { class: "tool-caller" }, callerLabel(b.caller)) : null,
+  ], bodyKids);
 }
 
 // Codex tool (top-level event; summary precomputed server-side, result is a dict).
 function renderCodexTool(ev) {
   const name = ev.name || "tool";
   const isErr = ev.result && ev.result.is_error;
-  const block = el("div", { class: "tool-block collapsed" + (isErr ? " error" : "") });
-  const head = el(
-    "div",
-    { class: "tool-head" },
-    el("span", { class: "chev" }, "▼"),
-    el("span", { class: "tool-icon" }, isErr ? "✗" : "🔧"),
-    el("span", { class: "tool-name" }, name),
-    ev.status ? el("span", { class: "status-tag" }, ev.status) : null,
-    el("span", { class: "tool-summary", title: ev.summary || "" }, ev.summary || "")
-  );
-  head.addEventListener("click", () => block.classList.toggle("collapsed"));
 
   const bodyKids = [];
   bodyKids.push(el("div", { class: "tool-section-label" }, "Input"));
@@ -1807,8 +1754,10 @@ function renderCodexTool(ev) {
     bodyKids.push(el("div", { class: "tool-section-label muted" }, "No result recorded"));
   }
 
-  block.append(head, el("div", { class: "tool-body" }, ...bodyKids));
-  return block;
+  return toolShell(name, isErr, [
+    ev.status ? el("span", { class: "status-tag" }, ev.status) : null,
+    el("span", { class: "tool-summary", title: ev.summary || "" }, ev.summary || ""),
+  ], bodyKids);
 }
 
 function preFrom(text, cls = "payload truncatable") {
@@ -2178,7 +2127,7 @@ async function refreshSidebar() {
 // Real transcript files get a fast, tiny stat request. The full session list
 // remains on a slower loop for sidebar changes and synthetic Cursor sessions.
 function supportsFastTranscriptPoll(file) {
-  return file && !file.startsWith("cursordb:") && !file.startsWith("cursorcli:");
+  return !!file && !SYNTHETIC_ID_RE.test(file);
 }
 
 let transcriptStatePolling = false;

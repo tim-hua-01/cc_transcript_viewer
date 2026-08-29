@@ -19,7 +19,7 @@ from pathlib import Path
 
 import codex_parser as codex
 import cursor_binary
-import cursor_to_codex as c2c
+from codex_export import cursor_to_codex as c2c
 
 ENCRYPTED = "gAAAAABtEST_encrypted_reasoning_blob"
 REASONING_ITEM = {
