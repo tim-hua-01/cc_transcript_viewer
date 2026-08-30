@@ -581,7 +581,8 @@ function renderSidebar(query) {
     if (SELECTED_MODELS.size && !SELECTED_MODELS.has(s.model || "")) return false;
     if (SELECTED_DIRS.size && !SELECTED_DIRS.has(s.cwd || "")) return false;
     if (DATE_FILTER.from || DATE_FILTER.to) {
-      const day = dayOf(s.mtime);
+      // Same recency the row displays: last activity, not file mtime.
+      const day = dayOf(s.last_ts ? Date.parse(s.last_ts) / 1000 : s.mtime);
       if (DATE_FILTER.from && day < DATE_FILTER.from) return false;
       if (DATE_FILTER.to && day > DATE_FILTER.to) return false;
     }
@@ -686,8 +687,10 @@ function renderSidebar(query) {
         : null,
       el(
         "div",
+        // Only the first id block: the full UUID is the widest thing in the
+        // row and wraps in a narrow sidebar. Click still copies the whole id.
         { class: "session-id", title: "Click to copy full id: " + s.id, onclick: (e) => copyId(e, s.id) },
-        s.id
+        String(s.id).split("-")[0] + (String(s.id).includes("-") ? "…" : "")
       ),
       subagentToggle
     );
@@ -1357,7 +1360,10 @@ function turnShell(kind, label, ev, bodyNodes) {
       : null,
     ev.phase ? el("span", { class: "phase-tag" }, ev.phase) : null,
     ev.status ? el("span", { class: "status-tag" }, ev.status) : null,
-    ev.model ? el("span", { class: "muted", style: "font-weight:400" }, shortModel(ev.model)) : null,
+    // "<synthetic>" is Claude Code's placeholder on machine-written records
+    // (interruptions, API errors) — not a model worth labelling the turn with.
+    ev.model && ev.model !== "<synthetic>"
+      ? el("span", { class: "muted", style: "font-weight:400" }, shortModel(ev.model)) : null,
     el("span", { class: "turn-time" }, fmtTime(ev.ts))
   );
   return el(

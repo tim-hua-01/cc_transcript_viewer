@@ -31,6 +31,7 @@ import os
 import subprocess
 import sys
 import threading
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -243,7 +244,7 @@ def list_sessions() -> list[dict]:
 
     for session in out:
         _apply_custom_name(session)
-    out.sort(key=lambda s: s.get("mtime") or 0, reverse=True)
+    out.sort(key=_recency, reverse=True)
 
     # Place each sub-agent directly under its parent session rather than at its
     # own mtime slot. An actively-updated parent floats to the top of the
@@ -267,6 +268,24 @@ def list_sessions() -> list[dict]:
         grouped.append(s)
         grouped.extend(subs_by_parent.get(s["file"], []))
     return grouped
+
+
+def _recency(s: dict) -> float:
+    """When the conversation last had real activity — the sidebar's sort key.
+
+    The last recorded timestamp, not the file mtime: Claude Code appends
+    post-hoc bookkeeping (`last-prompt` records for its /resume picker) to old
+    transcripts, which bumps their mtime days after the conversation ended and
+    would shuffle them to the top of a mtime-sorted list while their visible
+    "Nd ago" label still shows the real age.
+    """
+    ts = s.get("last_ts")
+    if isinstance(ts, str) and ts:
+        try:
+            return datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            pass
+    return s.get("mtime") or 0
 
 
 def _under(target: Path, root: Path) -> bool:
