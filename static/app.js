@@ -576,8 +576,9 @@ function renderSidebar(query) {
   list.innerHTML = "";
   const q = query.trim().toLowerCase();
 
-  const matches = SESSIONS.filter((s) => {
-    if (AGENT_FILTER !== "all" && s.agent !== AGENT_FILTER) return false;
+  // Every filter except the agent chips, which are handled by the caller —
+  // the chips display counts of what selecting them would show.
+  const matchesFilters = (s, q) => {
     if (SELECTED_MODELS.size && !SELECTED_MODELS.has(s.model || "")) return false;
     if (SELECTED_DIRS.size && !SELECTED_DIRS.has(s.cwd || "")) return false;
     if (DATE_FILTER.from || DATE_FILTER.to) {
@@ -593,7 +594,10 @@ function renderSidebar(query) {
     ).toLowerCase().includes(q);
     const contentHit = CONTENT_MATCHES && CONTENT_MATCHES.has(s.file);
     return metaHit || contentHit;
-  });
+  };
+  const matches = SESSIONS.filter(
+    (s) => (AGENT_FILTER === "all" || s.agent === AGENT_FILTER) && matchesFilters(s, q)
+  );
 
   // With an active query, order by relevance score; otherwise keep the
   // server's newest-first ordering.
@@ -605,10 +609,16 @@ function renderSidebar(query) {
     matches.sort((a, b) => (scoreOf(b) - scoreOf(a)) || ((b.mtime || 0) - (a.mtime || 0)));
   }
 
-  const perAgent = ["claude", "codex", "cursor", "opencode"]
-    .map((a) => `${matches.filter((s) => s.agent === a).length} ${agentLabel(a)}`)
-    .join(" · ");
-  $("#sidebar-stats").textContent = `${matches.length} sessions · ${perAgent}`;
+  // The total stays on its own short line (the full breakdown used to live
+  // here and wrapped in a narrow sidebar); per-agent counts ride on the
+  // filter chips, counted against every filter except the agent chip itself.
+  $("#sidebar-stats").textContent = `${matches.length} session${matches.length === 1 ? "" : "s"}`;
+  const chipEligible = SESSIONS.filter((s) => matchesFilters(s, q));
+  for (const chip of $$("#filter-row .filter-chip")) {
+    const a = chip.dataset.agent;
+    const n = a === "all" ? chipEligible.length : chipEligible.filter((s) => s.agent === a).length;
+    chip.textContent = (a === "all" ? "All" : agentLabel(a)) + " " + n;
+  }
 
   const matchedByFile = new Map(matches.map((s) => [s.file, s]));
   const subagentCounts = new Map();
@@ -687,10 +697,8 @@ function renderSidebar(query) {
         : null,
       el(
         "div",
-        // Only the first id block: the full UUID is the widest thing in the
-        // row and wraps in a narrow sidebar. Click still copies the whole id.
         { class: "session-id", title: "Click to copy full id: " + s.id, onclick: (e) => copyId(e, s.id) },
-        String(s.id).split("-")[0] + (String(s.id).includes("-") ? "…" : "")
+        s.id
       ),
       subagentToggle
     );
