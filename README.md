@@ -3,6 +3,8 @@
 A tiny, **zero-dependency** local web app for browsing your local coding-agent transcripts —
 **Claude Code, Codex, Cursor, and opencode together** in one time-sorted view.
 
+![The viewer showing a Claude Code session: the session sidebar with agent filters on the left, the rendered transcript with thinking blocks and sub-agent calls in the middle, and the user-message outline on the right](screenshot.png)
+
 It reads:
 
 - Claude Code transcripts from `~/.claude/projects/`
