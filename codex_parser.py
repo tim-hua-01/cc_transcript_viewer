@@ -338,6 +338,33 @@ def _base_instructions_text(value) -> str:
     return ""
 
 
+def _item_text(item: dict) -> str:
+    """Text of a Codex ≥0.147 ``item_completed`` message item, whose content
+    blocks are ``{"type": "text"|"Text", "text": …}``."""
+    return "\n".join(
+        block["text"]
+        for block in item.get("content") or []
+        if isinstance(block, dict) and isinstance(block.get("text"), str) and block["text"]
+    )
+
+
+def _completed_message_item(rec: dict) -> tuple[str, dict] | None:
+    """(item_type, item) when a record is an ``item_completed`` envelope for a
+    user or agent message; None otherwise. Codex ≥0.147 stopped writing the
+    ``user_message``/``agent_message`` event mirrors and wraps every finished
+    item in this envelope instead."""
+    if rec.get("type") != "event_msg":
+        return None
+    payload = rec.get("payload") or {}
+    if payload.get("type") != "item_completed":
+        return None
+    item = payload.get("item") or {}
+    itype = item.get("type")
+    if itype in ("UserMessage", "AgentMessage"):
+        return itype, item
+    return None
+
+
 def _first_user_message(records: list[dict]) -> str:
     for rec in records:
         if rec.get("type") != "event_msg":
@@ -345,6 +372,11 @@ def _first_user_message(records: list[dict]) -> str:
         payload = rec.get("payload") or {}
         if payload.get("type") == "user_message" and payload.get("message"):
             return common.short_title(str(payload["message"]))
+        completed = _completed_message_item(rec)
+        if completed and completed[0] == "UserMessage":
+            text = _item_text(completed[1])
+            if text:
+                return common.short_title(text)
     return ""
 
 
@@ -896,6 +928,13 @@ def parse_session(path: Path) -> dict:
             msg = payload.get("message")
             if msg:
                 user_event_texts.add(" ".join(str(msg).split()))
+        elif (completed := _completed_message_item(rec)) and completed[0] == "UserMessage":
+            # Codex ≥0.147 user prompts, so their response_item copies are
+            # recognized as repeats below. Deliberately narrow: other event_msg
+            # subtypes must fall through to the branches underneath.
+            text = _item_text(completed[1])
+            if text:
+                user_event_texts.add(" ".join(text.split()))
         elif rec.get("type") == "turn_context":
             turn_id = payload.get("turn_id")
             if turn_id:
@@ -1128,6 +1167,47 @@ def parse_session(path: Path) -> dict:
                             },
                         )
                     )
+            elif pt == "item_completed":
+                # Codex ≥0.147: user/agent messages only exist inside this
+                # envelope. Reasoning and tool items also ride in it but still
+                # arrive as response_items too, so only the messages are taken
+                # here — anything else would double-render.
+                completed = _completed_message_item(rec)
+                if completed is not None:
+                    itype, item = completed
+                    text = _item_text(item)
+                    if itype == "UserMessage":
+                        request = _guardian_request(text) if is_guardian else None
+                        if request is not None:
+                            events.append(
+                                _event_payload(
+                                    "guardian_request",
+                                    ts,
+                                    {"request": request, "context": text},
+                                )
+                            )
+                        elif text.strip():
+                            events.append(
+                                _event_payload(
+                                    "user",
+                                    ts,
+                                    {"text": text, "images": [], "local_images": [],
+                                     "text_elements": []},
+                                )
+                            )
+                    else:
+                        decision = _guardian_decision(text) if is_guardian else None
+                        if decision is not None:
+                            events.append(_event_payload("guardian_decision", ts, decision))
+                        elif text.strip():
+                            events.append(
+                                _event_payload(
+                                    "assistant",
+                                    ts,
+                                    {"text": text, "phase": item.get("phase"),
+                                     "memory_citation": item.get("memory_citation")},
+                                )
+                            )
             elif pt == "agent_message":
                 text = payload.get("message") or ""
                 decision = _guardian_decision(text) if is_guardian else None

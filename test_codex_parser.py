@@ -161,5 +161,59 @@ class CodexExecUnwrapTests(unittest.TestCase):
         )
         self.assertEqual(codex._patch_files(patch), ["a.py", "b.py"])
 
+class ItemCompletedFormatTests(unittest.TestCase):
+    """Codex >=0.147 stopped writing user_message/agent_message event mirrors;
+    user and agent messages only exist inside event_msg/item_completed
+    envelopes. The parser must surface them (and only them — reasoning and
+    tool items in the same envelope still arrive as response_items)."""
+
+    def _write_rollout(self, tmp: Path) -> Path:
+        day = tmp / "sessions" / "2026" / "08" / "29"
+        day.mkdir(parents=True)
+        f = day / "rollout-2026-08-29T10-00-00-0197a2e5-b222-7ab0-8888-000000000147.jsonl"
+        ts = "2026-08-29T10:00:00.000Z"
+        recs = [
+            {"timestamp": ts, "type": "session_meta",
+             "payload": {"id": "0197a2e5-b222-7ab0-8888-000000000147", "cwd": "/tmp/proj",
+                         "cli_version": "0.147.0"}},
+            {"timestamp": ts, "type": "event_msg",
+             "payload": {"type": "item_completed", "item": {
+                 "type": "UserMessage", "id": "u1",
+                 "content": [{"type": "text", "text": "hello new format"}]}}},
+            {"timestamp": ts, "type": "response_item",
+             "payload": {"type": "message", "role": "user", "id": "m1",
+                         "content": [{"type": "input_text", "text": "hello new format"}]}},
+            {"timestamp": ts, "type": "event_msg",
+             "payload": {"type": "item_completed", "item": {
+                 "type": "Reasoning", "id": "r1", "summary_text": ["thinking..."]}}},
+            {"timestamp": ts, "type": "event_msg",
+             "payload": {"type": "item_completed", "item": {
+                 "type": "AgentMessage", "id": "a1", "phase": "commentary",
+                 "content": [{"type": "Text", "text": "hi from 0.147"}]}}},
+        ]
+        f.write_text("\n".join(json.dumps(r) for r in recs) + "\n", encoding="utf-8")
+        return f
+
+    def test_messages_come_from_the_item_completed_envelope(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            path = self._write_rollout(tmp)
+            codex.configure(tmp)
+            try:
+                data = codex.parse_session(path)
+            finally:
+                codex.configure(Path.home() / ".codex")
+        kinds = [e["kind"] for e in data["events"]]
+        users = [e for e in data["events"] if e["kind"] == "user"]
+        assistants = [e for e in data["events"] if e["kind"] == "assistant"]
+        self.assertEqual([e["text"] for e in users], ["hello new format"])
+        self.assertEqual([e["text"] for e in assistants], ["hi from 0.147"])
+        # The response_item copy of the prompt is a repeat, not an extra turn
+        # or an instructions block.
+        self.assertEqual(kinds.count("user"), 1)
+        self.assertNotIn("instructions", kinds)
+        self.assertEqual(data["title"], "hello new format")
+
+
 if __name__ == "__main__":
     unittest.main()
