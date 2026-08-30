@@ -110,7 +110,7 @@ _IMAGE_MAGIC = (
 # ---------------------------------------------------------------------------
 def open_db(path: Path) -> sqlite3.Connection:
     """Read-only connection — safe to run while Cursor is open."""
-    return sqlite3.connect(f"file:{Path(path).expanduser()}?mode=ro", uri=True)
+    return sqlite3.connect(f"file:{Path(path).expanduser()}?mode=ro", uri=True, timeout=2.0)
 
 
 def _loads(value):
@@ -633,70 +633,73 @@ def main(argv: list[str] | None = None) -> int:
         print(f"no Cursor store at {args.db}", file=sys.stderr)
         return 2
     conn = open_db(args.db)
-    sessions = select_sessions(
-        conn,
-        model_regex=None if args.all_models else args.model_regex,
-        session_ids=set(args.session) or None,
-    )
-    if not sessions:
-        print("no matching sessions", file=sys.stderr)
-        return 1
+    try:
+        sessions = select_sessions(
+            conn,
+            model_regex=None if args.all_models else args.model_regex,
+            session_ids=set(args.session) or None,
+        )
+        if not sessions:
+            print("no matching sessions", file=sys.stderr)
+            return 1
 
-    if args.list:
+        if args.list:
+            for composer_id, composer in sessions:
+                messages, missing = session_messages(conn, composer)
+                print(
+                    f"{composer_id}  {composer_model(composer):<20} "
+                    f"{len(messages):>5} msgs  {'enc' if has_openai_reasoning(messages) else '---'}"
+                    f"{'  MISSING ' + str(missing) if missing else ''}  {composer.get('name') or ''}"
+                )
+            return 0
+
+        if not args.out:
+            parser.error("--out is required (use - for stdout)")
+
+        to_stdout = args.out == "-"
+        out_dir = None if to_stdout else Path(args.out).expanduser()
+        total = {"sessions": 0, "records": 0, "encrypted": 0, "missing": 0}
         for composer_id, composer in sessions:
-            messages, missing = session_messages(conn, composer)
+            lines, report = export_session(
+                conn,
+                composer_id,
+                composer,
+                tool_output=args.tool_output,
+                event_msgs=not args.no_event_msg,
+            )
+            if not lines[1:]:
+                print(f"skip {composer_id}: no messages in conversationState", file=sys.stderr)
+                continue
+            total["sessions"] += 1
+            total["records"] += report["records"]
+            total["encrypted"] += report["encrypted"]
+            total["missing"] += report["missing_blobs"]
+            if to_stdout:
+                for line in lines:
+                    print(json.dumps(line, ensure_ascii=False))
+                continue
+            path = output_path(out_dir, composer_id, lines[0]["timestamp"], args.layout)
+            write_rollout(path, lines)
             print(
-                f"{composer_id}  {composer_model(composer):<20} "
-                f"{len(messages):>5} msgs  {'enc' if has_openai_reasoning(messages) else '---'}"
-                f"{'  MISSING ' + str(missing) if missing else ''}  {composer.get('name') or ''}"
+                f"{path}  {report['records']} records, {report['reasoning']} reasoning "
+                f"({report['encrypted']} encrypted)"
+                + (f"  [{report['missing_blobs']} blobs missing]" if report["missing_blobs"] else "")
+                + (
+                    f"  [compacted: {report['dropped_turns']} earlier turns not in "
+                    "conversationState]"
+                    if report["dropped_turns"]
+                    else ""
+                )
+            )
+        if not to_stdout:
+            print(
+                f"\n{total['sessions']} sessions, {total['records']} records, "
+                f"{total['encrypted']} encrypted reasoning items"
+                + (f", {total['missing']} unresolved blobs" if total["missing"] else "")
             )
         return 0
-
-    if not args.out:
-        parser.error("--out is required (use - for stdout)")
-
-    to_stdout = args.out == "-"
-    out_dir = None if to_stdout else Path(args.out).expanduser()
-    total = {"sessions": 0, "records": 0, "encrypted": 0, "missing": 0}
-    for composer_id, composer in sessions:
-        lines, report = export_session(
-            conn,
-            composer_id,
-            composer,
-            tool_output=args.tool_output,
-            event_msgs=not args.no_event_msg,
-        )
-        if not lines[1:]:
-            print(f"skip {composer_id}: no messages in conversationState", file=sys.stderr)
-            continue
-        total["sessions"] += 1
-        total["records"] += report["records"]
-        total["encrypted"] += report["encrypted"]
-        total["missing"] += report["missing_blobs"]
-        if to_stdout:
-            for line in lines:
-                print(json.dumps(line, ensure_ascii=False))
-            continue
-        path = output_path(out_dir, composer_id, lines[0]["timestamp"], args.layout)
-        write_rollout(path, lines)
-        print(
-            f"{path}  {report['records']} records, {report['reasoning']} reasoning "
-            f"({report['encrypted']} encrypted)"
-            + (f"  [{report['missing_blobs']} blobs missing]" if report["missing_blobs"] else "")
-            + (
-                f"  [compacted: {report['dropped_turns']} earlier turns not in "
-                "conversationState]"
-                if report["dropped_turns"]
-                else ""
-            )
-        )
-    if not to_stdout:
-        print(
-            f"\n{total['sessions']} sessions, {total['records']} records, "
-            f"{total['encrypted']} encrypted reasoning items"
-            + (f", {total['missing']} unresolved blobs" if total["missing"] else "")
-        )
-    return 0
+    finally:
+        conn.close()
 
 
 if __name__ == "__main__":

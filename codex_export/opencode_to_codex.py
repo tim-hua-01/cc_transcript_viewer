@@ -76,7 +76,7 @@ ENCRYPTED_DETAIL = "reasoning.encrypted"
 # ---------------------------------------------------------------------------
 def open_db(path: Path) -> sqlite3.Connection:
     """Read-only connection — safe to run while opencode is open."""
-    conn = sqlite3.connect(f"file:{Path(path).expanduser()}?mode=ro", uri=True)
+    conn = sqlite3.connect(f"file:{Path(path).expanduser()}?mode=ro", uri=True, timeout=2.0)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -458,74 +458,77 @@ def main(argv: list[str] | None = None) -> int:
         print(f"no opencode database at {db}", file=sys.stderr)
         return 2
     conn = open_db(db)
-    sessions = select_sessions(
-        conn,
-        session_ids=set(args.session) or None,
-        with_encrypted=args.with_encrypted,
-    )
-    if not sessions:
-        print("no matching sessions", file=sys.stderr)
-        return 1
+    try:
+        sessions = select_sessions(
+            conn,
+            session_ids=set(args.session) or None,
+            with_encrypted=args.with_encrypted,
+        )
+        if not sessions:
+            print("no matching sessions", file=sys.stderr)
+            return 1
 
-    if args.list:
+        if args.list:
+            for row in sessions:
+                formats = reasoning_formats(session_turns(conn, row["id"]))
+                model = _model_id(_loads(row["model"]))
+                print(
+                    f"{row['id']}  {model:<28} "
+                    f"{','.join(formats) if formats else '---':<20} {row['title'] or ''}"
+                )
+            return 0
+
+        if not args.out:
+            parser.error("--out is required (use - for stdout)")
+
+        to_stdout = args.out == "-"
+        out_dir = None if to_stdout else Path(args.out).expanduser()
+        total = {"sessions": 0, "records": 0, "encrypted": 0}
+        formats_seen: list[str] = []
         for row in sessions:
-            formats = reasoning_formats(session_turns(conn, row["id"]))
-            model = _model_id(_loads(row["model"]))
-            print(
-                f"{row['id']}  {model:<28} "
-                f"{','.join(formats) if formats else '---':<20} {row['title'] or ''}"
+            lines, report = export_session(
+                conn, row, tool_output=args.tool_output, event_msgs=not args.no_event_msg
             )
+            if not lines[1:]:
+                print(f"skip {row['id']}: no messages", file=sys.stderr)
+                continue
+            total["sessions"] += 1
+            total["records"] += report["records"]
+            total["encrypted"] += report["encrypted"]
+            for fmt in report["formats"]:
+                if fmt not in formats_seen:
+                    formats_seen.append(fmt)
+            if to_stdout:
+                for record in lines:
+                    print(json.dumps(record, ensure_ascii=False))
+                continue
+            path = output_path(out_dir, row["id"], lines[0]["timestamp"], args.layout)
+            write_rollout(path, lines)
+            print(
+                f"{path}  {report['records']} records, {report['reasoning']} reasoning "
+                f"({report['encrypted']} encrypted"
+                + (f", {','.join(report['formats'])}" if report["formats"] else "")
+                + ")"
+                + (
+                    f"  [{report['unfinished_calls']} tool calls without a result]"
+                    if report["unfinished_calls"]
+                    else ""
+                )
+            )
+        if not to_stdout:
+            print(
+                f"\n{total['sessions']} sessions, {total['records']} records, "
+                f"{total['encrypted']} encrypted reasoning items"
+            )
+            non_openai = [f for f in formats_seen if not f.startswith("openai")]
+            if non_openai:
+                print(
+                    f"note: reasoning blobs are {', '.join(non_openai)} — a faithful record, "
+                    "but not replayable against the OpenAI Responses API"
+                )
         return 0
-
-    if not args.out:
-        parser.error("--out is required (use - for stdout)")
-
-    to_stdout = args.out == "-"
-    out_dir = None if to_stdout else Path(args.out).expanduser()
-    total = {"sessions": 0, "records": 0, "encrypted": 0}
-    formats_seen: list[str] = []
-    for row in sessions:
-        lines, report = export_session(
-            conn, row, tool_output=args.tool_output, event_msgs=not args.no_event_msg
-        )
-        if not lines[1:]:
-            print(f"skip {row['id']}: no messages", file=sys.stderr)
-            continue
-        total["sessions"] += 1
-        total["records"] += report["records"]
-        total["encrypted"] += report["encrypted"]
-        for fmt in report["formats"]:
-            if fmt not in formats_seen:
-                formats_seen.append(fmt)
-        if to_stdout:
-            for record in lines:
-                print(json.dumps(record, ensure_ascii=False))
-            continue
-        path = output_path(out_dir, row["id"], lines[0]["timestamp"], args.layout)
-        write_rollout(path, lines)
-        print(
-            f"{path}  {report['records']} records, {report['reasoning']} reasoning "
-            f"({report['encrypted']} encrypted"
-            + (f", {','.join(report['formats'])}" if report["formats"] else "")
-            + ")"
-            + (
-                f"  [{report['unfinished_calls']} tool calls without a result]"
-                if report["unfinished_calls"]
-                else ""
-            )
-        )
-    if not to_stdout:
-        print(
-            f"\n{total['sessions']} sessions, {total['records']} records, "
-            f"{total['encrypted']} encrypted reasoning items"
-        )
-        non_openai = [f for f in formats_seen if not f.startswith("openai")]
-        if non_openai:
-            print(
-                f"note: reasoning blobs are {', '.join(non_openai)} — a faithful record, "
-                "but not replayable against the OpenAI Responses API"
-            )
-    return 0
+    finally:
+        conn.close()
 
 
 if __name__ == "__main__":

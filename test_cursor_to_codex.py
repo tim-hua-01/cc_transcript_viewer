@@ -140,6 +140,7 @@ class ExportTest(unittest.TestCase):
         self.db = self.root / "state.vscdb"
         self.composer_id = _write_store(self.db, _demo_messages(), composer=DEMO_COMPOSER)
         self.conn = c2c.open_db(self.db)
+        self.addCleanup(self.conn.close)
         self.composer = dict(c2c.iter_composers(self.conn))[self.composer_id]
 
     def _lines(self, **kwargs):
@@ -260,6 +261,7 @@ class ExportTest(unittest.TestCase):
         composer["modelConfig"] = {"modelName": "claude-opus-5"}
         _write_store(other, _demo_messages(), composer=composer)
         conn = c2c.open_db(other)
+        self.addCleanup(conn.close)
         self.assertEqual(
             c2c.select_sessions(conn, model_regex=c2c.DEFAULT_MODEL_REGEX, session_ids=None), []
         )

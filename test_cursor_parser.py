@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import tempfile
 import time
 import unittest
@@ -16,24 +17,7 @@ import cursor_parser as cursor
 from test_fixtures import _write_cli_store
 
 
-class CursorBlobExtractionTests(unittest.TestCase):
-    """Balanced-JSON scanning over store.db blobs."""
-
-    def test_objects_amid_binary_junk(self):
-        blob = (
-            b"\x00\x01junk"
-            + json.dumps({"role": "user", "content": 'has {braces} and "quotes\\"'}).encode()
-            + b"\xff garbage "
-            + json.dumps({"a": {"nested": [1, 2]}}).encode()
-        )
-        objs = cursor._extract_json_objects(blob)
-        self.assertEqual(len(objs), 2)
-        self.assertEqual(objs[0]["role"], "user")
-        self.assertEqual(objs[1], {"a": {"nested": [1, 2]}})
-
-    def test_unbalanced_braces_do_not_crash(self):
-        self.assertEqual(cursor._extract_json_objects(b'{"open": '), [])
-
+class CursorDiffTests(unittest.TestCase):
     def test_unified_diff_shows_only_changed_hunks(self):
         before = "\n".join(f"line {i}" for i in range(50))
         after = before.replace("line 25", "line twenty-five")
@@ -575,10 +559,26 @@ class CursorOrphanRecoveryTests(unittest.TestCase):
         self.assertFalse(any(e.get("recovered") for e in events))
         self.assertEqual(len(events), 2)
 
+
 class ExtractJsonObjectsTests(unittest.TestCase):
     """The blob scanner: real messages are valid UTF-8 JSON between stretches
     of binary framing, and must be found even when the framing contains stray
     braces and quotes that would desync a naive brace balancer."""
+
+    def test_objects_amid_binary_junk(self):
+        blob = (
+            b"\x00\x01junk"
+            + json.dumps({"role": "user", "content": 'has {braces} and "quotes\\"'}).encode()
+            + b"\xff garbage "
+            + json.dumps({"a": {"nested": [1, 2]}}).encode()
+        )
+        objs = cursor._extract_json_objects(blob)
+        self.assertEqual(len(objs), 2)
+        self.assertEqual(objs[0]["role"], "user")
+        self.assertEqual(objs[1], {"a": {"nested": [1, 2]}})
+
+    def test_unbalanced_braces_do_not_crash(self):
+        self.assertEqual(cursor._extract_json_objects(b'{"open": '), [])
 
     def test_finds_objects_between_binary_framing(self):
         message = {"role": "user", "content": "hello"}
@@ -632,6 +632,74 @@ class StoreSummaryCacheTests(unittest.TestCase):
                 self.assertGreater(again["mtime"], first["mtime"])
                 without_mtime = lambda s: {k: v for k, v in s.items() if k != "mtime"}
                 self.assertEqual(without_mtime(again), without_mtime(first))
+            finally:
+                cursor.configure(None)
+
+    def test_wal_activity_is_not_hidden_by_an_unchanged_main_file(self):
+        # Cursor runs store.db in WAL mode: a live session's writes land in
+        # store.db-wal and leave the main file's (mtime, size) untouched. The
+        # fast fingerprint must cover the WAL, or a cached summary would be
+        # served stale for the whole of an in-progress session.
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            store = _write_cli_store(tmp / "chats")
+            cursor.configure(tmp / "state.vscdb", projects_dir=tmp / "projects",
+                             chats_dir=tmp / "chats")
+            try:
+                first = cursor.cli_store_summary(store)
+                wal = store.parent / "store.db-wal"
+                wal.write_bytes(b"wal frames")
+                later = time.time() + 60
+                os.utime(wal, (later, later))
+                again = cursor.cli_store_summary(store)
+                # A store.db-only fast fingerprint would return `first`
+                # unchanged; the recency following the WAL proves the fast
+                # level saw it and revalidated.
+                self.assertGreater(again["mtime"], first["mtime"])
+            finally:
+                cursor.configure(None)
+
+    def test_sidecar_meta_edit_invalidates_the_cached_summary(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            store = _write_cli_store(tmp / "chats")
+            cursor.configure(tmp / "state.vscdb", projects_dir=tmp / "projects",
+                             chats_dir=tmp / "chats")
+            try:
+                first = cursor.cli_store_summary(store)
+                self.assertEqual(first["cwd"], "/Users/test/demo")
+                meta_path = store.parent / "meta.json"
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                meta["cwd"] = "/Users/test/elsewhere"
+                meta_path.write_text(json.dumps(meta), encoding="utf-8")
+                again = cursor.cli_store_summary(store)
+                self.assertEqual(again["cwd"], "/Users/test/elsewhere")
+            finally:
+                cursor.configure(None)
+
+    def test_new_blob_content_forces_a_recompute(self):
+        # Guards against the content fingerprint going stale or frozen: an
+        # actual new message must always reach the full scan.
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            store = _write_cli_store(tmp / "chats")
+            cursor.configure(tmp / "state.vscdb", projects_dir=tmp / "projects",
+                             chats_dir=tmp / "chats")
+            try:
+                first = cursor.cli_store_summary(store)
+                conn = sqlite3.connect(store)
+                with conn:
+                    conn.execute(
+                        "INSERT INTO blobs(id, data) VALUES (?, ?)",
+                        ("9" * 64, json.dumps({
+                            "role": "user",
+                            "content": [{"type": "text",
+                                         "text": "<user_query>\nsecond prompt\n</user_query>"}],
+                        }).encode("utf-8")),
+                    )
+                conn.close()
+                again = cursor.cli_store_summary(store)
+                self.assertEqual(again["n_user"], first["n_user"] + 1)
             finally:
                 cursor.configure(None)
 

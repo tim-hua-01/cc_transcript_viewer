@@ -1196,11 +1196,11 @@ def _extract_json_objects(data: bytes) -> list:
 def _iter_store_role_messages(conn: sqlite3.Connection):
     """Yield role messages in blob rowid order, deduped by content fingerprint."""
     try:
-        rows = conn.execute("SELECT rowid, data FROM blobs ORDER BY rowid")
+        rows = conn.execute("SELECT data FROM blobs ORDER BY rowid")
     except sqlite3.Error:
         return
     seen: set[str] = set()
-    for rowid, data in rows:
+    for (data,) in rows:
         if not isinstance(data, (bytes, bytearray)):
             if isinstance(data, str):
                 data = data.encode("utf-8", errors="ignore")
@@ -1334,9 +1334,41 @@ def _store_title(title: str, first_user: str, subagent_fields: dict) -> str:
     return title
 
 
+def _store_fast_fingerprint(path: Path) -> list | None:
+    """Stat-only change fingerprint for a store.db, WAL and sidecar included.
+
+    Cursor runs these stores in WAL mode: a live session's writes land in
+    ``store.db-wal`` and leave the main file's (mtime, size) untouched until a
+    checkpoint, and the title/cwd live in a sidecar ``meta.json``. Keying on
+    the main file alone would serve a stale summary for the whole of an
+    in-progress session (the same trap ``opencode_parser._db_identity``
+    documents). None when the store itself is unstatable.
+    """
+    ident = common.file_identity(path)
+    if ident is None:
+        return None
+    return [
+        list(ident),
+        list(common.file_identity(path.parent / "store.db-wal") or ()) or None,
+        list(common.file_identity(path.parent / "meta.json") or ()) or None,
+    ]
+
+
+def _cached_level_matches(entry, level: int, value) -> bool:
+    """True when a peeked cache entry's two-level ``[fast, content]``
+    fingerprint matches ``value`` at the given level."""
+    return bool(
+        entry
+        and isinstance(entry[0], list)
+        and len(entry[0]) == 2
+        and entry[0][level] == value
+    )
+
+
 def _store_content_fingerprint(conn: sqlite3.Connection, path: Path) -> list:
     """Cheap content identity for one store.db: blob count, last rowid, total
-    payload bytes, the raw meta row, and the sidecar meta.json identity.
+    and largest payload bytes, the raw meta row, and the sidecar meta.json
+    identity.
 
     Costs a few milliseconds, versus ~1.5s for the full blob scan a summary
     needs — so a store whose mtime was touched without a real change (another
@@ -1344,11 +1376,12 @@ def _store_content_fingerprint(conn: sqlite3.Connection, path: Path) -> list:
     cheaply instead of forcing the scan.
     """
     try:
-        n, last, total = conn.execute(
-            "SELECT count(*), coalesce(max(rowid), 0), coalesce(sum(length(data)), 0) FROM blobs"
+        n, last, total, largest = conn.execute(
+            "SELECT count(*), coalesce(max(rowid), 0), coalesce(sum(length(data)), 0),"
+            " coalesce(max(length(data)), 0) FROM blobs"
         ).fetchone()
     except sqlite3.Error:
-        n = last = total = -1
+        n = last = total = largest = -1
     try:
         row = conn.execute("SELECT value FROM meta WHERE key='0'").fetchone()
         meta_raw = row[0] if row else b""
@@ -1357,10 +1390,10 @@ def _store_content_fingerprint(conn: sqlite3.Connection, path: Path) -> list:
     except sqlite3.Error:
         meta_raw = ""
     sidecar = common.file_identity(path.parent / "meta.json")
-    return [n, last, total, str(meta_raw), list(sidecar) if sidecar else None]
+    return [n, last, total, largest, str(meta_raw), list(sidecar) if sidecar else None]
 
 
-def _cli_store_summary_uncached(conn: sqlite3.Connection, path: Path) -> dict | None:
+def _cli_store_summary_uncached(conn: sqlite3.Connection, path: Path) -> dict:
     header = _store_header(conn, path)
     meta, side = header["meta"], header["side"]
     subagent_fields = header["subagent_fields"]
@@ -1387,8 +1420,6 @@ def _cli_store_summary_uncached(conn: sqlite3.Connection, path: Path) -> dict | 
                 for b in content:
                     if isinstance(b, dict) and b.get("type") == "tool-call":
                         n_tool += 1
-        elif role == "tool":
-            pass
 
     summary = common.make_summary(
         agent="cursor",
@@ -1413,26 +1444,25 @@ def _cli_store_summary_uncached(conn: sqlite3.Connection, path: Path) -> dict | 
 def cli_store_summary(path: Path) -> dict | None:
     """Lightweight metadata for one CLI store.db.
 
-    Two-level cache: the fast fingerprint is the store file's (mtime, size);
-    when that misses, a cheap in-database content fingerprint is compared
-    before paying for the full blob scan. Fingerprints are stored as
-    ``[fast, content]`` so either level can validate an entry.
+    Two-level cache: the fast fingerprint is stat-only (store.db, its WAL,
+    and the meta.json sidecar); when that misses, a cheap in-database content
+    fingerprint is compared before paying for the full blob scan. Fingerprints
+    are stored as ``[fast, content]`` so either level can validate an entry.
     """
     key = str(path)
-    ident = common.file_identity(path)
-    if ident is None:
+    fast = _store_fast_fingerprint(path)
+    if fast is None:
         return None
-    fast = list(ident)
     entry = SUMMARY_CACHE.peek(key)
-    if entry and isinstance(entry[0], list) and len(entry[0]) == 2 and entry[0][0] == fast:
-        return entry[1]
+    if _cached_level_matches(entry, 0, fast):
+        return dict(entry[1])
 
     conn = _open_store(path)
     if conn is None:
         return None
     try:
         content = _store_content_fingerprint(conn, path)
-        if entry and isinstance(entry[0], list) and len(entry[0]) == 2 and entry[0][1] == content:
+        if _cached_level_matches(entry, 1, content):
             # Only the mtime moved; the store's content is unchanged. Reuse the
             # summary, but refresh its recency from the file (a full recompute
             # would have picked the new mtime up, and the sidebar sorts by it)
@@ -1442,8 +1472,7 @@ def cli_store_summary(path: Path) -> dict | None:
             SUMMARY_CACHE.put(key, [fast, content], summary)
             return summary
         summary = _cli_store_summary_uncached(conn, path)
-        if summary is not None:
-            SUMMARY_CACHE.put(key, [fast, content], summary)
+        SUMMARY_CACHE.put(key, [fast, content], summary)
         return summary
     finally:
         conn.close()

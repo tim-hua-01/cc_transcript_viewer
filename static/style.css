@@ -371,8 +371,6 @@ body.standalone.sidebar-collapsed .edge-toggle-left { display: none; }
   transition: border-color var(--ease), box-shadow var(--ease);
 }
 #search:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--focus-ring); }
-#sidebar-stats { margin-top: 8px; font-size: 11px; }
-
 #filter-row { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
 .filter-chip {
   font-size: 11px; padding: 3px 10px; border-radius: 999px;
@@ -383,7 +381,7 @@ body.standalone.sidebar-collapsed .edge-toggle-left { display: none; }
 .filter-chip:hover { color: var(--text); }
 .filter-chip.on { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
 
-#filter-dropdowns { display: flex; gap: 6px; margin-top: 8px; }
+#filter-dropdowns { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
 .dropdown { position: relative; }
 .dropdown-btn {
   font-size: 11px; padding: 4px 10px; border-radius: 7px;
@@ -400,8 +398,8 @@ body.standalone.sidebar-collapsed .edge-toggle-left { display: none; }
   box-shadow: 0 6px 24px var(--shadow-color); padding: 6px;
 }
 .dropdown-panel.hidden { display: none; }
-/* Right-anchor a panel whose button sits near the sidebar's edge, so it
-   opens inward instead of spilling over the transcript pane. */
+/* Right-anchor a panel whose button sits near the sidebar's edge: the
+   sidebar clips overflow, so a left-anchored panel there would be cut off. */
 .dropdown-panel.anchor-right { left: auto; right: 0; }
 .dd-group, .dd-item {
   display: flex; align-items: center; gap: 7px;

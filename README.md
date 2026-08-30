@@ -68,7 +68,9 @@ accumulated.
 ## Features
 
 - **One sidebar, sorted by time.** Every Claude Code, Codex, Cursor, and opencode session in a single
-  flat list, newest (most recently modified) first — no per-project grouping. Each entry shows an
+  flat list, newest first — no per-project grouping. Sessions sort by their last recorded
+  message, not file modification time, so a tool quietly rewriting an old transcript's bookkeeping
+  (as Claude Code does) can't shuffle it to the top. Each entry shows an
   **agent tag** (Claude / Codex / Cursor / opencode), a **CLI** badge for Cursor command-line agent
   transcripts, the project
   path, recency, message/tool/web counts, model, and the full session **id** (click to copy).
@@ -85,11 +87,14 @@ accumulated.
   and ordinary transcript-content matches receive `1×`. Powered by `/api/search` with an
   mtime-keyed cache.
 - **Filters that compose.**
-  - **All / Claude / Codex / Cursor / opencode** chips.
+  - **All / Claude / Codex / Cursor / opencode** chips, each showing a live session count under the
+    current search and filters; chips whose count is zero hide themselves.
   - A **Model** dropdown grouped by family (Claude / GPT / Other): tick a family to select all its
     models, or pick individual ones (e.g. only Sonnet). The family box shows an indeterminate state
     on partial selection.
   - A **Directory** dropdown to narrow to specific project paths.
+  - A **Date** dropdown with from/to calendar fields and quick presets (today, last 7/30 days),
+    filtering on each session's last activity.
 - **Transcript view** — a chronological, color-coded conversation that renders all four agents'
   formats:
   - User prompts and assistant replies as Markdown, **with LaTeX math** (KaTeX) and inline images.

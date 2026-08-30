@@ -16,6 +16,7 @@ import json
 import mimetypes
 import re
 import sqlite3
+from collections import Counter
 from pathlib import Path
 from urllib.parse import quote
 
@@ -339,13 +340,27 @@ def _base_instructions_text(value) -> str:
 
 
 def _item_text(item: dict) -> str:
-    """Text of a Codex ≥0.147 ``item_completed`` message item, whose content
-    blocks are ``{"type": "text"|"Text", "text": …}``."""
+    """Concatenated text of a Codex ≥0.147 ``item_completed`` message item.
+
+    Takes the ``text`` string of every content block that has one (observed
+    block type tags vary: ``text``/``Text``); blocks without text are ignored.
+    """
     return "\n".join(
         block["text"]
         for block in item.get("content") or []
         if isinstance(block, dict) and isinstance(block.get("text"), str) and block["text"]
     )
+
+
+def _item_text_elements(item: dict) -> list:
+    """Flattened ``text_elements`` of an ``item_completed`` message's content
+    blocks — the envelope keeps them per block, the mirror kept one list."""
+    return [
+        element
+        for block in item.get("content") or []
+        if isinstance(block, dict)
+        for element in block.get("text_elements") or []
+    ]
 
 
 def _completed_message_item(rec: dict) -> tuple[str, dict] | None:
@@ -363,6 +378,57 @@ def _completed_message_item(rec: dict) -> tuple[str, dict] | None:
     if itype in ("UserMessage", "AgentMessage"):
         return itype, item
     return None
+
+
+def _mirror_message_counts(records: list[dict]) -> tuple[Counter, Counter]:
+    """Multisets of normalized (user, agent) message texts that appear as
+    pre-0.147 ``event_msg`` mirrors.
+
+    A rollout can carry a message both ways — as a mirror and inside an
+    ``item_completed`` envelope (a session resumed across the 0.147 upgrade
+    mixes eras within one file). The parse loop and the summary counter charge
+    each envelope message against these multisets first, so a message renders
+    and counts exactly once regardless of which formats the file contains.
+    """
+    users: Counter = Counter()
+    agents: Counter = Counter()
+    for rec in records:
+        if rec.get("type") != "event_msg":
+            continue
+        payload = rec.get("payload") or {}
+        pt = payload.get("type")
+        if pt == "user_message":
+            users[" ".join(str(payload.get("message") or "").split())] += 1
+        elif pt == "agent_message":
+            agents[" ".join(str(payload.get("message") or "").split())] += 1
+    return users, agents
+
+
+# event_msg subtypes the transcript deliberately does not render: transient
+# streaming deltas and begin/progress halves whose finished counterpart is
+# rendered from another record, plus bookkeeping with no conversational
+# content. Anything NOT listed here (and not handled in the parse loop) is
+# surfaced as a raw card — 0.147's item_completed messages went unnoticed for
+# days precisely because unknown event_msg records used to vanish silently.
+_IGNORED_EVENT_MSG_TYPES = frozenset({
+    "agent_message_delta",
+    "agent_reasoning_delta",
+    "agent_reasoning_raw_content",
+    "agent_reasoning_raw_content_delta",
+    "agent_reasoning_section_break",
+    "context_compacted",       # rendered from the top-level `compacted` record
+    "exec_command_begin",
+    "exec_command_end",        # rendered from response_item function calls
+    "exec_command_output_delta",
+    "mcp_tool_call_begin",
+    "mcp_tool_call_end",       # rendered from response_item tool calls
+    "patch_apply_begin",
+    "patch_apply_end",         # consumed by the prescan into patch results
+    "session_configured",
+    "thread_rolled_back",
+    "thread_settings_applied",
+    "turn_diff",
+})
 
 
 def _first_user_message(records: list[dict]) -> str:
@@ -554,6 +620,12 @@ def _read_thread_rows() -> dict[str, dict]:
     return rows
 
 
+# Bump when the summary computation changes, so cached summaries for
+# unchanged files are recomputed once (e.g. v2 taught the message counters
+# the ≥0.147 item_completed envelope).
+_SUMMARY_VERSION = 2
+
+
 def session_summary(path: Path, thread_row: dict | None = None) -> dict:
     """Lightweight metadata for a Codex session, cached by file identity plus a
     fingerprint of the SQLite thread row (which can change without the JSONL)."""
@@ -561,7 +633,7 @@ def session_summary(path: Path, thread_row: dict | None = None) -> dict:
     return common.cached_summary(
         SUMMARY_CACHE,
         str(path),
-        identity + (_thread_signature(thread_row),),
+        identity + (_thread_signature(thread_row), _SUMMARY_VERSION),
         lambda: _session_summary_uncached(path, thread_row),
     )
 
@@ -573,6 +645,7 @@ def _session_summary_uncached(path: Path, thread_row: dict | None = None) -> dic
     last_ts = None
     n_user = n_assistant = n_tool = n_reasoning = n_web = 0
     model = ""
+    mirror_users, mirror_agents = _mirror_message_counts(records)
 
     for rec in records:
         ts = rec.get("timestamp")
@@ -591,6 +664,20 @@ def _session_summary_uncached(path: Path, thread_row: dict | None = None) -> dic
                 n_user += 1
             elif pt == "agent_message":
                 n_assistant += 1
+            elif pt == "item_completed":
+                completed = _completed_message_item(rec)
+                if completed is not None:
+                    itype, item = completed
+                    key = " ".join(_item_text(item).split())
+                    if itype == "UserMessage":
+                        if mirror_users.get(key):
+                            mirror_users[key] -= 1
+                        else:
+                            n_user += 1
+                    elif mirror_agents.get(key):
+                        mirror_agents[key] -= 1
+                    else:
+                        n_assistant += 1
             elif pt == "agent_reasoning":
                 n_reasoning += 1
             elif pt == "web_search_end":
@@ -928,13 +1015,6 @@ def parse_session(path: Path) -> dict:
             msg = payload.get("message")
             if msg:
                 user_event_texts.add(" ".join(str(msg).split()))
-        elif (completed := _completed_message_item(rec)) and completed[0] == "UserMessage":
-            # Codex ≥0.147 user prompts, so their response_item copies are
-            # recognized as repeats below. Deliberately narrow: other event_msg
-            # subtypes must fall through to the branches underneath.
-            text = _item_text(completed[1])
-            if text:
-                user_event_texts.add(" ".join(text.split()))
         elif rec.get("type") == "turn_context":
             turn_id = payload.get("turn_id")
             if turn_id:
@@ -998,6 +1078,15 @@ def parse_session(path: Path) -> dict:
             call_id = payload.get("call_id")
             if call_id:
                 web_searches[call_id] = payload
+        elif (completed := _completed_message_item(rec)) and completed[0] == "UserMessage":
+            # Codex ≥0.147 user prompts, registered so their response_item
+            # copies are recognized as repeats below. Last in the chain on
+            # purpose: it is the only branch here that isn't a plain
+            # record-type test, and placing it after every typed branch means
+            # no future record type can be shadowed by it.
+            text = _item_text(completed[1])
+            if text:
+                user_event_texts.add(" ".join(text.split()))
 
     row = _read_thread_rows().get(str(path))
     if row:
@@ -1038,6 +1127,67 @@ def parse_session(path: Path) -> dict:
                     "text": text,
                     "has_encrypted": has_encrypted,
                 },
+            )
+        )
+
+    # Envelope messages already emitted as pre-0.147 mirrors: charge each
+    # item_completed message against these and skip the ones that match.
+    envelope_dup_users, envelope_dup_agents = _mirror_message_counts(records)
+
+    def append_user_message(ts, text, *, local_paths=(), embedded=(), text_elements=()):
+        """One user turn (or guardian request), with image recovery — the one
+        emit path for both the pre-0.147 mirror and the ≥0.147 envelope."""
+        request = _guardian_request(text) if is_guardian else None
+        if request is not None:
+            events.append(
+                _event_payload(
+                    "guardian_request",
+                    ts,
+                    {"request": request, "context": text},
+                )
+            )
+            return
+        key = " ".join(text.split())
+        fallback_groups = user_image_fallbacks.get(key) or []
+        fallback_images = fallback_groups.pop(0) if fallback_groups else []
+        images = []
+        unavailable_paths = []
+        if local_paths:
+            for i, local_path in enumerate(local_paths):
+                local = _local_image_payload(local_path)
+                if local:
+                    images.append(local)
+                elif i < len(fallback_images):
+                    images.append(fallback_images[i])
+                else:
+                    unavailable_paths.append(local_path)
+            images.extend(fallback_images[len(local_paths):])
+        else:
+            images = _safe_images(list(embedded)) or fallback_images
+        events.append(
+            _event_payload(
+                "user",
+                ts,
+                {
+                    "text": text,
+                    "images": images,
+                    "local_images": unavailable_paths,
+                    "text_elements": list(text_elements),
+                },
+            )
+        )
+
+    def append_agent_message(ts, text, *, phase=None, memory_citation=None):
+        """One assistant turn (or guardian decision) — shared like above."""
+        decision = _guardian_decision(text) if is_guardian else None
+        if decision is not None:
+            events.append(_event_payload("guardian_decision", ts, decision))
+            return
+        events.append(
+            _event_payload(
+                "assistant",
+                ts,
+                {"text": text, "phase": phase, "memory_citation": memory_citation},
             )
         )
 
@@ -1126,105 +1276,42 @@ def parse_session(path: Path) -> dict:
         if typ == "event_msg":
             pt = payload.get("type")
             if pt == "user_message":
-                text = payload.get("message") or ""
-                request = _guardian_request(text) if is_guardian else None
-                if request is not None:
-                    events.append(
-                        _event_payload(
-                            "guardian_request",
-                            ts,
-                            {"request": request, "context": text},
-                        )
-                    )
-                else:
-                    key = " ".join(text.split())
-                    fallback_groups = user_image_fallbacks.get(key) or []
-                    fallback_images = fallback_groups.pop(0) if fallback_groups else []
-                    local_paths = payload.get("local_images") or []
-                    images = []
-                    unavailable_paths = []
-                    if local_paths:
-                        for i, local_path in enumerate(local_paths):
-                            local = _local_image_payload(local_path)
-                            if local:
-                                images.append(local)
-                            elif i < len(fallback_images):
-                                images.append(fallback_images[i])
-                            else:
-                                unavailable_paths.append(local_path)
-                        images.extend(fallback_images[len(local_paths):])
-                    else:
-                        images = _safe_images(payload.get("images") or []) or fallback_images
-                    events.append(
-                        _event_payload(
-                            "user",
-                            ts,
-                            {
-                                "text": text,
-                                "images": images,
-                                "local_images": unavailable_paths,
-                                "text_elements": payload.get("text_elements") or [],
-                            },
-                        )
-                    )
+                append_user_message(
+                    ts,
+                    payload.get("message") or "",
+                    local_paths=payload.get("local_images") or [],
+                    embedded=payload.get("images") or [],
+                    text_elements=payload.get("text_elements") or [],
+                )
             elif pt == "item_completed":
                 # Codex ≥0.147: user/agent messages only exist inside this
                 # envelope. Reasoning and tool items also ride in it but still
                 # arrive as response_items too, so only the messages are taken
-                # here — anything else would double-render.
+                # here — anything else would double-render. A message that was
+                # already written as a mirror (hybrid file) is skipped.
                 completed = _completed_message_item(rec)
                 if completed is not None:
                     itype, item = completed
                     text = _item_text(item)
+                    key = " ".join(text.split())
                     if itype == "UserMessage":
-                        request = _guardian_request(text) if is_guardian else None
-                        if request is not None:
-                            events.append(
-                                _event_payload(
-                                    "guardian_request",
-                                    ts,
-                                    {"request": request, "context": text},
-                                )
-                            )
+                        if envelope_dup_users.get(key):
+                            envelope_dup_users[key] -= 1
                         elif text.strip():
-                            events.append(
-                                _event_payload(
-                                    "user",
-                                    ts,
-                                    {"text": text, "images": [], "local_images": [],
-                                     "text_elements": []},
-                                )
+                            append_user_message(
+                                ts, text, text_elements=_item_text_elements(item)
                             )
-                    else:
-                        decision = _guardian_decision(text) if is_guardian else None
-                        if decision is not None:
-                            events.append(_event_payload("guardian_decision", ts, decision))
-                        elif text.strip():
-                            events.append(
-                                _event_payload(
-                                    "assistant",
-                                    ts,
-                                    {"text": text, "phase": item.get("phase"),
-                                     "memory_citation": item.get("memory_citation")},
-                                )
-                            )
+                    elif envelope_dup_agents.get(key):
+                        envelope_dup_agents[key] -= 1
+                    elif text.strip():
+                        append_agent_message(ts, text, phase=item.get("phase"))
             elif pt == "agent_message":
-                text = payload.get("message") or ""
-                decision = _guardian_decision(text) if is_guardian else None
-                if decision is not None:
-                    events.append(_event_payload("guardian_decision", ts, decision))
-                else:
-                    events.append(
-                        _event_payload(
-                            "assistant",
-                            ts,
-                            {
-                                "text": text,
-                                "phase": payload.get("phase"),
-                                "memory_citation": payload.get("memory_citation"),
-                            },
-                        )
-                    )
+                append_agent_message(
+                    ts,
+                    payload.get("message") or "",
+                    phase=payload.get("phase"),
+                    memory_citation=payload.get("memory_citation"),
+                )
             elif pt == "agent_reasoning":
                 if record_index not in mirrored_reasoning_records:
                     append_reasoning(ts, payload.get("text") or "", False)
@@ -1293,6 +1380,17 @@ def parse_session(path: Path) -> dict:
                             "query": payload.get("query"),
                             "action": payload.get("action"),
                         },
+                    )
+                )
+            elif pt not in _IGNORED_EVENT_MSG_TYPES:
+                # An event_msg subtype this parser has never seen. Surface it
+                # rather than dropping it, so the next format drift is visible
+                # in the transcript instead of silently losing records.
+                events.append(
+                    _event_payload(
+                        "raw",
+                        ts,
+                        {"record_type": f"event_msg/{pt}", "payload": payload},
                     )
                 )
             continue

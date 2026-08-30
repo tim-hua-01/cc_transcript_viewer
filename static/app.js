@@ -376,7 +376,7 @@ function sessionMtime(file) {
   return s ? (s.mtime || 0) : 0;
 }
 
-// ---------- dropdown filters (model / directory) ----------
+// ---------- dropdown filters (model / directory / date) ----------
 function modelFamily(m) {
   // Match on the bare model id so provider-qualified opencode models
   // ("openrouter/anthropic/claude-opus-4") land in the same family as bare ones.
@@ -386,15 +386,30 @@ function modelFamily(m) {
   return "Other";
 }
 
+// Shared shell of every filter dropdown: labelled button, count span, panel,
+// and the open-one-close-the-rest wiring.
+function dropdownShell(title, panelClass = "dropdown-panel hidden") {
+  const wrap = el("div", { class: "dropdown" });
+  const count = el("span", { class: "dropdown-count" });
+  const btn = el("button", { class: "dropdown-btn" }, title, count, el("span", { class: "chev" }, "▾"));
+  const panel = el("div", { class: panelClass });
+  btn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    const open = !panel.classList.contains("hidden");
+    $$(".dropdown-panel").forEach((p) => p.classList.add("hidden"));
+    panel.classList.toggle("hidden", open);
+  });
+  panel.addEventListener("click", (e) => e.stopPropagation());
+  wrap.append(btn, panel);
+  return { wrap, count, panel };
+}
+
 // Generic multi-select dropdown.
 //   groups: [{ label, items: [{value, label}] }]  (no group header if label is "")
 //   selected: a Set the dropdown reads from and writes to
 //   onChange: called after any change
 function makeDropdown(title, groups, selected, onChange) {
-  const wrap = el("div", { class: "dropdown" });
-  const count = el("span", { class: "dropdown-count" });
-  const btn = el("button", { class: "dropdown-btn" }, title, count, el("span", { class: "chev" }, "▾"));
-  const panel = el("div", { class: "dropdown-panel hidden" });
+  const { wrap, count, panel } = dropdownShell(title);
 
   const updateCount = () => { count.textContent = selected.size ? ` (${selected.size})` : ""; };
 
@@ -444,16 +459,7 @@ function makeDropdown(title, groups, selected, onChange) {
   });
   panel.append(clear);
 
-  btn.addEventListener("click", (e) => {
-    e.stopPropagation();
-    const open = !panel.classList.contains("hidden");
-    $$(".dropdown-panel").forEach((p) => p.classList.add("hidden"));
-    panel.classList.toggle("hidden", open);
-  });
-  panel.addEventListener("click", (e) => e.stopPropagation());
-
   updateCount();
-  wrap.append(btn, panel);
   return wrap;
 }
 
@@ -470,10 +476,7 @@ function dayAgo(back) {
 }
 
 function makeDateDropdown(onChange) {
-  const wrap = el("div", { class: "dropdown" });
-  const count = el("span", { class: "dropdown-count" });
-  const btn = el("button", { class: "dropdown-btn" }, "Date", count, el("span", { class: "chev" }, "▾"));
-  const panel = el("div", { class: "dropdown-panel anchor-right hidden" });
+  const { wrap, count, panel } = dropdownShell("Date", "dropdown-panel anchor-right hidden");
 
   const fromInput = el("input", { type: "date" });
   const toInput = el("input", { type: "date" });
@@ -524,20 +527,22 @@ function makeDateDropdown(onChange) {
   });
   panel.append(clear);
 
-  btn.addEventListener("click", (e) => {
-    e.stopPropagation();
-    const open = !panel.classList.contains("hidden");
-    $$(".dropdown-panel").forEach((p) => p.classList.add("hidden"));
-    panel.classList.toggle("hidden", open);
-  });
-  panel.addEventListener("click", (e) => e.stopPropagation());
-
   updateCount();
-  wrap.append(btn, panel);
   return wrap;
 }
 
+// The dropdowns' option sets. Rebuilding the dropdowns closes any open panel,
+// so the live poller only rebuilds when an option actually appeared or
+// vanished — not on every session-list change.
+let FILTER_OPTIONS_SIG = "";
+function filterOptionsSignature() {
+  const models = [...new Set(SESSIONS.map((s) => s.model).filter(Boolean))].sort();
+  const dirs = [...new Set(SESSIONS.map((s) => s.cwd).filter(Boolean))].sort();
+  return JSON.stringify([models, dirs]);
+}
+
 function buildFilters() {
+  FILTER_OPTIONS_SIG = filterOptionsSignature();
   const host = $("#filter-dropdowns");
   host.innerHTML = "";
 
@@ -578,7 +583,7 @@ function renderSidebar(query) {
 
   // Every filter except the agent chips, which are handled by the caller —
   // the chips display counts of what selecting them would show.
-  const matchesFilters = (s, q) => {
+  const matchesFilters = (s) => {
     if (SELECTED_MODELS.size && !SELECTED_MODELS.has(s.model || "")) return false;
     if (SELECTED_DIRS.size && !SELECTED_DIRS.has(s.cwd || "")) return false;
     if (DATE_FILTER.from || DATE_FILTER.to) {
@@ -596,7 +601,7 @@ function renderSidebar(query) {
     return metaHit || contentHit;
   };
   const matches = SESSIONS.filter(
-    (s) => (AGENT_FILTER === "all" || s.agent === AGENT_FILTER) && matchesFilters(s, q)
+    (s) => (AGENT_FILTER === "all" || s.agent === AGENT_FILTER) && matchesFilters(s)
   );
 
   // With an active query, order by relevance score; otherwise keep the
@@ -609,10 +614,11 @@ function renderSidebar(query) {
     matches.sort((a, b) => (scoreOf(b) - scoreOf(a)) || ((b.mtime || 0) - (a.mtime || 0)));
   }
 
-  // Per-agent counts ride on the filter chips (counted against every filter
-  // except the agent chip itself, so a chip shows what clicking it would
-  // display). The chips make a separate totals line redundant.
-  const chipEligible = SESSIONS.filter((s) => matchesFilters(s, q));
+  // Per-agent counts ride on the filter chips, counted against every filter
+  // except the agent chip itself (collapsed sub-agent groups still count —
+  // collapsing hides rows, it doesn't exclude sessions). The chips make a
+  // separate totals line redundant.
+  const chipEligible = SESSIONS.filter(matchesFilters);
   for (const chip of $$("#filter-row .filter-chip")) {
     const a = chip.dataset.agent;
     const n = a === "all" ? chipEligible.length : chipEligible.filter((s) => s.agent === a).length;
@@ -713,7 +719,11 @@ function renderSidebar(query) {
   }
 
   if (!list.children.length) {
-    const message = q
+    // "No transcripts found" is only true when nothing is filtered out —
+    // an active chip/model/directory/date filter empties the list too.
+    const filtered = AGENT_FILTER !== "all" || SELECTED_MODELS.size ||
+      SELECTED_DIRS.size || DATE_FILTER.from || DATE_FILTER.to;
+    const message = q || filtered
       ? "No matching sessions."
       : SESSIONS_LOADED
         ? "No transcripts found."
@@ -750,7 +760,10 @@ function appendCopyEvent(lines, ev, branchLabel = "") {
   if (!COPY_ALLOWED_KINDS.has(ev.kind)) return;
 
   const labels = { user: "User", assistant: "Assistant", reasoning: "Reasoning", tool: "Tool" };
-  const details = [ev.model, ev.phase, ev.status, branchLabel].filter(Boolean);
+  // Same rule as the turn headers: "<synthetic>" is Claude Code's placeholder
+  // on machine-written records, not a model worth naming in copied text.
+  const details = [ev.model !== "<synthetic>" && ev.model, ev.phase, ev.status, branchLabel]
+    .filter(Boolean);
   lines.push("## " + (labels[ev.kind] || ev.kind || "Event") + (details.length ? " · " + details.join(" · ") : ""));
 
   if (Array.isArray(ev.blocks)) {
@@ -2268,6 +2281,9 @@ async function pollSidebar() {
     if (sig !== LAST_SIG) {
       LAST_SIG = sig;
       SESSIONS = next;
+      // A session in a new project or on a new model must show up in the
+      // Model/Directory dropdowns without a page reload.
+      if (filterOptionsSignature() !== FILTER_OPTIONS_SIG) buildFilters();
       await refreshSidebar();
     }
     // Synthetic Cursor sessions have no standalone file to stat, so retain

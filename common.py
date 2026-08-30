@@ -215,23 +215,34 @@ class SummaryCache:
         self._generation = 0
 
     def get(self, key: str, fingerprint) -> dict | None:
+        """A copy of the cached summary when the fingerprint matches, else None.
+
+        A copy, not the cached dict itself: callers decorate summaries in
+        place (sub-agent linkage, custom names), and handing out the cache's
+        own dict would let those per-request decorations leak into the cache
+        and its on-disk persistence.
+        """
         fp = list(fingerprint)
         with self._lock:
             entry = self._data.get(key)
             if entry and entry[0] == fp:
-                return entry[1]
+                return dict(entry[1])
         return None
 
     def peek(self, key: str):
         """(fingerprint, summary) for a key regardless of fingerprint match,
         or None. For callers with their own staleness logic (e.g. a cheap
-        second-level content check when the fast fingerprint misses)."""
+        second-level content check when the fast fingerprint misses).
+
+        Unlike get(), this hands back the cache's own summary dict — copy it
+        before mutating or returning it to anyone who might."""
         with self._lock:
             return self._data.get(key)
 
     def put(self, key: str, fingerprint, summary: dict) -> None:
         with self._lock:
-            self._data[key] = (list(fingerprint), summary)
+            # Store a copy for the same isolation reason get() returns one.
+            self._data[key] = (list(fingerprint), dict(summary))
             self._dirty = True
             self._generation += 1
 

@@ -161,58 +161,109 @@ class CodexExecUnwrapTests(unittest.TestCase):
         )
         self.assertEqual(codex._patch_files(patch), ["a.py", "b.py"])
 
+
 class ItemCompletedFormatTests(unittest.TestCase):
     """Codex >=0.147 stopped writing user_message/agent_message event mirrors;
     user and agent messages only exist inside event_msg/item_completed
-    envelopes. The parser must surface them (and only them — reasoning and
-    tool items in the same envelope still arrive as response_items)."""
+    envelopes. The parser must surface each exactly once, with image recovery,
+    and only the messages — reasoning and tool items in the same envelope
+    still arrive as response_items."""
 
-    def _write_rollout(self, tmp: Path) -> Path:
-        day = tmp / "sessions" / "2026" / "08" / "29"
-        day.mkdir(parents=True)
-        f = day / "rollout-2026-08-29T10-00-00-0197a2e5-b222-7ab0-8888-000000000147.jsonl"
-        ts = "2026-08-29T10:00:00.000Z"
-        recs = [
-            {"timestamp": ts, "type": "session_meta",
-             "payload": {"id": "0197a2e5-b222-7ab0-8888-000000000147", "cwd": "/tmp/proj",
-                         "cli_version": "0.147.0"}},
-            {"timestamp": ts, "type": "event_msg",
-             "payload": {"type": "item_completed", "item": {
-                 "type": "UserMessage", "id": "u1",
-                 "content": [{"type": "text", "text": "hello new format"}]}}},
-            {"timestamp": ts, "type": "response_item",
-             "payload": {"type": "message", "role": "user", "id": "m1",
-                         "content": [{"type": "input_text", "text": "hello new format"}]}},
-            {"timestamp": ts, "type": "event_msg",
-             "payload": {"type": "item_completed", "item": {
-                 "type": "Reasoning", "id": "r1", "summary_text": ["thinking..."]}}},
-            {"timestamp": ts, "type": "event_msg",
-             "payload": {"type": "item_completed", "item": {
-                 "type": "AgentMessage", "id": "a1", "phase": "commentary",
-                 "content": [{"type": "Text", "text": "hi from 0.147"}]}}},
-        ]
-        f.write_text("\n".join(json.dumps(r) for r in recs) + "\n", encoding="utf-8")
-        return f
+    TS = "2026-08-29T10:00:00.000Z"
 
-    def test_messages_come_from_the_item_completed_envelope(self):
+    def _rec(self, rec_type, payload):
+        return {"timestamp": self.TS, "type": rec_type, "payload": payload}
+
+    def _envelope(self, item_type, text, **item_extra):
+        item = {"type": item_type, "id": "i1",
+                "content": [{"type": "text", "text": text, "text_elements": []}]}
+        item.update(item_extra)
+        return self._rec("event_msg", {"type": "item_completed", "item": item})
+
+    def _parse_and_summary(self, records):
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)
-            path = self._write_rollout(tmp)
+            path = tmp / "rollout-2026-08-29T10-00-00-0197a2e5-b222-7ab0-8888-000000000147.jsonl"
+            _write_jsonl(path, records)
             codex.configure(tmp)
             try:
-                data = codex.parse_session(path)
+                return codex.parse_session(path), codex._session_summary_uncached(path)
             finally:
-                codex.configure(Path.home() / ".codex")
+                codex.configure(codex.DEFAULT_CODEX_HOME)
+
+    def test_messages_come_from_the_item_completed_envelope(self):
+        data, summary = self._parse_and_summary([
+            self._rec("session_meta", {"id": "x", "cwd": "/tmp/proj",
+                                       "cli_version": "0.147.0"}),
+            self._envelope("UserMessage", "hello new format"),
+            self._rec("response_item",
+                      {"type": "message", "role": "user", "id": "m1",
+                       "content": [{"type": "input_text", "text": "hello new format"}]}),
+            # The same reasoning arrives both in the envelope and as a
+            # response_item; only the response_item copy may render.
+            self._rec("event_msg", {"type": "item_completed", "item": {
+                "type": "Reasoning", "id": "r1", "summary_text": ["thinking..."]}}),
+            self._rec("response_item", {"type": "reasoning", "id": "r1",
+                                        "summary": [{"type": "summary_text",
+                                                     "text": "thinking..."}]}),
+            self._envelope("AgentMessage", "hi from 0.147", phase="commentary"),
+        ])
         kinds = [e["kind"] for e in data["events"]]
         users = [e for e in data["events"] if e["kind"] == "user"]
         assistants = [e for e in data["events"] if e["kind"] == "assistant"]
         self.assertEqual([e["text"] for e in users], ["hello new format"])
         self.assertEqual([e["text"] for e in assistants], ["hi from 0.147"])
         # The response_item copy of the prompt is a repeat, not an extra turn
-        # or an instructions block.
+        # or an instructions block; the Reasoning envelope must not render on
+        # top of the response_item reasoning.
         self.assertEqual(kinds.count("user"), 1)
+        self.assertEqual(kinds.count("reasoning"), 1)
         self.assertNotIn("instructions", kinds)
         self.assertEqual(data["title"], "hello new format")
+        # The sidebar counters must see the envelope messages too.
+        self.assertEqual(summary["n_user"], 1)
+        self.assertEqual(summary["n_assistant"], 1)
+
+    def test_envelope_prompt_recovers_images_from_its_response_item_copy(self):
+        data, _ = self._parse_and_summary([
+            self._envelope("UserMessage", "look at this"),
+            self._rec("response_item",
+                      {"type": "message", "role": "user", "id": "m1",
+                       "content": [
+                           {"type": "input_text", "text": "look at this"},
+                           {"type": "input_image",
+                            "image_url": "data:image/png;base64,iVBORw0KGgo="},
+                       ]}),
+        ])
+        users = [e for e in data["events"] if e["kind"] == "user"]
+        self.assertEqual(len(users), 1)
+        self.assertEqual(len(users[0]["images"]), 1)
+
+    def test_hybrid_mirror_plus_envelope_file_renders_each_message_once(self):
+        data, summary = self._parse_and_summary([
+            self._rec("event_msg", {"type": "user_message", "message": "hello"}),
+            self._envelope("UserMessage", "hello"),
+            self._rec("event_msg", {"type": "agent_message", "message": "hi"}),
+            self._envelope("AgentMessage", "hi"),
+            # An envelope-only message from after a mid-session CLI upgrade
+            # must still come through.
+            self._envelope("UserMessage", "post-upgrade prompt"),
+        ])
+        users = [e["text"] for e in data["events"] if e["kind"] == "user"]
+        assistants = [e["text"] for e in data["events"] if e["kind"] == "assistant"]
+        self.assertEqual(users, ["hello", "post-upgrade prompt"])
+        self.assertEqual(assistants, ["hi"])
+        self.assertEqual(summary["n_user"], 2)
+        self.assertEqual(summary["n_assistant"], 1)
+
+    def test_unknown_event_msg_subtype_surfaces_as_a_raw_card(self):
+        data, _ = self._parse_and_summary([
+            self._rec("event_msg", {"type": "brand_new_thing", "detail": 1}),
+            self._rec("event_msg", {"type": "thread_settings_applied"}),
+        ])
+        raws = [e for e in data["events"] if e["kind"] == "raw"]
+        self.assertEqual([e["record_type"] for e in raws],
+                         ["event_msg/brand_new_thing"])
 
 
 if __name__ == "__main__":
