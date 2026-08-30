@@ -473,7 +473,7 @@ function makeDateDropdown(onChange) {
   const wrap = el("div", { class: "dropdown" });
   const count = el("span", { class: "dropdown-count" });
   const btn = el("button", { class: "dropdown-btn" }, "Date", count, el("span", { class: "chev" }, "▾"));
-  const panel = el("div", { class: "dropdown-panel hidden" });
+  const panel = el("div", { class: "dropdown-panel anchor-right hidden" });
 
   const fromInput = el("input", { type: "date" });
   const toInput = el("input", { type: "date" });
@@ -609,15 +609,17 @@ function renderSidebar(query) {
     matches.sort((a, b) => (scoreOf(b) - scoreOf(a)) || ((b.mtime || 0) - (a.mtime || 0)));
   }
 
-  // The total stays on its own short line (the full breakdown used to live
-  // here and wrapped in a narrow sidebar); per-agent counts ride on the
-  // filter chips, counted against every filter except the agent chip itself.
-  $("#sidebar-stats").textContent = `${matches.length} session${matches.length === 1 ? "" : "s"}`;
+  // Per-agent counts ride on the filter chips (counted against every filter
+  // except the agent chip itself, so a chip shows what clicking it would
+  // display). The chips make a separate totals line redundant.
   const chipEligible = SESSIONS.filter((s) => matchesFilters(s, q));
   for (const chip of $$("#filter-row .filter-chip")) {
     const a = chip.dataset.agent;
     const n = a === "all" ? chipEligible.length : chipEligible.filter((s) => s.agent === a).length;
-    chip.textContent = (a === "all" ? "All" : agentLabel(a)) + " " + n;
+    chip.replaceChildren(
+      a === "all" ? "All" : agentLabel(a),
+      el("span", { class: "chip-count" }, String(n))
+    );
   }
 
   const matchedByFile = new Map(matches.map((s) => [s.file, s]));

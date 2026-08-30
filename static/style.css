@@ -377,8 +377,9 @@ body.standalone.sidebar-collapsed .edge-toggle-left { display: none; }
 .filter-chip {
   font-size: 11px; padding: 3px 10px; border-radius: 999px;
   background: var(--bg-elev); border: 1px solid var(--border);
-  color: var(--muted); cursor: pointer;
+  color: var(--muted); cursor: pointer; white-space: nowrap;
 }
+.chip-count { margin-left: 5px; opacity: .62; }
 .filter-chip:hover { color: var(--text); }
 .filter-chip.on { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
 
@@ -399,6 +400,9 @@ body.standalone.sidebar-collapsed .edge-toggle-left { display: none; }
   box-shadow: 0 6px 24px var(--shadow-color); padding: 6px;
 }
 .dropdown-panel.hidden { display: none; }
+/* Right-anchor a panel whose button sits near the sidebar's edge, so it
+   opens inward instead of spilling over the transcript pane. */
+.dropdown-panel.anchor-right { left: auto; right: 0; }
 .dd-group, .dd-item {
   display: flex; align-items: center; gap: 7px;
   padding: 4px 6px; border-radius: 6px; cursor: pointer; font-size: 12px;
