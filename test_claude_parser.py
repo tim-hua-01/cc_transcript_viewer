@@ -271,3 +271,35 @@ class QueuedPromptTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RawFallbackTests(unittest.TestCase):
+    """Unknown record types must surface as raw cards, never vanish; known
+    bookkeeping types stay silent."""
+
+    def _parse(self, records):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "session.jsonl"
+            _write_jsonl(path, records)
+            return claude.parse_session(path)
+
+    def test_unknown_record_type_surfaces_as_a_raw_card(self):
+        data = self._parse([
+            _user("u1", None, "hi", "2026-01-01T00:00:00Z"),
+            _assistant("a1", "u1", "hello", "2026-01-01T00:00:01Z"),
+            {"type": "brand-new-thing", "uuid": "x1", "parentUuid": "a1",
+             "timestamp": "2026-01-01T00:00:02Z", "detail": 42},
+        ])
+        raws = [e for e in data["events"] if e["kind"] == "raw"]
+        self.assertEqual([e["record_type"] for e in raws], ["brand-new-thing"])
+        self.assertEqual(raws[0]["payload"]["detail"], 42)
+
+    def test_known_bookkeeping_types_stay_silent(self):
+        data = self._parse([
+            _user("u1", None, "hi", "2026-01-01T00:00:00Z"),
+            {"type": "mode", "mode": "normal"},
+            {"type": "cost-state", "totalCostUSD": 1.0},
+            {"type": "queue-operation", "operation": "enqueue", "content": "x"},
+            {"type": "atis-latch", "atis": "v1.opaque"},
+        ])
+        self.assertNotIn("raw", [e["kind"] for e in data["events"]])

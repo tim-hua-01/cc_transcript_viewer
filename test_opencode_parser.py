@@ -134,3 +134,48 @@ class OpencodeParserTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RawFallbackTests(unittest.TestCase):
+    """Unknown part types must surface as raw cards, never vanish; known
+    bookkeeping parts stay silent."""
+
+    def _parse_with_extra_parts(self, parts):
+        import sqlite3 as sq
+        with tempfile.TemporaryDirectory() as td:
+            db = Path(td) / "opencode.db"
+            parent_id, _child = _write_opencode_db(db)
+            conn = sq.connect(db)
+            (msg_id,) = conn.execute(
+                "SELECT id FROM message WHERE session_id=? ORDER BY time_created LIMIT 1",
+                (parent_id,),
+            ).fetchone()
+            with conn:
+                for i, part in enumerate(parts):
+                    conn.execute(
+                        "INSERT INTO part(id, message_id, session_id, data) VALUES (?,?,?,?)",
+                        (f"prt_extra{i:04d}", msg_id, parent_id, json.dumps(part)),
+                    )
+            conn.close()
+            old = opencode.DB_PATH
+            opencode.configure(db)
+            try:
+                return opencode.parse_session_by_id(parent_id)
+            finally:
+                opencode.configure(old)
+
+    def test_unknown_part_type_surfaces_as_a_raw_card(self):
+        data = self._parse_with_extra_parts([
+            {"type": "hologram", "detail": 42},
+        ])
+        raws = [e for e in data["events"] if e["kind"] == "raw"]
+        self.assertEqual([e["record_type"] for e in raws], ["part/hologram"])
+        self.assertEqual(raws[0]["payload"]["detail"], 42)
+
+    def test_known_bookkeeping_parts_stay_silent(self):
+        data = self._parse_with_extra_parts([
+            {"type": "step-start"},
+            {"type": "snapshot", "id": "snap"},
+            {"type": "agent", "name": "explore"},
+        ])
+        self.assertNotIn("raw", [e["kind"] for e in data["events"]])

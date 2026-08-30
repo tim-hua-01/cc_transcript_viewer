@@ -1957,7 +1957,7 @@ function formatToolInput(name, input) {
     const node = el("div", {},
       value.description ? el("div", { class: "muted", style: "margin-bottom:4px" }, value.description) : null,
       value.workdir ? el("div", { class: "attach-meta", style: "margin-bottom:6px" }, "cwd: " + value.workdir) : null,
-      preFrom(cmd, "payload"),
+      preFrom(cmd, "payload cmd"),
       value.yield_time_ms ? el("div", { class: "attach-meta", style: "margin-top:6px" }, "yield: " + value.yield_time_ms + "ms") : null
     );
     return { summary: firstLine(cmd), inputNode: node };
@@ -2022,7 +2022,7 @@ function formatToolInput(name, input) {
       value.description ? el("div", { class: "muted", style: "margin-bottom:4px" }, value.description) : null,
       // opencode's bash takes an explicit working directory instead of `cd`.
       value.workdir ? el("div", { class: "attach-meta", style: "margin-bottom:6px" }, "cwd: " + value.workdir) : null,
-      preFrom(cmd, "payload"),
+      preFrom(cmd, "payload cmd"),
       value.run_in_background ? el("div", { class: "muted", style: "margin-top:4px" }, "(background)") : null
     );
     return { summary: firstLine(cmd), inputNode: node };
@@ -2093,88 +2093,53 @@ function formatToolInput(name, input) {
   return { summary: typeof value === "string" ? firstLine(value) : oneLineJson(value), inputNode: preFrom(text, "payload truncatable") };
 }
 
-// Compact plain-text rendering of a tool call for "Copy all". Mirrors the
-// per-tool branches in formatToolInput but emits minimal text instead of DOM,
-// dropping redundant wrappers (e.g. Codex exec orchestration `code`) so the
-// copied transcript uses as few tokens as possible.
+// Serialize a rendered tool-input node to plain text. "Copy all" walks the
+// same DOM formatToolInput just built, so copied text can never drift from
+// what the viewer displays (its predecessor was a hand-maintained per-tool
+// text table that silently fell behind the renderer). The vocabulary is the
+// renderer's own: <pre> blocks come out verbatim (diff prefixes included),
+// annotation divs become single lines, list items become bullets, and
+// <details> bodies (e.g. orchestration source) are display-only extras that
+// stay out of the copy to keep it compact.
+function nodeToCopyLines(node, lines) {
+  if (node == null) return;
+  if (typeof node === "string" || node.nodeType === 3) {
+    const t = (typeof node === "string" ? node : node.textContent || "").trim();
+    if (t) lines.push(t);
+    return;
+  }
+  const tag = (node.tagName || "").toLowerCase();
+  if (tag === "details" || tag === "button") return;
+  if (tag === "pre") {
+    // Strip the zero-width space renderPatch uses to keep empty lines visible.
+    const text = (node.textContent || "").replace(/\u200B/g, "");
+    const preLines = text.replace(/\n$/, "").split("\n");
+    // A shell command (the renderer tags it .cmd) keeps its "$ " marker so
+    // copied text still distinguishes the command from its description.
+    if (node.classList && node.classList.contains("cmd") && preLines[0]) {
+      preLines[0] = "$ " + preLines[0];
+    }
+    for (const line of preLines) lines.push(line);
+    return;
+  }
+  if (tag === "li") {
+    const t = (node.textContent || "").trim();
+    if (t) lines.push("- " + t);
+    return;
+  }
+  const cls = node.classList;
+  if (cls && (cls.contains("attach-meta") || cls.contains("muted") || cls.contains("tool-section-label"))) {
+    const t = (node.textContent || "").trim();
+    if (t) lines.push(t);
+    return;
+  }
+  for (const child of node.childNodes || []) nodeToCopyLines(child, lines);
+}
+
 function toolCallToText(name, input) {
-  const n = (name || "").toLowerCase();
-  const v = input == null ? {} : input;
-  const out = [];
-
-  if (n === "exec" && typeof v === "object") {
-    const calls = Array.isArray(v.calls) ? v.calls : [];
-    if (calls.length) {
-      calls.forEach((call) => out.push(...toolCallToText(call.name, call.input)));
-      return out;
-    }
-    if (v.code) { out.push("$ " + v.code); return out; }
-  }
-  if (n === "exec_command" || n === "bash") {
-    const cmd = v.command || v.cmd || "";
-    if (v.description) out.push("# " + v.description);
-    if (v.workdir) out.push("(in " + v.workdir + ")");
-    if (cmd) out.push("$ " + cmd);
-    if (v.run_in_background) out.push("(background)");
-    return out;
-  }
-  if (n === "read") {
-    const extra = [v.offset ? "offset " + v.offset : "", v.limit ? "limit " + v.limit : "", v.pages ? "pages " + v.pages : ""].filter(Boolean).join(", ");
-    out.push("read " + (v.file_path || "") + (extra ? "  (" + extra + ")" : ""));
-    return out;
-  }
-  if (n === "edit") {
-    out.push("edit " + (v.file_path || "") + (v.replace_all ? "  (replace all)" : ""));
-    if (v.patch != null) out.push(String(v.patch));
-    else {
-      if (v.old_string != null) String(v.old_string).split("\n").forEach((l) => out.push("- " + l));
-      if (v.new_string != null) String(v.new_string).split("\n").forEach((l) => out.push("+ " + l));
-    }
-    return out;
-  }
-  if (n === "multiedit") {
-    out.push("multi-edit " + (v.file_path || "") + "  (" + (v.edits || []).length + " edits)");
-    (v.edits || []).forEach((e) => {
-      if (e.old_string != null) String(e.old_string).split("\n").forEach((l) => out.push("- " + l));
-      if (e.new_string != null) String(e.new_string).split("\n").forEach((l) => out.push("+ " + l));
-    });
-    return out;
-  }
-  if (n === "write") {
-    out.push("write " + (v.file_path || ""));
-    if (v.content) out.push(String(v.content));
-    return out;
-  }
-  if (n === "grep" || n === "glob") {
-    const pat = v.pattern || v.query || "";
-    const where = v.path || v.glob || "";
-    out.push(n + " " + pat + (where ? "  in " + where : ""));
-    return out;
-  }
-  if (n === "task" || n === "agent") {
-    const sub = v.subagent_type || v.agentType || "";
-    out.push("task" + (sub ? " [" + sub + "]" : "") + ": " + (v.description || ""));
-    if (v.prompt) out.push(String(v.prompt));
-    return out;
-  }
-  if (n === "todowrite") {
-    (v.todos || []).forEach((td) => out.push("- [" + (td.status || "?") + "] " + (td.content || td.activeForm || "")));
-    return out;
-  }
-  if (n === "webfetch") {
-    out.push("webfetch " + (v.url || ""));
-    if (v.prompt) out.push(String(v.prompt));
-    return out;
-  }
-  if (n === "websearch") {
-    out.push("websearch " + (v.query || v.search_term || ""));
-    return out;
-  }
-  if (n === "delete" && v.path) { out.push("delete " + v.path); return out; }
-
-  // Fallback: compact single-line JSON.
-  out.push(n + " " + JSON.stringify(v));
-  return out;
+  const lines = [];
+  nodeToCopyLines(formatToolInput(name, input).inputNode, lines);
+  return lines;
 }
 
 function firstLine(s) { return (s || "").split("\n")[0].slice(0, 200); }

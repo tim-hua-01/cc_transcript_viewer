@@ -380,6 +380,39 @@ def _completed_message_item(rec: dict) -> tuple[str, dict] | None:
     return None
 
 
+def _record_message(rec: dict) -> tuple[str, str, str, dict] | None:
+    """(role, text, source, data) when a record carries a conversational
+    message, else None. ``role`` is "user"/"assistant"; ``source`` is "mirror"
+    (the pre-0.147 ``user_message``/``agent_message`` event) or "envelope"
+    (the ≥0.147 ``item_completed`` item); ``data`` is the payload or item the
+    per-message extras (images, phase, …) live on.
+
+    This is the one place that knows every on-disk shape a Codex message
+    takes. The summary counter, the session title, the prescan, and the event
+    loop all classify through it, so the next format change is taught here
+    once — not in four hand-synchronized type chains, which is how the 0.147
+    change slipped through.
+    """
+    if rec.get("type") != "event_msg":
+        return None
+    payload = rec.get("payload") or {}
+    pt = payload.get("type")
+    if pt == "user_message":
+        return "user", payload.get("message") or "", "mirror", payload
+    if pt == "agent_message":
+        return "assistant", payload.get("message") or "", "mirror", payload
+    completed = _completed_message_item(rec)
+    if completed is not None:
+        itype, item = completed
+        role = "user" if itype == "UserMessage" else "assistant"
+        return role, _item_text(item), "envelope", item
+    return None
+
+
+def _normalized_message_key(text) -> str:
+    return " ".join(str(text).split())
+
+
 def _mirror_message_counts(records: list[dict]) -> tuple[Counter, Counter]:
     """Multisets of normalized (user, agent) message texts that appear as
     pre-0.147 ``event_msg`` mirrors.
@@ -393,14 +426,10 @@ def _mirror_message_counts(records: list[dict]) -> tuple[Counter, Counter]:
     users: Counter = Counter()
     agents: Counter = Counter()
     for rec in records:
-        if rec.get("type") != "event_msg":
-            continue
-        payload = rec.get("payload") or {}
-        pt = payload.get("type")
-        if pt == "user_message":
-            users[" ".join(str(payload.get("message") or "").split())] += 1
-        elif pt == "agent_message":
-            agents[" ".join(str(payload.get("message") or "").split())] += 1
+        msg = _record_message(rec)
+        if msg is not None and msg[2] == "mirror":
+            counter = users if msg[0] == "user" else agents
+            counter[_normalized_message_key(msg[1])] += 1
     return users, agents
 
 
@@ -433,16 +462,9 @@ _IGNORED_EVENT_MSG_TYPES = frozenset({
 
 def _first_user_message(records: list[dict]) -> str:
     for rec in records:
-        if rec.get("type") != "event_msg":
-            continue
-        payload = rec.get("payload") or {}
-        if payload.get("type") == "user_message" and payload.get("message"):
-            return common.short_title(str(payload["message"]))
-        completed = _completed_message_item(rec)
-        if completed and completed[0] == "UserMessage":
-            text = _item_text(completed[1])
-            if text:
-                return common.short_title(text)
+        msg = _record_message(rec)
+        if msg is not None and msg[0] == "user" and msg[1]:
+            return common.short_title(str(msg[1]))
     return ""
 
 
@@ -660,24 +682,21 @@ def _session_summary_uncached(path: Path, thread_row: dict | None = None) -> dic
             model = model or payload.get("model", "")
         elif typ == "event_msg":
             pt = payload.get("type")
-            if pt == "user_message":
-                n_user += 1
-            elif pt == "agent_message":
-                n_assistant += 1
-            elif pt == "item_completed":
-                completed = _completed_message_item(rec)
-                if completed is not None:
-                    itype, item = completed
-                    key = " ".join(_item_text(item).split())
-                    if itype == "UserMessage":
-                        if mirror_users.get(key):
-                            mirror_users[key] -= 1
-                        else:
-                            n_user += 1
-                    elif mirror_agents.get(key):
-                        mirror_agents[key] -= 1
-                    else:
-                        n_assistant += 1
+            if (msg := _record_message(rec)) is not None:
+                role, text, source, _data = msg
+                counted = True
+                if source == "envelope":
+                    # Skip an envelope message that repeats a mirror, so a
+                    # hybrid file counts each message once.
+                    dups = mirror_users if role == "user" else mirror_agents
+                    key = _normalized_message_key(text)
+                    if dups.get(key):
+                        dups[key] -= 1
+                        counted = False
+                if counted and role == "user":
+                    n_user += 1
+                elif counted:
+                    n_assistant += 1
             elif pt == "agent_reasoning":
                 n_reasoning += 1
             elif pt == "web_search_end":
@@ -1011,10 +1030,13 @@ def parse_session(path: Path) -> dict:
         payload = rec.get("payload") or {}
         if rec.get("type") == "session_meta":
             meta.update(payload)
-        elif rec.get("type") == "event_msg" and payload.get("type") == "user_message":
-            msg = payload.get("message")
-            if msg:
-                user_event_texts.add(" ".join(str(msg).split()))
+        elif (msg := _record_message(rec)) is not None:
+            # Real user prompts (either format), registered so their
+            # response_item copies are recognized as repeats below. Message
+            # records belong to no other prescan branch, so this classifier
+            # test can't shadow one.
+            if msg[0] == "user" and msg[1]:
+                user_event_texts.add(_normalized_message_key(msg[1]))
         elif rec.get("type") == "turn_context":
             turn_id = payload.get("turn_id")
             if turn_id:
@@ -1078,15 +1100,6 @@ def parse_session(path: Path) -> dict:
             call_id = payload.get("call_id")
             if call_id:
                 web_searches[call_id] = payload
-        elif (completed := _completed_message_item(rec)) and completed[0] == "UserMessage":
-            # Codex ≥0.147 user prompts, registered so their response_item
-            # copies are recognized as repeats below. Last in the chain on
-            # purpose: it is the only branch here that isn't a plain
-            # record-type test, and placing it after every typed branch means
-            # no future record type can be shadowed by it.
-            text = _item_text(completed[1])
-            if text:
-                user_event_texts.add(" ".join(text.split()))
 
     row = _read_thread_rows().get(str(path))
     if row:
@@ -1275,43 +1288,44 @@ def parse_session(path: Path) -> dict:
 
         if typ == "event_msg":
             pt = payload.get("type")
-            if pt == "user_message":
-                append_user_message(
-                    ts,
-                    payload.get("message") or "",
-                    local_paths=payload.get("local_images") or [],
-                    embedded=payload.get("images") or [],
-                    text_elements=payload.get("text_elements") or [],
-                )
+            if (msg := _record_message(rec)) is not None:
+                role, text, source, data = msg
+                if source == "envelope":
+                    # ≥0.147 envelope: skip a message already written as a
+                    # mirror (hybrid file) and empty items; images live on the
+                    # response_item copy and are recovered by the emitters.
+                    dups = envelope_dup_users if role == "user" else envelope_dup_agents
+                    key = _normalized_message_key(text)
+                    if dups.get(key):
+                        dups[key] -= 1
+                    elif not text.strip():
+                        pass
+                    elif role == "user":
+                        append_user_message(
+                            ts, text, text_elements=_item_text_elements(data)
+                        )
+                    else:
+                        append_agent_message(ts, text, phase=data.get("phase"))
+                elif role == "user":
+                    append_user_message(
+                        ts,
+                        text,
+                        local_paths=data.get("local_images") or [],
+                        embedded=data.get("images") or [],
+                        text_elements=data.get("text_elements") or [],
+                    )
+                else:
+                    append_agent_message(
+                        ts,
+                        text,
+                        phase=data.get("phase"),
+                        memory_citation=data.get("memory_citation"),
+                    )
             elif pt == "item_completed":
-                # Codex ≥0.147: user/agent messages only exist inside this
-                # envelope. Reasoning and tool items also ride in it but still
-                # arrive as response_items too, so only the messages are taken
-                # here — anything else would double-render. A message that was
-                # already written as a mirror (hybrid file) is skipped.
-                completed = _completed_message_item(rec)
-                if completed is not None:
-                    itype, item = completed
-                    text = _item_text(item)
-                    key = " ".join(text.split())
-                    if itype == "UserMessage":
-                        if envelope_dup_users.get(key):
-                            envelope_dup_users[key] -= 1
-                        elif text.strip():
-                            append_user_message(
-                                ts, text, text_elements=_item_text_elements(item)
-                            )
-                    elif envelope_dup_agents.get(key):
-                        envelope_dup_agents[key] -= 1
-                    elif text.strip():
-                        append_agent_message(ts, text, phase=item.get("phase"))
-            elif pt == "agent_message":
-                append_agent_message(
-                    ts,
-                    payload.get("message") or "",
-                    phase=payload.get("phase"),
-                    memory_citation=payload.get("memory_citation"),
-                )
+                # A non-message item (Reasoning, CommandExecution, …): its
+                # content still arrives as a response_item, which is what the
+                # transcript renders — taking it here too would double-render.
+                pass
             elif pt == "agent_reasoning":
                 if record_index not in mirrored_reasoning_records:
                     append_reasoning(ts, payload.get("text") or "", False)

@@ -38,6 +38,15 @@ SESSION_SCHEME = "opencode:"
 # session's own `time_updated` plus its message/part counts.
 SUMMARY_CACHE = common.SummaryCache()
 
+# Part types the transcript deliberately does not render. Anything not
+# handled by the turn builders and not listed here is surfaced as a raw card,
+# so an opencode format change shows up instead of vanishing.
+_IGNORED_PART_TYPES = frozenset({
+    "agent",        # marks the @-mention span inside the prompt text
+    "snapshot",     # workspace-snapshot bookkeeping
+    "step-start",   # step boundary; step-finish carries the token counts
+})
+
 # Whole-list cache keyed on the database's on-disk identity, so the 1s
 # /api/sessions poll does no SQL at all while opencode is idle.
 _LIST_CACHE: tuple[tuple, list] | None = None
@@ -394,7 +403,12 @@ def _user_events(parts: list[dict], ts) -> list[dict]:
             })
         elif ptype == "compaction":
             events.append(_compaction_event(part, ts))
-        # `agent` parts only mark the @-mention span inside the prompt text.
+        elif ptype not in _IGNORED_PART_TYPES:
+            # A part type this parser has never seen: surface it instead of
+            # dropping it silently, so an opencode format change is visible
+            # in the transcript (the Codex 0.147 lesson).
+            events.append({"kind": "raw", "ts": ts,
+                           "record_type": f"part/{ptype}", "payload": part})
 
     if blocks:
         events.insert(0, {"kind": "user", "ts": ts, "blocks": blocks})
@@ -451,7 +465,10 @@ def _assistant_events(message: dict, parts: list[dict], ts) -> list[dict]:
                 "label": f"Retry (attempt {part.get('attempt')})",
                 "text": _error_text(part.get("error")),
             })
-        # step-start/snapshot are pure bookkeeping.
+        elif ptype not in _IGNORED_PART_TYPES:
+            # Unknown part type — surface it (see _user_events).
+            events.append({"kind": "raw", "ts": ts,
+                           "record_type": f"part/{ptype}", "payload": part})
 
     error = message.get("error")
     if error:

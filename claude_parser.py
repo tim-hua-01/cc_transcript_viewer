@@ -30,6 +30,26 @@ PROJECTS_DIR = DEFAULT_PROJECTS_DIR
 SUMMARY_CACHE = common.SummaryCache()
 _PARALLEL_SCAN_THRESHOLD = 32
 
+# Record types the transcript deliberately does not render: session-level
+# bookkeeping with no conversational content, plus the title/branch records
+# the event loop consumes earlier (listed again here so a degenerate one with
+# an empty field stays quiet too). Anything not handled and not listed is
+# surfaced as a raw card, so a Claude Code format change shows up in the
+# transcript instead of vanishing.
+_IGNORED_RECORD_TYPES = frozenset({
+    "atis-latch",           # opaque session token
+    "bridge-session",       # cloud-session bridging pointer
+    "cost-state",           # running cost/usage totals
+    "file-history-delta",   # file-backup bookkeeping for /rewind
+    "mode",                 # mode-change notices (plan/normal/…)
+    "queue-operation",      # queued-prompt bookkeeping; content re-enters as
+                            # attachments/user turns when dequeued
+    "summary",              # legacy compact-summary title pointers
+    # consumed earlier in the loop:
+    "agent-name", "ai-title", "custom-title", "last-prompt",
+    "permission-mode", "pr-link", "file-history-snapshot",
+})
+
 
 def configure(projects_dir: Path) -> None:
     """Point the module at a Claude Code projects directory."""
@@ -639,6 +659,16 @@ def parse_session(path: Path) -> dict:
             meta["git_branch"] = rec["gitBranch"]
         if rec.get("version"):
             meta["version"] = rec["version"]
+
+        if t not in ("system", "attachment", "user", "assistant"):
+            if t not in _IGNORED_RECORD_TYPES:
+                # A record type this parser has never seen: surface it instead
+                # of dropping it silently, so a Claude Code format change is
+                # visible in the transcript rather than a quiet gap (the
+                # Codex 0.147 lesson).
+                emit({"kind": "raw", "ts": ts, "record_type": t,
+                      "payload": rec, "is_sidechain": is_sidechain})
+            continue
 
         if t == "system":
             ev = {

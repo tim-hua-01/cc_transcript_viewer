@@ -706,3 +706,48 @@ class StoreSummaryCacheTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CursorRawFallbackTests(unittest.TestCase):
+    """An unknown IDE bubble type with no recognizable content must surface as
+    a raw card; routine empty assistant bubbles stay silent."""
+
+    def test_unknown_empty_bubble_surfaces_and_empty_assistant_does_not(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            db_path = tmp / "state.vscdb"
+            cid = "raw-fallback-composer"
+            headers = [
+                {"bubbleId": "u1", "type": 1},
+                {"bubbleId": "a1", "type": 2},
+                {"bubbleId": "e1", "type": 2},   # empty assistant: silent
+                {"bubbleId": "x1", "type": 7},   # unknown, no content: raw
+            ]
+            composer = {"name": "raw test", "fullConversationHeadersOnly": headers,
+                        "createdAt": 1_700_000_000_000, "lastUpdatedAt": 1_700_000_100_000}
+            bubbles = {
+                "u1": {"type": 1, "text": "hi"},
+                "a1": {"type": 2, "text": "hello"},
+                "e1": {"type": 2},
+                "x1": {"type": 7, "mystery": True},
+            }
+            conn = sqlite3.connect(db_path)
+            with conn:
+                conn.execute("create table cursorDiskKV (key text primary key, value text)")
+                conn.execute("insert into cursorDiskKV values (?, ?)",
+                             (f"composerData:{cid}", json.dumps(composer)))
+                for bid, bubble in bubbles.items():
+                    conn.execute("insert into cursorDiskKV values (?, ?)",
+                                 (f"bubbleId:{cid}:{bid}", json.dumps(bubble)))
+            conn.close()
+            old = (cursor.DB_PATH, cursor.PROJECTS_DIR, cursor.CHATS_DIR)
+            cursor.configure(db_path, projects_dir=tmp / "projects", chats_dir=tmp / "chats")
+            try:
+                data = cursor.parse_session_by_id(cid)
+            finally:
+                cursor.configure(old[0], projects_dir=old[1], chats_dir=old[2])
+        kinds = [e["kind"] for e in data["events"]]
+        raws = [e for e in data["events"] if e["kind"] == "raw"]
+        self.assertEqual(kinds.count("raw"), 1)
+        self.assertEqual(raws[0]["record_type"], "bubble/7")
+        self.assertTrue(raws[0]["payload"]["mystery"])

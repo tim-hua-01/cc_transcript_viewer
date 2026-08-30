@@ -704,6 +704,15 @@ def parse_session_by_id(composer_id: str) -> dict | None:
             if isinstance(tf, dict):
                 blocks.append(_normalize_tool(conn, tf))
             if not blocks:
+                # Empty assistant bubbles (type 2) are routine spacers; an
+                # unknown bubble type with no recognizable content is format
+                # drift and must stay visible (the Codex 0.147 lesson).
+                if btype not in (1, 2):
+                    events.append({
+                        "kind": "raw", "ts": ts,
+                        "record_type": f"bubble/{btype}",
+                        "payload": b, "is_sidechain": False,
+                    })
                 continue
             if current_model and current_model not in models_seen_set:
                 models_seen_set.add(current_model)
