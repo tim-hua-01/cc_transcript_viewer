@@ -373,7 +373,7 @@ body.standalone.sidebar-collapsed .edge-toggle-left { display: none; }
 #search:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--focus-ring); }
 #sidebar-stats { margin-top: 8px; font-size: 11px; }
 
-#filter-row { display: flex; gap: 6px; margin-top: 8px; }
+#filter-row { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
 .filter-chip {
   font-size: 11px; padding: 3px 10px; border-radius: 999px;
   background: var(--bg-elev); border: 1px solid var(--border);

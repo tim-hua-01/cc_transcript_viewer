@@ -620,6 +620,9 @@ function renderSidebar(query) {
       a === "all" ? "All" : agentLabel(a),
       el("span", { class: "chip-count" }, String(n))
     );
+    // An agent with nothing to show contributes only clutter — but never hide
+    // "All" or the selected chip (the way back out of a filter).
+    chip.hidden = n === 0 && a !== "all" && a !== AGENT_FILTER;
   }
 
   const matchedByFile = new Map(matches.map((s) => [s.file, s]));
