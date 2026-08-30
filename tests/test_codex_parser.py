@@ -10,7 +10,7 @@ import unittest
 from pathlib import Path
 
 import codex_parser as codex
-from test_fixtures import _write_jsonl
+from tests.fixture_builders import _write_jsonl
 
 
 class CodexReasoningSummaryTests(unittest.TestCase):

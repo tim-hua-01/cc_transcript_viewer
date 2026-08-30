@@ -9,7 +9,7 @@ import unittest
 from pathlib import Path
 
 import claude_parser as claude
-from test_fixtures import _assistant, _user, _write_jsonl
+from tests.fixture_builders import _assistant, _user, _write_jsonl
 
 
 class BranchFoldingTests(unittest.TestCase):
@@ -269,10 +269,6 @@ class QueuedPromptTests(unittest.TestCase):
         self.assertEqual(data["events"][0]["kind"], "notice")
         self.assertEqual(data["events"][0]["label"], "System reminder")
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class RawFallbackTests(unittest.TestCase):
     """Unknown record types must surface as raw cards, never vanish; known
     bookkeeping types stay silent."""
@@ -303,3 +299,7 @@ class RawFallbackTests(unittest.TestCase):
             {"type": "atis-latch", "atis": "v1.opaque"},
         ])
         self.assertNotIn("raw", [e["kind"] for e in data["events"]])
+
+
+if __name__ == "__main__":
+    unittest.main()

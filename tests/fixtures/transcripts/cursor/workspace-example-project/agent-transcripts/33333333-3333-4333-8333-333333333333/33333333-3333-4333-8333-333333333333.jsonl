@@ -1,0 +1,3 @@
+{"role":"user","message":{"content":[{"type":"text","text":"<timestamp>Friday, Jan 2, 2026</timestamp>\n<user_query>\nCheck the fictional example.\n</user_query>"}]}}
+{"role":"assistant","message":{"content":[{"type":"text","text":"I am checking the example."},{"type":"tool_use","name":"Shell","input":{"command":"printf fixture","description":"print fictional fixture text","working_directory":"/workspace/example-project"}}]}}
+{"role":"assistant","message":{"content":[{"type":"text","text":"The fictional example looks consistent."}]}}

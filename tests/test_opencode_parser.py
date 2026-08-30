@@ -11,7 +11,7 @@ import unittest
 from pathlib import Path
 
 import opencode_parser as opencode
-from test_fixtures import _write_opencode_db
+from tests.fixture_builders import _write_opencode_db
 
 
 class OpencodeParserTests(unittest.TestCase):
@@ -132,10 +132,6 @@ class OpencodeParserTests(unittest.TestCase):
         finally:
             opencode.configure(Path(self._tmp.name) / "opencode" / "opencode.db")
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class RawFallbackTests(unittest.TestCase):
     """Unknown part types must surface as raw cards, never vanish; known
     bookkeeping parts stay silent."""
@@ -179,3 +175,7 @@ class RawFallbackTests(unittest.TestCase):
             {"type": "agent", "name": "explore"},
         ])
         self.assertNotIn("raw", [e["kind"] for e in data["events"]])
+
+
+if __name__ == "__main__":
+    unittest.main()

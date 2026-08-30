@@ -19,7 +19,7 @@ from pathlib import Path
 import codex_parser as codex
 import event_schema
 from codex_export import opencode_to_codex as o2c
-from test_fixtures import _write_opencode_db
+from tests.fixture_builders import _write_opencode_db
 
 
 class OpencodeToCodexTests(unittest.TestCase):

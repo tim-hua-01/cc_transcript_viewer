@@ -31,7 +31,7 @@ phones home.
    as sensitive.
 5. Keep it a handful of files: `server.py`, a Codex-parsing module
    (`codex_server.py`), and `static/{index.html,style.css,app.js}`, plus
-   `test_security.py`.
+   `tests/test_security.py`.
 
 ## Where the data lives (read-only)
 
@@ -104,7 +104,8 @@ One JSON object per line, each with a `type` such as `session_meta`, `turn_conte
 Implement a `ThreadingHTTPServer` with these GET routes:
 - `GET /`, `/index.html`, `/app.js`, `/style.css` — static files.
 - `GET /api/sessions` → `{"sessions": [ ... ]}`. One lightweight summary per session
-  across **both** agents, merged and **sorted by most-recently-modified first**. Each
+  across **both** agents, merged and **sorted by last recorded activity first** (falling
+  back to file mtime when the transcript has no usable timestamp). Each
   summary: `agent` ("claude"|"codex"), `id`, `file` (absolute path), `title` (first
   user message, ~100 chars), `cwd`, `git_branch`, `model`, message/tool/web counts,
   `mtime`, and sub-agent linkage (`is_subagent`, `parent_file`). Place each sub-agent
@@ -129,7 +130,7 @@ how many transcripts I've accumulated.
 A three-pane layout: left sidebar, center transcript, right outline.
 
 **Sidebar (session list):**
-- Time-sorted flat list (no per-project grouping), each row: agent tag
+- Last-activity-sorted flat list (no per-project grouping), each row: agent tag
   (Claude/Codex), title, project path, recency, badges (💬 user / 🔧 tool / 🌐 web
   counts), model, and the full session id (click to copy). Sub-agents indented and
   flagged.
@@ -175,7 +176,7 @@ A three-pane layout: left sidebar, center transcript, right outline.
 - Confine `/api/session` to the transcript roots; restrict `/api/local-image` to
   image MIME types.
 
-Write `test_security.py` using **stdlib `unittest` only**. It should boot the server
+Write `tests/test_security.py` using **stdlib `unittest` only**. It should boot the server
 on an ephemeral loopback port against a temporary fixture transcript and assert:
 1. Exercising every endpoint opens **no outbound socket** — install a guard that wraps
    `socket.socket.connect`/`connect_ex` and records any non-loopback destination;
@@ -196,7 +197,7 @@ on an ephemeral loopback port against a temporary fixture transcript and assert:
 4. Search + filters.
 5. Codex parser module → merge into the unified list and transcript view.
 6. Outline + jump navigation; live auto-refresh; image serving.
-7. Security hardening (Host guard, path confinement) + `test_security.py`.
+7. Security hardening (Host guard, path confinement) + `tests/test_security.py`.
 8. mtime caching for `/api/sessions` and search.
 
 After each step, show me how to run it (`python3 server.py`, open the printed

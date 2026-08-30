@@ -222,14 +222,23 @@ This app reads your private transcripts, so it's built to keep them on your mach
 These guarantees are enforced by a zero-dependency test suite — run it yourself:
 
 ```bash
-python3 -m unittest            # everything: security, parsers, schema, caching
-python3 -m unittest test_security   # just the security guarantees
+python3 -m unittest                         # full suite
+python3 -m unittest tests.test_security     # security guarantees only
+python3 -m unittest tests.test_frontend_browser  # optional browser journey
 ```
 
 It spins the server up on loopback, exercises every endpoint with a socket-level guard installed, and
 fails if any request dials a non-loopback host; it also forges a foreign `Host` header to confirm the
 rebinding guard rejects it, and statically asserts neither module imports a network client and that
-the default bind is loopback.
+the default bind is loopback. Parser regressions are also checked against small, checked-in
+transcript files under `tests/fixtures/`. Those fixtures are fictional and use generated images and
+placeholder paths; their record shapes were compared with local stores, but no private transcript
+content was copied into the repository.
+
+The frontend browser journey uses Chrome or Chromium when one is installed, and otherwise skips. It
+opens a standalone export with networking stubbed out and checks the rendered conversation and Copy
+All behavior through the real DOM. This keeps the default suite dependency-free without replacing
+the focused parser and server tests with a large screenshot suite.
 
 ## Notes on Codex transcripts
 
@@ -383,14 +392,16 @@ Restart Claude Code (or run `/config` once) for the change to take effect. Note 
 | `common.py` | Everything the four parsers share: JSONL iteration, JSON/SQLite access, title truncation, timestamp conversion, the sidebar-summary shape (`make_summary`), and the thread-safe fingerprint-keyed `SummaryCache` (plus its `cached_summary` wrapper) all of them use. |
 | `event_schema.py` | The written-down (and machine-checked) event contract between the parsers and the frontend: every event kind, both message shapes, and validators the test suite runs over every parser's output. |
 | `static/index.html`, `static/style.css`, `static/app.js` | The single frontend (vanilla JS, no build step). `app.js` dispatches on event kind and renders the Claude Code / Cursor / opencode (block-based) and Codex (flat) shapes, and runs the always-on live-refresh poll loop. When `window.__TRANSCRIPT_EXPORT__` is present (a saved single-file transcript) it renders that session directly and disables everything that needs the server. CDN assets (marked, DOMPurify, KaTeX) are version-pinned with SRI integrity hashes. |
-| `test_security.py` | Zero-dependency security tests (`python3 -m unittest test_security`): asserts no outbound connections at runtime, no network-client imports, loopback default bind, the `Host`-header rebinding guard, that `/api/session` is confined to the transcript roots while `/api/local-image` serves images only, and that every CDN asset is version-pinned and SRI-hashed. |
-| `test_export.py` | Tests for the single-file export: the document inlines its assets and points at no server, transcript text can't break out of the embedded JSON, local images become `data:` URIs (and degrade to a note when missing, oversized, or not an image), `/api/export` enforces the same path allowlist as `/api/session`, and `app.js`/`style.css` still carry the standalone wiring the export depends on. |
-| `test_cursor_to_codex.py` | Tests for the Cursor exporter: the `conversationState` blob chain resolves, and the OpenAI reasoning item buried in a JSON-encoded `signature` survives with its `rs_…` id and `encrypted_content` intact. |
-| `test_opencode_to_codex.py` | Tests for the opencode exporter: encrypted reasoning survives, the fused tool record splits into two, timestamps come from the parts' own clocks, and the output reparses through `codex_parser` as a valid `opencode`-labelled session. |
-| `test_claude_parser.py`, `test_codex_parser.py`, `test_cursor_parser.py`, `test_opencode_parser.py` | Characterization tests for each parser's internals — branch folding and queued prompts (Claude), the JS-literal orchestration parser (Codex), blob/JSON extraction and diff reconstruction (Cursor), and the part→event mapping (opencode). |
-| `test_event_schema.py` | Conformance tests: every parser's summaries and full parses must satisfy `event_schema.py`, and `app.js` must dispatch on every declared kind. |
-| `test_summary_cache.py`, `test_common.py` | Unit tests for the shared layer: summary-cache round-trip persistence, fingerprint invalidation and dirty-flag races, plus the small helpers in `common.py`. |
-| `test_fixtures.py` | Shared fixture builders that write minimal-but-valid transcripts for each source. |
+| `tests/test_security.py` | Zero-dependency security tests (`python3 -m unittest tests.test_security`): asserts no outbound connections at runtime, no network-client imports, loopback default bind, the `Host`-header rebinding guard, that `/api/session` is confined to the transcript roots while `/api/local-image` serves images only, and that every CDN asset is version-pinned and SRI-hashed. |
+| `tests/test_export.py` | Tests for the single-file export: the document inlines its assets and points at no server, transcript text can't break out of the embedded JSON, local images become `data:` URIs (and degrade to a note when missing, oversized, or not an image), and `/api/export` enforces the same path allowlist as `/api/session`. |
+| `tests/test_frontend_browser.py` | One optional Chrome/Chromium journey through the real standalone frontend: transcript rendering, server-only controls, offline behavior, and Copy All. It skips when no supported browser is installed. |
+| `tests/test_server.py` | Cross-source ordering tests: parsed last activity wins over a misleading file mtime, sub-agents remain beside their parent, and malformed or missing activity falls back to mtime. |
+| `tests/test_cursor_to_codex.py`, `tests/test_opencode_to_codex.py` | Exporter tests: encrypted reasoning and tool records survive conversion, timestamps remain attached to the right records, and the output reparses through `codex_parser`. |
+| `tests/test_claude_parser.py`, `tests/test_codex_parser.py`, `tests/test_cursor_parser.py`, `tests/test_opencode_parser.py` | Characterization tests for each parser's internals — branch folding and queued prompts (Claude), the JS-literal orchestration parser (Codex), blob/JSON extraction and diff reconstruction (Cursor), and the part→event mapping (opencode). |
+| `tests/test_event_schema.py` | Conformance tests: every parser's summaries and full parses must satisfy `event_schema.py`, and `app.js` must dispatch on every declared kind. |
+| `tests/test_golden_transcripts.py`, `tests/fixtures/` | Regression tests over checked-in, fictional transcript files whose field shapes were compared with current local stores. The fixture README records the sanitization and review rules. |
+| `tests/test_summary_cache.py`, `tests/test_common.py` | Unit tests for the shared layer: summary-cache round-trip persistence, fingerprint invalidation and dirty-flag races, plus the small helpers in `common.py`. |
+| `tests/fixture_builders.py` | Shared fixture builders that write temporary minimal-but-valid transcripts and databases for each source. |
 
 ### Transcript format notes
 

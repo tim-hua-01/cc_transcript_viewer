@@ -1,4 +1,4 @@
-"""Focused tests for persistent transcript summary caching."""
+"""Focused regression tests for persistent transcript summary caching."""
 
 from __future__ import annotations
 

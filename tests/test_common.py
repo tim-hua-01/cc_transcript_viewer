@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unit tests for the helpers in common.py."""
+"""Focused unit tests for the helpers in common.py."""
 
 from __future__ import annotations
 

@@ -19,10 +19,11 @@ from pathlib import Path
 import claude_parser as claude
 import export_html
 import server
-from test_fixtures import (
+from tests.fixture_builders import (
     _write_fixture_session,
     http_get,
     patch_server_files,
+    restore_server_files,
     start_http_server,
     stop_http_server,
 )
@@ -196,14 +197,16 @@ class ExportRouteTest(unittest.TestCase):
         cls.projects_dir = tmp / "projects"
         cls.projects_dir.mkdir()
         cls.fixture = _write_fixture_session(cls.projects_dir)
+        cls._old_claude = claude.PROJECTS_DIR
         claude.configure(cls.projects_dir)
-        cls._old_cache_file = patch_server_files(server, tmp)
+        cls._old_server_files = patch_server_files(server, tmp)
         cls.httpd, cls.port, cls.thread = start_http_server(server.Handler)
 
     @classmethod
     def tearDownClass(cls):
         stop_http_server(cls.httpd, cls.thread)
-        server.CACHE_FILE = cls._old_cache_file
+        claude.configure(cls._old_claude)
+        restore_server_files(server, cls._old_server_files)
         cls._tmp.cleanup()
 
     def get(self, path: str):
@@ -238,49 +241,6 @@ class ExportRouteTest(unittest.TestCase):
     def test_export_reports_a_missing_transcript(self):
         status, _, _ = self.get("/api/export?file=%2Ftmp%2Fnope-does-not-exist.jsonl")
         self.assertEqual(status, 404)
-
-
-class StandaloneModeTest(unittest.TestCase):
-    """The export leans on app.js switching itself off; keep that wiring honest."""
-
-    @classmethod
-    def setUpClass(cls):
-        cls.js = (Path("static") / "app.js").read_text(encoding="utf-8")
-
-    def test_app_js_detects_an_embedded_payload(self):
-        self.assertIn("const EXPORT_DATA = window.__TRANSCRIPT_EXPORT__ || null;", self.js)
-        self.assertIn("const STANDALONE = !!EXPORT_DATA;", self.js)
-        self.assertIn("if (STANDALONE) startStandalone();", self.js)
-
-    def test_standalone_stops_polling_the_absent_server(self):
-        self.assertRegex(
-            self.js,
-            r"if \(!STANDALONE\) \{\s*setInterval\(pollOpenTranscript, TRANSCRIPT_POLL_MS\);"
-            r"\s*setInterval\(pollSidebar, SIDEBAR_POLL_MS\);\s*\}",
-        )
-
-    def test_standalone_suppresses_links_to_sessions_it_does_not_carry(self):
-        """An export holds one session; cross-session links would go nowhere."""
-        self.assertIn("if (STANDALONE) return;", self.js)          # openSession
-        self.assertIn("data.forked_from.file && !STANDALONE", self.js)
-        self.assertIn("b.child_file && !STANDALONE", self.js)
-        self.assertRegex(
-            self.js,
-            r'el\("span", \{\s*class: "parent-link",'
-            r'\s*title: "The parent session is not part of this export"',
-        )
-
-    def test_standalone_hides_server_backed_buttons(self):
-        for guard in (
-            r'STANDALONE \? null : el\("button", \{\s*class: "rename-btn"',
-            r"!STANDALONE && hasTranscriptFile\(transcriptFile\)",
-        ):
-            with self.subTest(guard=guard):
-                self.assertRegex(self.js, guard)
-
-    def test_standalone_hides_the_session_list(self):
-        css = (Path("static") / "style.css").read_text(encoding="utf-8")
-        self.assertIn("body.standalone #sidebar", css)
 
 
 if __name__ == "__main__":

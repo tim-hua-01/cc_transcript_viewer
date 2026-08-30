@@ -20,7 +20,7 @@ import codex_parser as codex
 import cursor_parser as cursor
 import event_schema
 import opencode_parser as opencode
-from test_fixtures import (
+from tests.fixture_builders import (
     _write_cli_session,
     _write_cli_store,
     _write_fixture_session,

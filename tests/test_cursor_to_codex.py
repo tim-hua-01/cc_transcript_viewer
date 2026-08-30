@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for the Cursor → Codex rollout exporter.
+"""Regression tests for the Cursor → Codex rollout exporter.
 
 These pin the parts that are easy to get subtly wrong: the agentKv blob chain
 hidden in ``conversationState``, and the OpenAI reasoning item Cursor buries in

@@ -7,7 +7,7 @@ files outside the directories it's meant to expose. These tests assert both,
 so anyone who downloads the project can verify the guarantees rather than
 trust them.
 
-Run with:  python -m unittest test_security    (zero dependencies, stdlib only)
+Run with:  python -m unittest tests.test_security    (zero dependencies, stdlib only)
 """
 
 from __future__ import annotations
@@ -57,7 +57,7 @@ def _guard(real):
     return wrapper
 
 
-from test_fixtures import (
+from tests.fixture_builders import (
     _write_cli_session,
     _write_cli_store,
     _write_fixture_session,
@@ -65,6 +65,7 @@ from test_fixtures import (
     _write_opencode_db,
     http_get,
     patch_server_files,
+    restore_server_files,
     start_http_server,
     stop_http_server,
 )
@@ -110,10 +111,16 @@ class SecurityTest(unittest.TestCase):
                  }},
             ),
         )
+        cls._old_parser_config = (
+            claude.PROJECTS_DIR,
+            codex.CODEX_HOME,
+            (cursor.DB_PATH, cursor.PROJECTS_DIR, cursor.CHATS_DIR),
+            opencode.DB_PATH,
+        )
         claude.configure(cls.projects_dir)
         # Hermetic viewer-owned files — never touch the user's real names.json
         # or ~/.cache summary file from the test suite.
-        cls._old_cache_file = patch_server_files(server, tmp)
+        cls._old_server_files = patch_server_files(server, tmp)
         cls.codex_parent, cls.codex_guardian, cls.codex_image = _write_guardian_sessions(tmp / "codex")
         codex.configure(tmp / "codex")
         cls.cursor_projects = tmp / "cursor-projects"
@@ -125,7 +132,6 @@ class SecurityTest(unittest.TestCase):
             projects_dir=cls.cursor_projects,
             chats_dir=cls.cursor_chats,
         )
-        cls._old_opencode_db = opencode.DB_PATH
         cls.opencode_db = tmp / "opencode" / "opencode.db"
         cls.opencode_parent, cls.opencode_child = _write_opencode_db(cls.opencode_db)
         opencode.configure(cls.opencode_db)
@@ -142,8 +148,15 @@ class SecurityTest(unittest.TestCase):
         stop_http_server(cls.httpd, cls.thread)
         socket.socket.connect = _real_connect
         socket.socket.connect_ex = _real_connect_ex
-        server.CACHE_FILE = cls._old_cache_file
-        opencode.configure(cls._old_opencode_db)
+        restore_server_files(server, cls._old_server_files)
+        claude.configure(cls._old_parser_config[0])
+        codex.configure(cls._old_parser_config[1])
+        cursor.configure(
+            cls._old_parser_config[2][0],
+            projects_dir=cls._old_parser_config[2][1],
+            chats_dir=cls._old_parser_config[2][2],
+        )
+        opencode.configure(cls._old_parser_config[3])
         cls._tmp.cleanup()
 
     def get(self, path: str):
@@ -185,7 +198,10 @@ class SecurityTest(unittest.TestCase):
             with urllib.request.urlopen(req, timeout=5) as r:
                 return r.status, r.headers, r.read()
         except urllib.error.HTTPError as e:
-            return e.code, e.headers, e.read()
+            try:
+                return e.code, e.headers, e.read()
+            finally:
+                e.close()
 
     def post_json(self, path: str, payload: dict):
         url = f"http://127.0.0.1:{self.port}{path}"
@@ -199,7 +215,10 @@ class SecurityTest(unittest.TestCase):
             with urllib.request.urlopen(req, timeout=5) as r:
                 return r.status, r.headers, r.read()
         except urllib.error.HTTPError as e:
-            return e.code, e.headers, e.read()
+            try:
+                return e.code, e.headers, e.read()
+            finally:
+                e.close()
 
     # ----- viewer-owned custom names -------------------------------------- #
 
@@ -359,7 +378,10 @@ class SecurityTest(unittest.TestCase):
         request = next(ev for ev in data["events"] if ev["kind"] == "guardian_request")
         decision = next(ev for ev in data["events"] if ev["kind"] == "guardian_decision")
         self.assertEqual(request["request"]["tool"], "exec_command")
-        self.assertEqual(request["request"]["command"][-1], "python3 -m unittest test_security")
+        self.assertEqual(
+            request["request"]["command"][-1],
+            "python3 -m unittest tests.test_security",
+        )
         self.assertEqual(request["metadata"]["model"], "guardian-test")
         self.assertEqual(request["metadata"]["duration_ms"], 2000)
         self.assertEqual(request["metadata"]["usage"]["input_tokens"], 1200)
@@ -703,15 +725,6 @@ class FrontendAssetIntegrityTest(unittest.TestCase):
                 url = re.search(r"""(?:src|href)=["'](https?://[^"']+)""", tag).group(1)
                 self.assertRegex(url, r"@\d+\.\d+\.\d+/",
                                  "CDN URL must pin an exact version (x.y.z)")
-
-    def test_open_transcript_has_separate_fast_poll(self):
-        js = (Path("static") / "app.js").read_text(encoding="utf-8")
-        self.assertIn("const TRANSCRIPT_POLL_MS = 300", js)
-        self.assertIn("const SIDEBAR_POLL_MS = 1000", js)
-        self.assertIn('fetch("/api/session-state?file="', js)
-        self.assertIn("setInterval(pollOpenTranscript, TRANSCRIPT_POLL_MS)", js)
-        self.assertIn("setInterval(pollSidebar, SIDEBAR_POLL_MS)", js)
-
 
 if __name__ == "__main__":
     unittest.main()

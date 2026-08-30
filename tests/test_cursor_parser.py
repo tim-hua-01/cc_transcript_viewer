@@ -14,7 +14,7 @@ import unittest
 from pathlib import Path
 
 import cursor_parser as cursor
-from test_fixtures import _write_cli_store
+from tests.fixture_builders import _write_cli_store
 
 
 class CursorDiffTests(unittest.TestCase):
@@ -704,10 +704,6 @@ class StoreSummaryCacheTests(unittest.TestCase):
                 cursor.configure(None)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class CursorRawFallbackTests(unittest.TestCase):
     """An unknown IDE bubble type with no recognizable content must surface as
     a raw card; routine empty assistant bubbles stay silent."""
@@ -751,3 +747,7 @@ class CursorRawFallbackTests(unittest.TestCase):
         self.assertEqual(kinds.count("raw"), 1)
         self.assertEqual(raws[0]["record_type"], "bubble/7")
         self.assertTrue(raws[0]["payload"]["mystery"])
+
+
+if __name__ == "__main__":
+    unittest.main()

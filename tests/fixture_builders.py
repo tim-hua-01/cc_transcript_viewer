@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Shared fixtures and harness helpers for the test suite.
+"""Fixture builders and harness helpers shared by the test suite.
 
 Builders that write minimal-but-valid on-disk transcripts for each source
 (Claude Code JSONL, Codex rollout JSONL, Cursor CLI JSONL and store.db), plus
@@ -19,13 +19,26 @@ from pathlib import Path
 
 def patch_server_files(server_module, tmp: Path):
     """Point the viewer-owned files (custom names, summary cache) into tmp so
-    tests never touch the user's real ones. Returns the previous CACHE_FILE for
-    tearDownClass to restore."""
+    tests never touch the user's real ones. Return all replaced state so the
+    caller can restore it even when test modules run in a different order."""
+    old_state = (
+        server_module.CUSTOM_NAMES_FILE,
+        server_module._CUSTOM_NAMES_CACHE,
+        server_module.CACHE_FILE,
+    )
     server_module.CUSTOM_NAMES_FILE = tmp / "viewer" / "names.json"
     server_module._CUSTOM_NAMES_CACHE = None
-    old_cache_file = server_module.CACHE_FILE
     server_module.CACHE_FILE = tmp / "cache" / "summaries.json"
-    return old_cache_file
+    return old_state
+
+
+def restore_server_files(server_module, old_state) -> None:
+    """Undo ``patch_server_files`` without retaining a deleted temp path."""
+    (
+        server_module.CUSTOM_NAMES_FILE,
+        server_module._CUSTOM_NAMES_CACHE,
+        server_module.CACHE_FILE,
+    ) = old_state
 
 
 def start_http_server(handler):
@@ -50,7 +63,10 @@ def http_get(port: int, path: str, timeout: float = 10):
         with urllib.request.urlopen(url, timeout=timeout) as r:
             return r.status, r.headers, r.read()
     except urllib.error.HTTPError as e:
-        return e.code, e.headers, e.read()
+        try:
+            return e.code, e.headers, e.read()
+        finally:
+            e.close()
 
 
 def _write_jsonl(path: Path, records: list[dict]) -> None:
@@ -328,7 +344,7 @@ def _write_guardian_sessions(codex_home: Path) -> tuple[Path, Path, Path]:
          "payload": {"type": "context_compacted"}},
     ]
     planned = {
-        "command": ["/bin/zsh", "-lc", "python3 -m unittest test_security"],
+        "command": ["/bin/zsh", "-lc", "python3 -m unittest tests.test_security"],
         "cwd": "/tmp/proj",
         "justification": "Run local tests?",
         "sandbox_permissions": "require_escalated",
