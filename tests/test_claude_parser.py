@@ -108,6 +108,145 @@ class BranchFoldingTests(unittest.TestCase):
         self.assertIn("branch b", texts)
 
 
+class ParallelToolCallTests(unittest.TestCase):
+    """Within-turn forks from parallel tool calls are not rewinds.
+
+    Claude Code links each tool result to the record holding its tool_use (not
+    to the end of the assistant message) and chains later tool_use blocks off
+    intermediate results, so a flat uuid/parentUuid tree forks inside one turn.
+    Hook progress records, attachments and meta user records hang off results
+    the same way.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _parse(self, records):
+        path = self.dir / "session.jsonl"
+        _write_jsonl(path, records)
+        return claude.parse_session(path)
+
+    @staticmethod
+    def _tool_use(uuid, parent, msg_id, tool_id, name, ts):
+        return {
+            "type": "assistant",
+            "uuid": uuid,
+            "parentUuid": parent,
+            "timestamp": ts,
+            "message": {
+                "id": msg_id,
+                "role": "assistant",
+                "model": "claude-test",
+                "content": [{"type": "tool_use", "id": tool_id, "name": name, "input": {}}],
+            },
+        }
+
+    @staticmethod
+    def _result(uuid, parent, tool_id, text, ts, extra_blocks=(), **fields):
+        rec = {
+            "type": "user",
+            "uuid": uuid,
+            "parentUuid": parent,
+            "timestamp": ts,
+            "message": {
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": tool_id, "content": text},
+                    *extra_blocks,
+                ],
+            },
+        }
+        rec.update(fields)
+        return rec
+
+    def _parallel_turn(self):
+        """One assistant message with three tool calls in the real on-disk
+        linkage: results point at their tool_use record, the second tool_use
+        chains off the first result, and per-result leaves hang off results."""
+        return [
+            _user("u0", None, "hello", "2025-12-31T00:00:00Z"),
+            _assistant("a0", "u0", "hi", "2025-12-31T00:00:01Z"),
+            _user("u1", "a0", "search things", "2026-01-01T00:00:00Z"),
+            self._tool_use("a1", "u1", "msg_1", "t1", "WebSearch", "2026-01-01T00:00:01Z"),
+            self._tool_use("a2", "a1", "msg_1", "t2", "WebSearch", "2026-01-01T00:00:02Z"),
+            self._result("r1", "a1", "t1", "one", "2026-01-01T00:00:03Z"),
+            self._tool_use("a3", "r1", "msg_1", "t3", "Bash", "2026-01-01T00:00:04Z"),
+            {"type": "progress", "uuid": "p3", "parentUuid": "a3",
+             "timestamp": "2026-01-01T00:00:05Z", "parentToolUseID": "t3",
+             "data": {"type": "hook_progress", "hookEvent": "PreToolUse"}},
+            self._result("r3", "a3", "t3", "three", "2026-01-01T00:00:06Z"),
+            {"type": "attachment", "uuid": "att3", "parentUuid": "r3",
+             "timestamp": "2026-01-01T00:00:07Z",
+             "attachment": {"type": "bash_output_audience_note", "toolUseID": "t3"}},
+            # Queued user text merged into a result record.
+            self._result("r2", "a2", "t2", "two", "2026-01-01T00:00:08Z",
+                         extra_blocks=({"type": "text", "text": "and also push"},)),
+            {"type": "user", "uuid": "m2", "parentUuid": "r2", "isMeta": True,
+             "timestamp": "2026-01-01T00:00:09Z",
+             "message": {"role": "user", "content": "[Image: expanded]"}},
+            _assistant("a4", "m2", "all done", "2026-01-01T00:00:10Z"),
+        ]
+
+    def _kinds(self, events):
+        return [e["kind"] for e in events]
+
+    def test_parallel_tool_calls_do_not_fold(self):
+        records = self._parallel_turn() + [{"type": "last-prompt", "leafUuid": "u1"}]
+        data = self._parse(records)
+        kinds = self._kinds(data["events"])
+        self.assertNotIn("branch", kinds)
+        # File order is preserved and nothing is lost.
+        self.assertEqual(kinds[:3], ["user", "assistant", "user"])
+        self.assertEqual(kinds[-1], "assistant")
+        self.assertEqual(data["events"][-1]["blocks"][0]["text"], "all done")
+        tool_names = [
+            b["name"]
+            for e in data["events"]
+            for b in e.get("blocks") or []
+            if b.get("type") == "tool_use"
+        ]
+        self.assertEqual(tool_names, ["WebSearch", "WebSearch", "Bash"])
+        self.assertEqual(
+            [b["result"]["text"] for e in data["events"] for b in e.get("blocks") or []
+             if b.get("type") == "tool_use"],
+            ["one", "two", "three"],
+        )
+
+    def test_real_rewind_still_folds_around_parallel_turn(self):
+        records = self._parallel_turn() + [
+            # Rewound and edited the "search things" prompt after the parallel
+            # turn: a second child of a0, appended later.
+            _user("u2", "a0", "search other things", "2026-01-01T00:00:11Z"),
+            _assistant("a5", "u2", "new reply", "2026-01-01T00:00:12Z"),
+            {"type": "last-prompt", "leafUuid": "u2"},
+        ]
+        data = self._parse(records)
+        kinds = self._kinds(data["events"])
+        self.assertEqual(kinds, ["user", "assistant", "branch", "user", "assistant"])
+        branch = data["events"][2]
+        self.assertEqual(len(branch["groups"]), 1)
+        folded = branch["groups"][0]
+        self.assertEqual(folded[0]["kind"], "user")
+        self.assertEqual(folded[0]["blocks"][0]["text"], "search things")
+        self.assertEqual(folded[-1]["blocks"][0]["text"], "all done")
+        self.assertEqual(branch["count"], len(folded))
+        self.assertEqual(data["events"][4]["blocks"][0]["text"], "new reply")
+
+    def test_turn_groups_collapse_a_turn_into_one_node(self):
+        groups = claude._turn_groups(self._parallel_turn())
+        turn = {groups[u] for u in ("a1", "a2", "r1", "a3", "p3", "r3", "att3", "r2", "m2")}
+        self.assertEqual(turn, {("m", "msg_1")})
+        self.assertEqual(groups["u1"], ("u", "u1"))
+        # The next assistant message (no message id in this fixture) starts a
+        # new group; the human prompt before the turn is its own group too.
+        self.assertNotEqual(groups["a4"], ("m", "msg_1"))
+        self.assertEqual(groups["u0"], ("u", "u0"))
+
+
 class SyntheticUserNoticeTests(unittest.TestCase):
     def test_known_wrappers_become_notices(self):
         n = claude._synthetic_user_notice("<system-reminder>tick</system-reminder>")
