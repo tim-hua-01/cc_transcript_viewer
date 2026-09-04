@@ -551,6 +551,10 @@ def _turn_metadata(events: list[dict]) -> dict:
     """Collapse generic Codex bookkeeping for one model turn."""
     meta: dict = {}
     raw_types = []
+    # Newer Codex rollouts emit one token_usage_record after every model
+    # response.  Keep the last (therefore cumulative) values for the turn;
+    # event_msg/token_count may follow it and carries only thread-wide totals.
+    latest_turn_usage = None
     for ev in events:
         kind = ev.get("kind")
         if kind == "context":
@@ -571,8 +575,21 @@ def _turn_metadata(events: list[dict]) -> dict:
                 meta["context_window"] = ev["context_window"]
             if ev.get("rate_limits") is not None:
                 meta["rate_limits"] = ev["rate_limits"]
+            if ev.get("turn_token_usage") is not None:
+                latest_turn_usage = ev.get("turn_token_usage") or {}
+                meta["last_response_usage"] = ev.get("response_usage") or {}
+                meta["thread_usage"] = ev.get("thread_token_usage") or {}
+                if ev.get("response_id"):
+                    meta["last_response_id"] = ev["response_id"]
+                for key in ("turn_id", "root_turn_id"):
+                    if ev.get(key):
+                        meta[key] = ev[key]
         elif kind == "raw" and ev.get("record_type"):
             raw_types.append(ev["record_type"])
+    if latest_turn_usage is not None:
+        # A turn's metadata should lead with turn-scoped usage, not the legacy
+        # token_count record's thread-scoped total.
+        meta["usage"] = latest_turn_usage
     if raw_types:
         meta["record_types"] = sorted(set(raw_types))
     return meta
@@ -1234,6 +1251,29 @@ def parse_session(path: Path) -> dict:
                         "approval_policy": payload.get("approval_policy"),
                         "sandbox_policy": payload.get("sandbox_policy"),
                         "summary": payload.get("summary"),
+                    },
+                )
+            )
+            continue
+
+        if typ == "token_usage_record":
+            # Codex >= 0.147 writes detailed response/turn/thread usage as a
+            # top-level rollout record.  Treat it as bookkeeping so the turn
+            # metadata fold consumes it instead of exposing a Raw card.
+            turn_usage = payload.get("turn_token_usage")
+            response_usage = payload.get("usage")
+            events.append(
+                _event_payload(
+                    "tokens",
+                    ts,
+                    {
+                        "usage": turn_usage or response_usage or {},
+                        "response_usage": response_usage or {},
+                        "turn_token_usage": turn_usage,
+                        "thread_token_usage": payload.get("thread_token_usage"),
+                        "turn_id": payload.get("turn_id"),
+                        "root_turn_id": payload.get("root_turn_id"),
+                        "response_id": payload.get("response_id"),
                     },
                 )
             )

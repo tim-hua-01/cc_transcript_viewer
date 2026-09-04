@@ -95,6 +95,87 @@ class CodexReasoningSummaryTests(unittest.TestCase):
         self.assertEqual(reasoning, [])
 
 
+class CodexTokenUsageRecordTests(unittest.TestCase):
+    def test_detailed_usage_is_folded_into_turn_metadata(self):
+        records = [
+            {
+                "timestamp": "2026-09-04T19:00:00Z",
+                "type": "event_msg",
+                "payload": {"type": "task_started", "turn_id": "turn-1"},
+            },
+            {
+                "timestamp": "2026-09-04T19:00:01Z",
+                "type": "event_msg",
+                "payload": {"type": "user_message", "message": "hello"},
+            },
+            {
+                "timestamp": "2026-09-04T19:00:02Z",
+                "type": "event_msg",
+                "payload": {"type": "agent_message", "message": "working"},
+            },
+            {
+                "timestamp": "2026-09-04T19:00:03Z",
+                "type": "token_usage_record",
+                "payload": {
+                    "thread_id": "thread-1",
+                    "turn_id": "turn-1",
+                    "session_id": "thread-1",
+                    "root_turn_id": "turn-1",
+                    "response_id": "resp-1",
+                    "usage": {"input_tokens": 90, "output_tokens": 10},
+                    "turn_token_usage": {"input_tokens": 90, "output_tokens": 10},
+                    "thread_token_usage": {"input_tokens": 900, "output_tokens": 100},
+                },
+            },
+            {
+                "timestamp": "2026-09-04T19:00:04Z",
+                "type": "token_usage_record",
+                "payload": {
+                    "thread_id": "thread-1",
+                    "turn_id": "turn-1",
+                    "session_id": "thread-1",
+                    "root_turn_id": "turn-1",
+                    "response_id": "resp-2",
+                    "usage": {"input_tokens": 95, "output_tokens": 5},
+                    "turn_token_usage": {"input_tokens": 185, "output_tokens": 15},
+                    "thread_token_usage": {"input_tokens": 995, "output_tokens": 105},
+                },
+            },
+            # The legacy aggregate is still emitted after the detailed record.
+            # It must not replace the more useful turn-scoped primary usage.
+            {
+                "timestamp": "2026-09-04T19:00:05Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {"total_token_usage": {"input_tokens": 995, "output_tokens": 105}},
+                },
+            },
+            {
+                "timestamp": "2026-09-04T19:00:06Z",
+                "type": "event_msg",
+                "payload": {"type": "task_complete", "turn_id": "turn-1"},
+            },
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "rollout.jsonl"
+            _write_jsonl(path, records)
+            data = codex.parse_session(path)
+
+        answer = next(event for event in data["events"] if event.get("text") == "working")
+        metadata = answer["turn_metadata"]
+        self.assertEqual(metadata["usage"], {"input_tokens": 185, "output_tokens": 15})
+        self.assertEqual(metadata["last_response_usage"],
+                         {"input_tokens": 95, "output_tokens": 5})
+        self.assertEqual(metadata["thread_usage"],
+                         {"input_tokens": 995, "output_tokens": 105})
+        self.assertEqual(metadata["last_response_id"], "resp-2")
+        self.assertEqual(metadata["turn_id"], "turn-1")
+        self.assertFalse(
+            {"raw", "tokens", "status"} & {event["kind"] for event in data["events"]}
+        )
+
+
 class CodexOrchestrationTests(unittest.TestCase):
     """The JS-literal parser that unpacks generated `tools.name(...)` calls."""
 
