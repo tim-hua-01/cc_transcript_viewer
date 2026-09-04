@@ -29,6 +29,40 @@ and has a [test suite](#privacy--security) that verifies those guarantees.
 > prompt for your own coding agent (it describes the original Claude Code + Codex core; the Cursor
 > and opencode sources came later).
 
+## Do this first: two settings that can't backfill
+
+Both coding agents throw away, by default, exactly the things this viewer is best at showing. Neither
+setting applies retroactively, so change them before you accumulate sessions you wish you could read.
+
+**Claude Code** — edit your global settings at `~/.claude/settings.json`:
+
+```jsonc
+{
+  // Days to keep transcripts before automatic cleanup (default: 30 — after which
+  // they're deleted and this viewer has nothing to show).
+  // A large value effectively keeps them forever (~274 years here).
+  "cleanupPeriodDays": 99999,
+
+  // Persist human-readable thinking summaries. Without this, Claude Code stores
+  // only an encrypted signature for thinking blocks, so they show up empty in
+  // the viewer. With it on, NEW sessions save a readable summary.
+  "showThinkingSummaries": true
+}
+```
+
+Restart Claude Code (or run `/config` once) for the change to take effect. Note this only stops
+*future* deletion — anything already cleaned up is gone.
+
+**Codex** — add to `~/.codex/config.toml`:
+
+```toml
+model_reasoning_summary = "detailed"
+```
+
+Codex doesn't save raw chain-of-thought in readable form for OpenAI models, but with this set it
+saves readable summaries of it. Encrypted-only reasoning records contain no displayable text and are
+omitted by the viewer.
+
 ## Run it
 
 Python 3.9+ and the standard library are all it needs — no `pip install`, no build step:
@@ -242,16 +276,11 @@ the focused parser and server tests with a large screenshot suite.
 
 ## Notes on Codex transcripts
 
-- **Reasoning summaries.** Codex doesn't save raw chain-of-thought in readable form for OpenAI
-  models, but it can save readable summaries when configured. To request them for future sessions,
-  add to `~/.codex/config.toml`:
-
-  ```toml
-  model_reasoning_summary = "detailed"
-  ```
-
-  This doesn't backfill old transcripts. Encrypted-only reasoning records contain no displayable
-  text and are omitted; readable duplicates (written as both `event_msg/agent_reasoning` and
+- **Reasoning summaries.** Readable summaries only exist if you set
+  `model_reasoning_summary = "detailed"` (see [Do this
+  first](#do-this-first-two-settings-that-cant-backfill)), and setting it doesn't backfill old
+  transcripts. Encrypted-only reasoning records contain no displayable text and are omitted;
+  readable duplicates (written as both `event_msg/agent_reasoning` and
   `response_item/reasoning.summary`) are grouped and deduped.
 - **Web search results aren't stored.** Codex records only the search *queries* it issued (the viewer
   lists all of them); the fetched pages are sent to the model but never written to the rollout. The
@@ -351,29 +380,6 @@ one record where Codex keeps two. Tool names and arguments stay opencode's own (
 rather than being renamed. Every part carries its own clock, so timestamps are exact rather than
 inferred. A call with no result (interrupted, or still running) emits the call alone and is
 reported.
-
-## Important: keep your transcripts around
-
-By default **Claude Code deletes chat transcripts after 30 days**, so this viewer can only show what
-hasn't been cleaned up yet. To retain them, edit your global settings at `~/.claude/settings.json`
-and add:
-
-```jsonc
-{
-  // Days to keep transcripts before automatic cleanup (default: 30).
-  // A large value effectively keeps them forever (~274 years here).
-  "cleanupPeriodDays": 99999,
-
-  // Optional but recommended: persist human-readable thinking summaries.
-  // Without this, Claude Code stores only an encrypted signature for thinking
-  // blocks, so they show up empty in the viewer. With it on, NEW sessions save
-  // a readable summary the viewer can display. (It can't backfill old sessions.)
-  "showThinkingSummaries": true
-}
-```
-
-Restart Claude Code (or run `/config` once) for the change to take effect. Note this only stops
-*future* deletion — anything already cleaned up is gone.
 
 ## How it works
 
