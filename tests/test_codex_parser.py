@@ -8,6 +8,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import codex_parser as codex
 from tests.fixture_builders import _write_jsonl
@@ -174,6 +175,31 @@ class CodexTokenUsageRecordTests(unittest.TestCase):
         self.assertFalse(
             {"raw", "tokens", "status"} & {event["kind"] for event in data["events"]}
         )
+
+
+class CodexGeneratedTitleTests(unittest.TestCase):
+    def test_thread_name_is_exposed_like_claude_ai_title(self):
+        records = [{
+            "timestamp": "2026-09-05T12:00:00Z",
+            "type": "event_msg",
+            "payload": {"type": "user_message", "message": "a long initial request"},
+        }]
+        row = {
+            "id": "thread-1",
+            "title": "a long initial request",
+            "name": "Summarize parser metadata",
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "rollout.jsonl"
+            _write_jsonl(path, records)
+            summary = codex.session_summary(path, row)
+            with mock.patch.object(codex, "_read_thread_rows", return_value={str(path): row}):
+                data = codex.parse_session(path)
+
+        self.assertEqual(summary["title"], "a long initial request")
+        self.assertEqual(summary["ai_title"], "Summarize parser metadata")
+        self.assertEqual(data["title"], "a long initial request")
+        self.assertEqual(data["ai_title"], "Summarize parser metadata")
 
 
 class CodexOrchestrationTests(unittest.TestCase):

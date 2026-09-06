@@ -367,7 +367,9 @@ async function loadSessions() {
 // removed, or rewritten (mtime bumps). Lets the poller skip needless rebuilds.
 function sessionsSignature(list) {
   let sig = list.length + "|";
-  for (const s of list) sig += s.file + ":" + (s.mtime || 0) + ":" + (s.custom_title || "") + ";";
+  for (const s of list) {
+    sig += s.file + ":" + (s.mtime || 0) + ":" + (s.custom_title || "") + ":" + (s.ai_title || "") + ";";
+  }
   return sig;
 }
 
@@ -1012,8 +1014,8 @@ function renderTranscript(data, opts = {}) {
     data.custom_title && data.original_title
       ? el("div", { class: "t-aititle", title: "Title derived from the transcript" }, "Original title: " + data.original_title)
       : null,
-    // The agent's own AI-generated session title (Claude Code's /resume label),
-    // shown as a muted subtitle when present and not identical to the prompt title.
+    // The agent's own AI-generated session title, shown as a muted subtitle
+    // when present and not identical to the prompt-derived title.
     data.ai_title && data.ai_title !== data.original_title
       ? el("div", { class: "t-aititle", title: "AI-generated session title" }, "Short title: " + data.ai_title)
       : null,

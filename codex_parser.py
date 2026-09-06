@@ -47,7 +47,7 @@ def _thread_signature(thread_row: dict | None) -> str:
     """Stable fingerprint for SQLite metadata that can change without the JSONL."""
     row = thread_row or {}
     fields = (
-        "id", "title", "preview", "cwd", "updated_at", "updated_at_ms",
+        "id", "title", "name", "preview", "cwd", "updated_at", "updated_at_ms",
         "created_at", "created_at_ms", "archived", "model", "reasoning_effort",
         "tokens_used", "source", "thread_source", "cli_version", "model_provider",
     )
@@ -637,17 +637,22 @@ def _fold_turn_metadata(
 def _read_thread_rows() -> dict[str, dict]:
     if not STATE_DB.exists():
         return {}
-    query = """
-        select id, rollout_path, created_at, updated_at, created_at_ms, updated_at_ms,
-               source, model_provider, cwd, title, tokens_used, archived,
-               cli_version, first_user_message, model, reasoning_effort,
-               thread_source, preview
-        from threads
-    """
+    fields = [
+        "id", "rollout_path", "created_at", "updated_at", "created_at_ms", "updated_at_ms",
+        "source", "model_provider", "cwd", "title", "tokens_used", "archived",
+        "cli_version", "first_user_message", "model", "reasoning_effort",
+        "thread_source", "preview",
+    ]
     rows: dict[str, dict] = {}
     try:
         conn = common.connect_ro(STATE_DB, row_factory=sqlite3.Row)
         try:
+            # `name` was added after the original state_5 schema. Query it when
+            # available without making older Codex databases unreadable.
+            columns = {row[1] for row in conn.execute("pragma table_info(threads)")}
+            if "name" in columns:
+                fields.append("name")
+            query = f"select {', '.join(fields)} from threads"
             for row in conn.execute(query):
                 d = dict(row)
                 if d.get("rollout_path"):
@@ -662,7 +667,7 @@ def _read_thread_rows() -> dict[str, dict]:
 # Bump when the summary computation changes, so cached summaries for
 # unchanged files are recomputed once (e.g. v2 taught the message counters
 # the ≥0.147 item_completed envelope).
-_SUMMARY_VERSION = 2
+_SUMMARY_VERSION = 3
 
 
 def session_summary(path: Path, thread_row: dict | None = None) -> dict:
@@ -763,6 +768,9 @@ def _session_summary_uncached(path: Path, thread_row: dict | None = None) -> dic
         tokens_used=row.get("tokens_used") or 0,
         n_reasoning=n_reasoning,
         archived=bool(row.get("archived", 0)),
+        # Newer Codex versions generate a short thread name independently of
+        # the legacy title/first prompt, analogous to Claude Code's ai-title.
+        ai_title=row.get("name") or "",
     )
     summary.update(subagent_fields)
     return summary
@@ -1118,7 +1126,7 @@ def parse_session(path: Path) -> dict:
             if call_id:
                 web_searches[call_id] = payload
 
-    row = _read_thread_rows().get(str(path))
+    row = _read_thread_rows().get(str(path)) or {}
     if row:
         title = row.get("title") or row.get("preview") or ""
         meta.update(
@@ -1539,6 +1547,7 @@ def parse_session(path: Path) -> dict:
         "agent": _agent_label(meta),
         "id": meta.get("id") or _thread_id_from_path(path),
         "title": title or "(untitled session)",
+        "ai_title": row.get("name") or "",
         "meta": meta,
         "events": events,
         "n_records": len(records),

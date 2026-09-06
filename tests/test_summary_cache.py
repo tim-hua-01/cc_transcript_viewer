@@ -81,10 +81,12 @@ class SummaryCacheTests(unittest.TestCase):
             "payload": {"id": "test-id"},
         }) + "\n", encoding="utf-8")
 
-        first = codex.session_summary(path, {"title": "first"})
-        second = codex.session_summary(path, {"title": "second"})
+        first = codex.session_summary(path, {"title": "first", "name": "short one"})
+        second = codex.session_summary(path, {"title": "second", "name": "short two"})
         self.assertEqual(first["title"], "first")
         self.assertEqual(second["title"], "second")
+        self.assertEqual(first["ai_title"], "short one")
+        self.assertEqual(second["ai_title"], "short two")
 
     def test_dirty_flag_clears_only_when_no_concurrent_update(self):
         cache = common.SummaryCache()

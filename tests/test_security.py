@@ -345,7 +345,7 @@ class SecurityTest(unittest.TestCase):
         )
         self.assertEqual(match["score"], server.NATIVE_TITLE_WEIGHT)
 
-    def test_claude_and_cursor_native_titles_have_half_custom_weight(self):
+    def test_agent_native_titles_have_half_custom_weight(self):
         claude = {
             "agent": "claude",
             "custom_title": "",
@@ -358,6 +358,12 @@ class SecurityTest(unittest.TestCase):
             "custom_title": "",
             "original_title": "Short Cursor title",
         }
+        codex = {
+            "agent": "codex",
+            "custom_title": "",
+            "original_title": "A long Codex prompt",
+            "ai_title": "Short Codex title",
+        }
         custom, native = server._search_title_segments(claude)
         self.assertEqual(custom, "")
         self.assertEqual(native.count("Original Claude title"), 1)
@@ -365,6 +371,10 @@ class SecurityTest(unittest.TestCase):
         self.assertEqual(
             server._search_title_segments(cursor),
             ("", "Short Cursor title"),
+        )
+        self.assertEqual(
+            server._search_title_segments(codex),
+            ("", "A long Codex prompt\nShort Codex title"),
         )
 
     def test_guardian_is_grouped_and_structured(self):

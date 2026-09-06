@@ -554,9 +554,9 @@ def _search_title_segments(session: dict) -> tuple[str, str]:
     """Return viewer-custom and native-title text as distinct score tiers."""
     custom = session.get("custom_title") or ""
     native_titles = []
-    # Sources whose stored titles are AI- or user-authored names (as opposed
-    # to Codex's, which is usually just the first prompt again).
-    if session.get("agent") in {"claude", "cursor", "opencode"}:
+    # Sources with stored AI- or user-authored names. Codex's legacy `title`
+    # is usually the first prompt, but newer versions also expose `ai_title`.
+    if session.get("agent") in {"claude", "codex", "cursor", "opencode"}:
         for title in (
             session.get("original_title"),
             session.get("claude_title"),
