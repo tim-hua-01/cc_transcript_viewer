@@ -32,7 +32,7 @@ const esc = (s) => (s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&l
 const THEMES = [
   { id: "warm", name: "Warm", colors: ["#fffdfa", "#efe8dc", "#c0492a"] },
   { id: "paper", name: "Paper", colors: ["#ffffff", "#e9ecef", "#315ca8"] },
-  { id: "botanical", name: "Botanical", colors: ["#f8faf6", "#e2e8dd", "#586f5b"] },
+  { id: "botanical", name: "Botanical", colors: ["#fbf8ee", "#e8ddbe", "#174f3a"] },
   { id: "lavender", name: "Lavender", colors: ["#faf9fc", "#e6e1e9", "#65557b"] },
   { id: "sorbet", name: "Sorbet", colors: ["#fff9f5", "#eddcd7", "#8e4b61"] },
   { id: "night", name: "Night", colors: ["#171a1f", "#292e37", "#e07a5f"] },

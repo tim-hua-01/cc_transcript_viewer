@@ -29,11 +29,14 @@
 /* Theme palettes only redefine semantic colors; component styling stays shared. */
 :root[data-theme="botanical"] {
   color-scheme: light;
-  --bg: #f8faf6; --bg-alt: #edf1e9; --bg-elev: #e2e8dd; --border: #cdd5c9;
-  --text: #29302a; --muted: #667067; --accent: #586f5b; --user: #466b7d;
-  --assistant: #7b5f51; --thinking: #6b5c83; --tool: #4f7162; --tool-err: #ad4650;
-  --code-bg: #f0f3ed; --focus-ring: rgba(88,111,91,.16);
-  --shadow-color: rgba(41,48,42,.12); --thinking-body: #514b61;
+  /* Warm mineral surfaces keep the forest green concentrated in accents
+     instead of casting a green film over the entire interface. */
+  --bg: #fbf8ee; --bg-alt: #f3eddd; --bg-elev: #e8ddbe; --border: #d4c49c;
+  --text: #202820; --muted: #6c6454; --accent: #174f3a; --user: #205b50;
+  --assistant: #765515; --thinking: #665478; --tool: #315f42; --tool-err: #a63f49;
+  --code-bg: #f6f1e5; --focus-ring: rgba(23,79,58,.17);
+  --shadow-color: rgba(55,43,20,.14); --thinking-body: #51495c;
+  --diff-add-text: #48620f; --diff-del-text: #a32d2d;
 }
 :root[data-theme="paper"] {
   color-scheme: light;
@@ -187,6 +190,7 @@ body.standalone.sidebar-collapsed .edge-toggle-left { display: none; }
   width: 0.85em; height: 0.85em; flex: none; border-radius: 2px;
   background: #2a55a0;  /* matches the blue square on tim-hua-01.github.io */
 }
+:root[data-theme="botanical"] .brand-mark { background: var(--accent); }
 .theme-picker { position: relative; margin-left: auto; font-weight: 400; }
 .theme-toggle {
   height: 26px; padding: 0 7px; display: flex; align-items: center; gap: 5px;
