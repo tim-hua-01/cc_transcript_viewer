@@ -389,6 +389,9 @@ const SELECTED_MODELS = new Set();
 const SELECTED_DIRS = new Set();
 // Inclusive local-date range over a session's last activity; "" = unbounded.
 const DATE_FILTER = { from: "", to: "" };
+// The sessions the sidebar currently lists, after every filter and the
+// search box; the prompt export acts on exactly this set.
+let VISIBLE_SESSIONS = [];
 // Parent session file keys whose linked subagent subtrees are hidden.
 // Kept outside renderSidebar so live polling does not reopen collapsed groups.
 const COLLAPSED_SUBAGENT_PARENTS = new Set();
@@ -574,8 +577,46 @@ function makeDateDropdown(onChange) {
   });
   panel.append(clear);
 
+  // Lives here because this panel is where "last week" gets chosen: pick a
+  // range, then copy every prompt you typed in it (across the listed sessions).
+  if (!STANDALONE) {
+    panel.append(el("button", {
+      class: "dd-clear dd-copy-prompts",
+      onclick: copyPromptsMarkdown,
+      title: "Copy every prompt you typed in the sessions listed below, as Markdown grouped by session",
+    }, "Copy my prompts as Markdown"));
+  }
+
   updateCount();
   return wrap;
+}
+
+// Copy the user prompts of every listed session (sub-agents excluded on the
+// server) to the clipboard as one Markdown document, honoring the date range.
+async function copyPromptsMarkdown(e) {
+  const button = e.currentTarget;
+  const original = button.textContent;
+  if (button.dataset.busy === "1") return;
+  button.dataset.busy = "1";
+  button.textContent = "Collecting…";
+  try {
+    const files = VISIBLE_SESSIONS.filter((s) => !s.is_subagent).map((s) => s.file);
+    const res = await fetch("/api/prompts", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ files, from: DATE_FILTER.from, to: DATE_FILTER.to }),
+    });
+    const payload = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(payload.error || `HTTP ${res.status}`);
+    await writeClipboard(payload.markdown || "");
+    const n = payload.prompts || 0;
+    flashLabel(button, n ? `Copied ${n} prompt${n === 1 ? "" : "s"}` : "No prompts in range", 1600, original);
+  } catch (error) {
+    button.title = "Could not copy prompts: " + String(error);
+    flashLabel(button, "Copy failed", 1600, original);
+  } finally {
+    delete button.dataset.busy;
+  }
 }
 
 // The dropdowns' option sets. Rebuilding the dropdowns closes any open panel,
@@ -679,6 +720,7 @@ function renderSidebar(query) {
     chip.hidden = n === 0 && a !== "all" && a !== AGENT_FILTER;
   }
 
+  VISIBLE_SESSIONS = matches;
   const matchedByFile = new Map(matches.map((s) => [s.file, s]));
   const subagentCounts = new Map();
   for (const s of matches) {

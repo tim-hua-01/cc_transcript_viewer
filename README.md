@@ -172,6 +172,14 @@ accumulated.
   their trigger, before/after token counts, duration, and preserved message/tool counts. Codex
   boundaries show the context-window number, replacement-item count, and whether the replacement
   summary is encrypted and therefore unreadable from the transcript.
+- **Copy your own prompts across sessions as Markdown.** Open the sidebar's **Date** dropdown and
+  click **Copy my prompts as Markdown**. It copies every prompt you typed in the sessions currently
+  listed (so the agent chips, model/directory filters, date range, and search box all narrow it),
+  grouped by session with the title, project, and session id, and one `###` heading per prompt
+  with its local date and time. Prompts outside the chosen date range are dropped even when their
+  session is listed, sub-agent sessions are skipped (their "user" turns are the parent agent's
+  instructions), and abandoned branches are marked. Paste the result into any model and ask it
+  "when did I say I'd drop that task?".
 - **Save transcript as a self-contained HTML file.** **Save HTML**, in the transcript controls,
   downloads the open session as a single `.html` file you can hand to someone else — no server, no
   `~/.claude` / `~/.codex` / Cursor or opencode database, no other sessions. It is the viewer's own

@@ -34,6 +34,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -737,6 +738,140 @@ def search_sessions(query: str) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# Prompt export: every user prompt from a set of sessions, as one Markdown
+# document (for pasting into another model and asking "when did I say X?").
+# ---------------------------------------------------------------------------
+_DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+PROMPT_EXPORT_MAX_SESSIONS = 2000
+_AGENT_LABELS = {"claude": "Claude", "codex": "Codex", "cursor": "Cursor", "opencode": "opencode"}
+
+
+def _prompt_text(ev: dict) -> str:
+    """The human-typed text of a `user` event (either message shape)."""
+    blocks = ev.get("blocks")
+    if not blocks:
+        return (ev.get("text") or "").strip()
+    parts = [b.get("text") for b in blocks if b.get("type") == "text" and b.get("text")]
+    if any(b.get("type") == "image" for b in blocks):
+        parts.append("[image attached]")
+    return "\n".join(parts).strip()
+
+
+def _local_day_and_time(ts) -> tuple[str, str]:
+    """("YYYY-MM-DD", "HH:MM") in local time for an ISO timestamp, or ("", "")."""
+    if not isinstance(ts, str) or not ts:
+        return "", ""
+    try:
+        parsed = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except ValueError:
+        return "", ""
+    local = parsed.astimezone() if parsed.tzinfo else parsed
+    return local.strftime("%Y-%m-%d"), local.strftime("%H:%M")
+
+
+def _session_prompts(data: dict, from_day: str, to_day: str) -> list[tuple[str, str, str, bool]]:
+    """[(day, time, text, in_abandoned_branch)] for each real user prompt
+    inside the local-day window; an undated prompt is kept only when no
+    window is set."""
+    out: list[tuple[str, str, str, bool]] = []
+
+    def walk(events, abandoned: bool) -> None:
+        for ev in events or []:
+            if ev.get("kind") == "branch":
+                for group in ev.get("groups", []) or []:
+                    walk(group, True)
+            elif ev.get("kind") == "user":
+                text = _prompt_text(ev)
+                if not text:
+                    continue
+                day, time = _local_day_and_time(ev.get("ts"))
+                if from_day or to_day:
+                    if not day:
+                        continue
+                    if from_day and day < from_day:
+                        continue
+                    if to_day and day > to_day:
+                        continue
+                out.append((day, time, text, abandoned))
+
+    walk(data.get("events"), False)
+    return out
+
+
+def prompts_markdown(file_ids: list[str], from_day: str = "", to_day: str = "") -> dict:
+    """Build the Markdown prompt digest for `file_ids` (in the given order).
+
+    Only sessions the sidebar lists are included, and sub-agents are skipped:
+    their "user" turns are the parent agent's instructions, not the person.
+    Returns {"markdown", "sessions", "prompts"}.
+    """
+    listed = {s["file"]: s for s in list_sessions() if not s.get("is_subagent")}
+    seen: set[str] = set()
+    sections: list[str] = []
+    n_sessions = n_prompts = 0
+    for file_id in file_ids:
+        summary = listed.get(file_id)
+        if summary is None or file_id in seen:
+            continue
+        seen.add(file_id)
+        try:
+            data = load_session(file_id)
+        except Exception:  # noqa: BLE001 — one unreadable session must not sink the export
+            data = None
+        if not data:
+            continue
+        prompts = _session_prompts(data, from_day, to_day)
+        if not prompts:
+            continue
+        n_sessions += 1
+        n_prompts += len(prompts)
+        label = _AGENT_LABELS.get(summary.get("agent"), summary.get("agent") or "")
+        title = (summary.get("title") or data.get("title") or "(untitled session)").strip()
+        lines = [f"## [{label}] {title}"]
+        cwd = (data.get("meta") or {}).get("cwd") or summary.get("cwd")
+        if cwd:
+            lines.append(f"- Project: {cwd}")
+        if summary.get("git_branch"):
+            lines.append(f"- Branch: {summary['git_branch']}")
+        last_day, last_time = _local_day_and_time(summary.get("last_ts"))
+        if last_day:
+            lines.append(f"- Last active: {last_day} {last_time}")
+        lines.append(f"- Session: {summary.get('id') or data.get('id') or file_id}")
+        lines.append(f"- Prompts: {len(prompts)}")
+        lines.append("")
+        for day, time, text, abandoned in prompts:
+            when = f"{day} {time}".strip() or "undated"
+            suffix = " (abandoned branch)" if abandoned else ""
+            lines.append(f"### {when}{suffix}")
+            lines.append("")
+            lines.append(text)
+            lines.append("")
+        sections.append("\n".join(lines))
+
+    if from_day and to_day:
+        span = f"{from_day} to {to_day}"
+    elif from_day:
+        span = f"since {from_day}"
+    elif to_day:
+        span = f"through {to_day}"
+    else:
+        span = "all time"
+    head = [
+        f"# My prompts, {span}",
+        "",
+        f"{n_prompts} prompts across {n_sessions} sessions, in the viewer's current order "
+        "(newest activity first unless a search is active). Each `##` is one session; "
+        "each `###` is one prompt with its local date and time.",
+        "",
+    ]
+    return {
+        "markdown": "\n".join(head + sections).rstrip() + "\n",
+        "sessions": n_sessions,
+        "prompts": n_prompts,
+    }
+
+
+# ---------------------------------------------------------------------------
 # HTTP server
 # ---------------------------------------------------------------------------
 # The frontend's three files, served with explicit types (see _send_file for
@@ -973,6 +1108,9 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         route = urlparse(self.path).path
+        if route == "/api/prompts":
+            self._post_prompts()
+            return
         if route not in ("/api/open-local", "/api/reveal-transcript"):
             self.send_error(404)
             return
@@ -1010,6 +1148,35 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json({"error": f"could not open file: {e}"}, status=500)
             return
         self._send_json({"opened": str(opened)})
+
+    def _post_prompts(self):
+        """POST /api/prompts {files: [...], from?: "YYYY-MM-DD", to?: "YYYY-MM-DD"}
+        -> {markdown, sessions, prompts}. Session ids are a long list, hence
+        the larger body cap; each one still has to be a listed session."""
+        body = self._read_json_body(max_len=512 * 1024)
+        if body is None:
+            return
+        files = body.get("files")
+        if (
+            not isinstance(files, list)
+            or len(files) > PROMPT_EXPORT_MAX_SESSIONS
+            or not all(isinstance(f, str) and f for f in files)
+        ):
+            self._send_json({"error": "files must be a list of session ids"}, status=400)
+            return
+        days = []
+        for key in ("from", "to"):
+            value = body.get(key) or ""
+            if not isinstance(value, str) or (value and not _DAY_RE.match(value)):
+                self._send_json({"error": f"{key} must be YYYY-MM-DD"}, status=400)
+                return
+            days.append(value)
+        try:
+            result = prompts_markdown(files, *days)
+        except Exception as e:  # noqa: BLE001
+            self._send_json({"error": str(e)}, status=500)
+            return
+        self._send_json(result)
 
     def do_PUT(self):
         if HOST_CHECK and not self._host_allowed():
