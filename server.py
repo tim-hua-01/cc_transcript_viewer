@@ -550,9 +550,9 @@ def open_local_file(file_id: str, path_value: str) -> Path:
 # ---------------------------------------------------------------------------
 # Full-text search across transcript content
 # ---------------------------------------------------------------------------
-# Cache: session file id -> (mtime, all_user_message_text, rest_of_text).
+# Cache: session file id -> (mtime, user text, rest, normalized user, normalized rest).
 # Ids are transcript paths or synthetic database schemes, matching /api/session.
-_TEXT_CACHE: dict[str, tuple[float, str, str]] = {}
+_TEXT_CACHE: dict[str, tuple[float, str, str, str, str]] = {}
 
 # User prompts should outrank generated/tool output without overwhelming a
 # custom title selected specifically to identify the transcript.
@@ -561,9 +561,12 @@ CUSTOM_TITLE_WEIGHT = 10_000
 NATIVE_TITLE_WEIGHT = CUSTOM_TITLE_WEIGHT // 2
 
 
-# Input fields worth indexing on a flat-shape (Codex) tool call, including the
-# nested calls an orchestration-style exec unpacks into.
-_FLAT_INPUT_SEARCH_KEYS = ("cmd", "command", "file_path", "query", "prompt")
+# Input text from all tool shapes, including file edits and nested exec calls.
+_TOOL_INPUT_SEARCH_KEYS = (
+    "cmd", "command", "file_path", "pattern", "query", "prompt", "description", "content", "url",
+    "old_string", "new_string", "old_str", "new_str", "old_text", "new_text",
+    "patch", "patch_text", "diff",
+)
 
 
 def _event_text(ev: dict) -> list[str]:
@@ -574,14 +577,23 @@ def _event_text(ev: dict) -> list[str]:
         if x and isinstance(x, str):
             parts.append(x)
 
+    def add_input(inp):
+        if isinstance(inp, str):
+            add(inp)
+        elif isinstance(inp, dict):
+            for k in _TOOL_INPUT_SEARCH_KEYS:
+                add(inp.get(k))
+            for call in inp.get("calls") or []:
+                if isinstance(call, dict):
+                    add_input(call.get("input"))
+            for edit in inp.get("edits") or []:
+                add_input(edit)
+
     if ev.get("blocks"):  # block shape (Claude Code / Cursor / opencode)
         for b in ev["blocks"]:
             add(b.get("text"))
             if b.get("type") == "tool_use":
-                inp = b.get("input") or {}
-                if isinstance(inp, dict):
-                    for k in ("command", "file_path", "pattern", "query", "prompt", "description", "content", "url"):
-                        add(inp.get(k))
+                add_input(b.get("input"))
                 res = b.get("result") or {}
                 if isinstance(res, dict):
                     add(res.get("text"))
@@ -589,19 +601,7 @@ def _event_text(ev: dict) -> list[str]:
         add(ev.get("text"))
         add(ev.get("summary"))
         add(ev.get("query"))
-        inp = ev.get("input")
-        if isinstance(inp, str):
-            add(inp)
-        elif isinstance(inp, dict):
-            for k in _FLAT_INPUT_SEARCH_KEYS:
-                add(inp.get(k))
-            for call in inp.get("calls") or []:
-                nested = call.get("input") if isinstance(call, dict) else None
-                if isinstance(nested, str):
-                    add(nested)
-                elif isinstance(nested, dict):
-                    for k in _FLAT_INPUT_SEARCH_KEYS:
-                        add(nested.get(k))
+        add_input(ev.get("input"))
         res = ev.get("result")
         if isinstance(res, dict):
             add(res.get("output"))
@@ -650,7 +650,7 @@ def _session_segments(data: dict) -> tuple[str, str]:
     return "\n".join(user), "\n".join(rest)
 
 
-def session_segments(s: dict) -> tuple[str, str]:
+def session_segments(s: dict, *, normalized: bool = False) -> tuple[str, str]:
     """(user messages, rest) for one session, cached by its mtime.
 
     Works for both real transcript files and synthetic-id sessions (the
@@ -660,15 +660,15 @@ def session_segments(s: dict) -> tuple[str, str]:
     key = s.get("file", "")
     mtime = s.get("mtime") or 0
     cached = _TEXT_CACHE.get(key)
-    if cached and cached[0] == mtime:
-        return cached[1], cached[2]
-    try:
-        data = load_session(key)
-    except Exception:  # noqa: BLE001
-        data = None
-    user, rest = _session_segments(data) if data else ("", "")
-    _TEXT_CACHE[key] = (mtime, user, rest)
-    return user, rest
+    if not cached or cached[0] != mtime:
+        try:
+            data = load_session(key)
+        except Exception:  # noqa: BLE001
+            data = None
+        user, rest = _session_segments(data) if data else ("", "")
+        cached = (mtime, user, rest, common.normalize_search_text(user), common.normalize_search_text(rest))
+        _TEXT_CACHE[key] = cached
+    return (cached[3], cached[4]) if normalized else (cached[1], cached[2])
 
 
 def _search_title_segments(session: dict) -> tuple[str, str]:
@@ -688,6 +688,53 @@ def _search_title_segments(session: dict) -> tuple[str, str]:
     return custom, "\n".join(native_titles)
 
 
+def _search_snippet(text: str, normalized: str, index: int, length: int) -> tuple[str, int]:
+    """Map a normalized match back to the original text, including length changes.
+
+    Line boundaries are safe normalization boundaries: locating the line first
+    avoids repeatedly normalizing huge transcript prefixes. Only the matching
+    lines need a character-level boundary search. No per-character maps are cached.
+    """
+    same_offsets = len(text) == len(normalized) and text.lower() == normalized
+
+    def source_offset(line, offset):
+        lo, hi = 0, len(line)
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if len(common.normalize_search_text(line[:mid])) < offset:
+                lo = mid + 1
+            else:
+                hi = mid
+        return lo
+
+    if same_offsets:
+        idx, end = index, index + length
+    else:
+        idx = end = None
+        source_cursor = normalized_cursor = 0
+        for line in text.splitlines(keepends=True):
+            folded = common.normalize_search_text(line)
+            if folded:
+                line_end = normalized_cursor + len(folded)
+                if idx is None and normalized_cursor <= index < line_end:
+                    idx = source_cursor + source_offset(line, index - normalized_cursor + 1) - 1
+                last = index + length - 1
+                if normalized_cursor <= last < line_end:
+                    end = source_cursor + source_offset(line, last - normalized_cursor + 1)
+                    break
+                normalized_cursor = line_end + 1  # collapsed line separator
+            source_cursor += len(line)
+        # Defensive fallback for unusual Unicode line-separator behavior.
+        if idx is None or end is None:
+            idx = source_offset(text, index + 1) - 1
+            end = source_offset(text, index + length)
+    start = max(0, idx - 50)
+    snippet = " ".join(text[start:end + 70].split())
+    if start > 0:
+        snippet = "…" + snippet
+    return snippet, idx
+
+
 def search_sessions(query: str) -> list[dict]:
     """Return [{file, snippet, score}] for sessions whose content matches `query`.
 
@@ -695,15 +742,16 @@ def search_sessions(query: str) -> list[dict]:
     half that weight, followed by user messages and ordinary transcript text.
     Among equal scores, an earlier first occurrence wins.
     """
-    q = (query or "").strip().lower()
+    q = common.normalize_search_text(query)
     if not q:
         return []
     out = []
     for s in list_sessions():
         user, rest = session_segments(s)
         custom, native = _search_title_segments(s)
-        custom_low = custom.lower()
-        native_low, user_low, rest_low = native.lower(), user.lower(), rest.lower()
+        custom_low = common.normalize_search_text(custom)
+        native_low = common.normalize_search_text(native)
+        user_low, rest_low = session_segments(s, normalized=True)
         c_custom = custom_low.count(q)
         c_native = native_low.count(q)
         c_user = user_low.count(q)
@@ -717,21 +765,15 @@ def search_sessions(query: str) -> list[dict]:
             + c_rest
         )
         if c_custom:
-            combined, idx = custom, custom_low.find(q)
-            pos = idx
+            combined, normalized, offset = custom, custom_low, 0
         elif c_native:
-            combined, idx = native, native_low.find(q)
-            pos = len(custom) + idx
+            combined, normalized, offset = native, native_low, len(custom)
         elif c_user:
-            combined, idx = user, user_low.find(q)
-            pos = len(custom) + len(native) + idx
+            combined, normalized, offset = user, user_low, len(custom) + len(native)
         else:
-            combined, idx = rest, rest_low.find(q)
-            pos = len(custom) + len(native) + len(user) + idx
-        start = max(0, idx - 50)
-        snippet = combined[start:idx + len(q) + 70].replace("\n", " ").strip()
-        if start > 0:
-            snippet = "…" + snippet
+            combined, normalized, offset = rest, rest_low, len(custom) + len(native) + len(user)
+        snippet, idx = _search_snippet(combined, normalized, normalized.find(q), len(q))
+        pos = offset + idx
         out.append({"file": s["file"], "snippet": snippet, "score": score, "pos": pos})
     out.sort(key=lambda m: (-m["score"], m["pos"]))
     return out

@@ -664,10 +664,21 @@ function buildFilters() {
   host.append(makeDateDropdown(() => renderSidebar($("#search").value)));
 }
 
+// Keep these search-only rules in sync with common.normalize_search_text().
+function normalizeSearchText(value) {
+  const fold = (text) => text
+    .replace(/[‘’‚‛′‵ʼ]/g, "'")
+    .replace(/[“”„‟″‶«»]/g, '"')
+    .replace(/[‐‑‒–—―−]/g, "-")
+    .replace(/[\u00ad\u200b\u200c\u200d\u2060\ufeff]/g, "");
+  return fold(fold(value || "").normalize("NFKC")).toLowerCase()
+    .replace(/[\s\u0085\u001c-\u001f]+/g, " ").trim();
+}
+
 function renderSidebar(query) {
   const list = $("#session-list");
   list.innerHTML = "";
-  const q = query.trim().toLowerCase();
+  const q = normalizeSearchText(query);
 
   // Every filter except the agent chips, which are handled by the caller —
   // the chips display counts of what selecting them would show.
@@ -682,10 +693,10 @@ function renderSidebar(query) {
       if (DATE_FILTER.to && day > DATE_FILTER.to) return false;
     }
     if (!q) return true;
-    const metaHit = (
+    const metaHit = normalizeSearchText(
       s.title + " " + (s.original_title || "") + " " + (s.ai_title || "") + " " +
       (s.cwd || "") + " " + s.id + " " + s.agent
-    ).toLowerCase().includes(q);
+    ).includes(q);
     const contentHit = CONTENT_MATCHES && CONTENT_MATCHES.has(s.file);
     return metaHit || contentHit;
   };

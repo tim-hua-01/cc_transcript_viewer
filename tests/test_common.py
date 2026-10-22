@@ -4,8 +4,19 @@
 from __future__ import annotations
 
 import unittest
+import json
+from pathlib import Path
 
 import common
+
+
+class SearchNormalizationTests(unittest.TestCase):
+    def test_search_equivalences_and_literal_code_punctuation(self):
+        cases = json.loads((Path(__file__).parent / "fixtures/search_normalization.json").read_text())
+        for source, expected in cases:
+            with self.subTest(source=source):
+                self.assertEqual(common.normalize_search_text(source), expected)
+                self.assertEqual(common.normalize_search_text(expected), expected)
 
 
 class ShortTitleTests(unittest.TestCase):

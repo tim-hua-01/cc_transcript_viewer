@@ -1,0 +1,16 @@
+[
+  ["Ada’s example", "ada's example"],
+  ["‘single’ ‚quotes‛ ′prime‵ ʼapostrophe", "'single' 'quotes' 'prime' 'apostrophe"],
+  ["“double” „quotes‟ «guillemets» ″prime‶", "\"double\" \"quotes\" \"guillemets\" \"prime\""],
+  ["a‐b‑c‒d–e—f―g−h", "a-b-c-d-e-f-g-h"],
+  ["Wait…", "wait..."],
+  ["Ｆｕｌｌｗｉｄｔｈ ﬃ ﬁ", "fullwidth ffi fi"],
+  ["Cafe\u0301", "café"],
+  ["CAFÉ", "café"],
+  [" \t line\r\n\n  breaks\t and  spaces ", "line breaks and spaces"],
+  ["non\u00a0breaking\u202fthin\u2009spaces", "non breaking thin spaces"],
+  ["\ufeffin\u200bvi\u200csi\u200dble\u2060 soft\u00adhyphen", "invisible softhyphen"],
+  ["one\u0085two\u001cthree", "one two three"],
+  ["C++ != C#; /tmp/foo_bar.py --flag x-y", "c++ != c#; /tmp/foo_bar.py --flag x-y"],
+  ["\t\u200b\u00a0\ufeff", ""]
+]

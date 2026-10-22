@@ -12,8 +12,10 @@ from __future__ import annotations
 
 import json
 import mimetypes
+import re
 import sqlite3
 import threading
+import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -21,6 +23,26 @@ from pathlib import Path
 # URLs on it, server.py routes it, and export_html.py rewrites it into data:
 # URIs — one constant so a rename can't silently break image embedding.
 LOCAL_IMAGE_ROUTE = "/api/local-image"
+
+
+# Keep these rules in sync with normalizeSearchText() in static/app.js.
+_SEARCH_TRANSLATION = str.maketrans({
+    **dict.fromkeys("‘’‚‛′‵ʼ", "'"),
+    **dict.fromkeys("“”„‟″‶«»", '"'),
+    **dict.fromkeys("‐‑‒–—―−", "-"),
+    **dict.fromkeys("\u00ad\u200b\u200c\u200d\u2060\ufeff", None),
+})
+
+
+def normalize_search_text(text: str) -> str:
+    """Search-only folding of case, typography, Unicode forms and whitespace.
+
+    Keep operators and ordinary punctuation significant (C++, paths, etc.).
+    Transcript rendering and snippets always retain their source typography.
+    """
+    text = unicodedata.normalize("NFKC", (text or "").translate(_SEARCH_TRANSLATION))
+    text = text.translate(_SEARCH_TRANSLATION).lower()
+    return re.sub(r"\s+", " ", text).strip()
 
 
 def iter_jsonl(path: Path):

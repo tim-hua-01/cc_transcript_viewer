@@ -173,6 +173,29 @@ class StandaloneBrowserJourneyTests(unittest.TestCase):
             "regressionVisible", "sourceFailureVisible", "rowTagged", "gapExplained", "cleanLockHidden",
         ), True))
 
+    def test_search_normalization_and_sidebar_metadata(self):
+        cases = json.loads((Path(__file__).parent / "fixtures/search_normalization.json").read_text())
+        rendered = export_html.build_standalone_html(codex.parse_session(FIXTURE))
+        rendered = re.sub(r'<script\b[^>]*\bsrc="https://[^"]+"[^>]*></script>', "", rendered)
+        rendered = re.sub(r'<link\b[^>]*\bhref="https://[^"]+"[^>]*>', "", rendered)
+        summary = dict(codex.session_summary(FIXTURE), title="Ada's oﬃce", cwd="/tmp/Ｆｏｌｄｅｒ")
+        probe = """<script>
+          SESSIONS = [__SUMMARY__];
+          CONTENT_MATCHES = null;
+          const counts = ["Ada’s office", "/tmp/Folder"].map((query) => {
+            renderSidebar(query);
+            return VISIBLE_SESSIONS.length;
+          });
+          document.body.setAttribute("data-test-probe", encodeURIComponent(JSON.stringify({
+            normalized: __CASES__.map(([source]) => normalizeSearchText(source)),
+            counts,
+          })));
+        </script>""".replace("__SUMMARY__", json.dumps(summary)).replace("__CASES__", json.dumps(cases))
+        rendered = rendered.replace("</body>", probe + "\n</body>", 1)
+        result = self.probe_page(rendered)
+        self.assertEqual(result["normalized"], [expected for _, expected in cases])
+        self.assertEqual(result["counts"], [1, 1])
+
     def probe_page(self, rendered, budget_ms=1000):
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)

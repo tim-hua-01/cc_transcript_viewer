@@ -128,7 +128,11 @@ accumulated.
   prompts, replies, reasoning, tool commands/paths/queries/outputs — in addition to titles and
   directories, and shows a snippet of the match. Viewer custom-title matches receive `10,000×`
   weight, native Claude/Cursor/opencode titles receive `5,000×`, every user-message match receives `50×`,
-  and ordinary transcript-content matches receive `1×`. Powered by `/api/search` with an
+  and ordinary transcript-content matches receive `1×`. Matching ignores case and normalizes
+  smart quotes, Unicode dashes/ellipsis, compatibility characters (such as full-width letters
+  and ligatures), repeated whitespace/line breaks, and common invisible formatting characters.
+  The same rules apply to sidebar metadata; snippets retain the original text. File-edit
+  replacements and patch bodies are searchable too. Powered by `/api/search` with an
   mtime-keyed cache.
 - **Filters that compose.**
   - **All / Claude / Codex / Cursor / opencode** chips, each showing a live session count under the
