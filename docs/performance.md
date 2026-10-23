@@ -106,7 +106,10 @@ already in place).
 One small, separately tested commit per step, with a `bench.py` run before
 and after. Steps 1–3 are independent; 4 depends on 3.
 
-### 1. Stop shipping `result.structured` (Finding 1)
+### 1. Stop shipping `result.structured` (Finding 1) — done, `fa0bf28`
+
+Result: the 133 MB transcript's response went from 60 MB to 33 MB, and the
+121 MB one's from 7.1 MB to 4.2 MB.
 
 Remove the field from `claude_parser.parse_session`'s tool-result dicts.
 Expected: the 133 MB transcript's response goes from 60 MB to about 35 MB, with
@@ -114,7 +117,10 @@ the matching cut in browser parse time and JS heap. Risk: something reads it
 that grep missed. Check: the frontend, export and search code have no reference
 to it, and the full suite and browser tests pass.
 
-### 2. Faster `normalize_search_text` (Finding 2)
+### 2. Faster `normalize_search_text` (Finding 2) — done, `2a3622a`
+
+Result: the cold first search went from 15.2 s to 8.8 s; repeat searches are
+unchanged.
 
 Replace both `translate` calls with a compiled character-class regex whose
 replacement function looks up the same `_SEARCH_TRANSLATION` table, so there's
