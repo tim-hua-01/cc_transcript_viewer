@@ -3,8 +3,11 @@
 
 from __future__ import annotations
 
-import unittest
 import json
+import random
+import re
+import unicodedata
+import unittest
 from pathlib import Path
 
 import common
@@ -17,6 +20,25 @@ class SearchNormalizationTests(unittest.TestCase):
             with self.subTest(source=source):
                 self.assertEqual(common.normalize_search_text(source), expected)
                 self.assertEqual(common.normalize_search_text(expected), expected)
+
+    def test_matches_the_straightforward_translate_implementation(self):
+        # The regex-gated translation is an optimization; its output must
+        # match plain str.translate exactly, on every kind of input it folds.
+        def reference(text):
+            text = unicodedata.normalize("NFKC", text.translate(common._SEARCH_TRANSLATION))
+            return re.sub(r"\s+", " ", text.translate(common._SEARCH_TRANSLATION).lower()).strip()
+
+        alphabet = (
+            [chr(c) for c in common._SEARCH_TRANSLATION]
+            + list("aZ9 _-'\"\t\n\r\u00a0\u2003\u3000")
+            + ["\u0301", "\u0308", "e\u0301", "\ufb01", "\uff21", "\u2460", "\u00bd",
+               "\u212b", "\u03a3", "\u0130", "\u00df", "\U0001f600", "\u2018\u0301"]
+        )
+        rng = random.Random(0)
+        for _ in range(2000):
+            text = "".join(rng.choice(alphabet) for _ in range(rng.randint(0, 24)))
+            with self.subTest(text=text):
+                self.assertEqual(common.normalize_search_text(text), reference(text))
 
 
 class ShortTitleTests(unittest.TestCase):

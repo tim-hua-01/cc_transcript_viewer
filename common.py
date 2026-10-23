@@ -34,15 +34,28 @@ _SEARCH_TRANSLATION = str.maketrans({
 })
 
 
+# The characters _SEARCH_TRANSLATION rewrites, as one class. They are rare,
+# so finding them with a regex and mapping only the matches is several times
+# faster than str.translate, which looks up every character of the text.
+_SEARCH_SPECIAL = re.compile(
+    "[" + "".join(re.escape(chr(c)) for c in _SEARCH_TRANSLATION) + "]"
+)
+_WHITESPACE_RUN = re.compile(r"\s+")
+
+
+def _translate_search(text: str) -> str:
+    return _SEARCH_SPECIAL.sub(lambda m: _SEARCH_TRANSLATION[ord(m.group())] or "", text)
+
+
 def normalize_search_text(text: str) -> str:
     """Search-only folding of case, typography, Unicode forms and whitespace.
 
     Keep operators and ordinary punctuation significant (C++, paths, etc.).
     Transcript rendering and snippets always retain their source typography.
     """
-    text = unicodedata.normalize("NFKC", (text or "").translate(_SEARCH_TRANSLATION))
-    text = text.translate(_SEARCH_TRANSLATION).lower()
-    return re.sub(r"\s+", " ", text).strip()
+    text = unicodedata.normalize("NFKC", _translate_search(text or ""))
+    text = _translate_search(text).lower()
+    return _WHITESPACE_RUN.sub(" ", text).strip()
 
 
 def iter_jsonl(path: Path, skip_line=None):
