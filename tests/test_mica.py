@@ -24,6 +24,9 @@ from unittest import mock
 from urllib.parse import quote
 
 import claude_parser as claude
+import codex_parser as codex
+import cursor_parser as cursor
+import opencode_parser as opencode
 import server
 from tests.fixture_builders import (
     _write_fixture_session,
@@ -604,8 +607,16 @@ class ViewerIntegration(CaptureTestCase):
 
     def setUp(self):
         super().setUp()
-        self._old_projects = claude.PROJECTS_DIR
+        self._old_sources = (claude.PROJECTS_DIR, codex.CODEX_HOME,
+                             (cursor.DB_PATH, cursor.PROJECTS_DIR, cursor.CHATS_DIR),
+                             opencode.DB_PATH)
+        # Every source, not just Claude: otherwise the viewer lists (and
+        # search loads) the real ~/.codex, Cursor, and opencode sessions.
         claude.configure(self.projects)
+        codex.configure(self.tmp / "home" / ".codex")
+        cursor.configure(self.tmp / "cursor-db", projects_dir=self.tmp / "cursor-projects",
+                         chats_dir=self.tmp / "cursor-chats")
+        opencode.configure(self.tmp / "opencode" / "opencode.db")
         self._old_files = patch_server_files(server, self.tmp)
         self._old_mica = server.MICA
         self.live = _write_fixture_session(self.projects, "aaaaaaaa-0000-4000-8000-000000000001", "live prompt")
@@ -623,7 +634,11 @@ class ViewerIntegration(CaptureTestCase):
         stop_http_server(self.httpd, self.thread)
         server.MICA = self._old_mica
         restore_server_files(server, self._old_files)
-        claude.configure(self._old_projects)
+        projects, codex_home, (cursor_db, cursor_projects, cursor_chats), opencode_db = self._old_sources
+        claude.configure(projects)
+        codex.configure(codex_home)
+        cursor.configure(cursor_db, projects_dir=cursor_projects, chats_dir=cursor_chats)
+        opencode.configure(opencode_db)
         super().tearDown()
 
     def get_json(self, path):
