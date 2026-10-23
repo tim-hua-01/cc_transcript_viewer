@@ -529,6 +529,12 @@ Claude Code stores each session as a JSONL file at
 - Metadata lines include `ai-title`, `custom-title`, `agent-name`, `pr-link`, `attachment` (hook
   output), and `system` records such as compaction boundaries and `compactMetadata`. Some other
   operational records are ignored.
+- Newer versions also log each raw API request: `api-request` (per-call params plus the hashes of
+  the messages sent), `api-request-blob` (those messages, content-addressed), and
+  `api-request-shape` (the system prompt and tool definitions). Together these can be a third or
+  more of the file. The viewer shows only the system prompt and the initial `# Environment`
+  system message, as collapsed cards at the top of the transcript; the rest duplicates the
+  conversation and is skipped before parsing.
 
 Codex stores each session as a rollout JSONL file at
 `~/.codex/sessions/YYYY/MM/DD/rollout-<timestamp>-<thread-id>.jsonl` (and under

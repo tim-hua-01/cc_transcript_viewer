@@ -87,6 +87,16 @@ class ToolInputSearchTests(unittest.TestCase):
                     self.assertIn("new wording", text)
 
 
+class SystemPromptSearchTests(unittest.TestCase):
+    def test_system_instructions_are_not_indexed_but_others_are(self):
+        user, rest = server._session_segments({"events": [
+            {"kind": "instructions", "role": "system", "label": "System prompt", "text": "boilerplate"},
+            {"kind": "instructions", "role": "developer", "label": "AGENTS.md", "text": "project rules"},
+        ]})
+        self.assertNotIn("boilerplate", user + rest)
+        self.assertIn("project rules", rest)
+
+
 class SearchCacheTests(unittest.TestCase):
     def test_normalized_cache_is_reused_and_invalidated_with_source(self):
         session = {"file": "fixture", "mtime": 1}

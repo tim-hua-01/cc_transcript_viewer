@@ -4,6 +4,7 @@ synthetic-user notices, skill injections, and queued prompts with images."""
 
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -484,6 +485,48 @@ class RawFallbackTests(unittest.TestCase):
         ])
         self.assertNotIn("raw", [e["kind"] for e in data["events"]])
 
+    _API_REQUEST_RECORDS = [
+        {"type": "api-request-shape", "shapeHash": "s1", "timestamp": "2026-01-01T00:00:00Z",
+         "shape": {"system": [{"type": "text", "text": "You are Claude Code."}],
+                   "tools": [{"name": "Read", "input_schema": {}}]}},
+        {"type": "api-request-blob", "hash": "b0",
+         "message": {"role": "system", "content": "# Environment\n - Platform: darwin"}},
+        {"type": "api-request-blob", "hash": "b1",
+         "message": {"role": "user", "content": [{"type": "text", "text": "hi"}]}},
+        {"type": "api-request", "id": "r1", "shapeHash": "s1", "tail": ["b0", "b1"],
+         "params": {"model": "claude-opus-5-5"}},
+        # An unchanged shape is not repeated; a changed one is.
+        {"type": "api-request-shape", "shapeHash": "s1", "timestamp": "2026-01-01T00:00:05Z",
+         "shape": {"system": [{"type": "text", "text": "You are Claude Code."}],
+                   "tools": [{"name": "Read", "input_schema": {}}]}},
+        {"type": "api-request-shape", "shapeHash": "s2", "timestamp": "2026-01-01T00:00:09Z",
+         "shape": {"system": [{"type": "text", "text": "You are Claude Code, v2."}], "tools": []}},
+    ]
+
+    def test_system_prompt_is_pinned_to_the_top_and_the_log_stays_silent(self):
+        data = self._parse([_user("u1", None, "hi", "2026-01-01T00:00:01Z"),
+                            *self._API_REQUEST_RECORDS])
+        events = data["events"]
+        self.assertEqual([e["kind"] for e in events], ["instructions"] * 3 + ["user"])
+        self.assertEqual([e["label"] for e in events[:3]],
+                         ["System prompt", "Environment", "System prompt (updated)"])
+        self.assertEqual(events[0]["text"], "You are Claude Code.\n\n— Tools (1): Read")
+        self.assertEqual(events[1]["text"], "# Environment\n - Platform: darwin")
+        self.assertEqual(events[2]["text"], "You are Claude Code, v2.")
+
+    def test_bulky_api_request_lines_are_skipped_before_parsing(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "session.jsonl"
+            lines = [json.dumps(_user("u1", None, "hi", "2026-01-01T00:00:00Z"))]
+            lines += [json.dumps(r, separators=(",", ":")) for r in self._API_REQUEST_RECORDS]
+            path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            kept = [(r["type"], r.get("hash")) for r in claude._iter_records(path)]
+        # Params and non-system blobs are dropped; the system blob and the
+        # shapes (which carry the system prompt) are kept.
+        self.assertEqual(kept, [
+            ("user", None), ("api-request-shape", None), ("api-request-blob", "b0"),
+            ("api-request-shape", None), ("api-request-shape", None),
+        ])
 
 if __name__ == "__main__":
     unittest.main()

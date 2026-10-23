@@ -45,12 +45,18 @@ def normalize_search_text(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
-def iter_jsonl(path: Path):
-    """Yield parsed records from a JSONL file, skipping blank/corrupt lines."""
+def iter_jsonl(path: Path, skip_line=None):
+    """Yield parsed records from a JSONL file, skipping blank/corrupt lines.
+
+    Lines for which ``skip_line(line)`` is true are dropped before
+    ``json.loads`` — a cheap pre-filter for bulky record types the caller
+    would ignore anyway. It is only an optimization: a record the filter
+    misses still parses, so callers must also ignore it by type.
+    """
     with path.open(encoding="utf-8") as fh:
         for line in fh:
             line = line.strip()
-            if not line:
+            if not line or (skip_line and skip_line(line)):
                 continue
             try:
                 yield json.loads(line)

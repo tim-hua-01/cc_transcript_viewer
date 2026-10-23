@@ -636,6 +636,8 @@ def _session_segments(data: dict) -> tuple[str, str]:
         rest.append(cwd)
 
     def add_event(ev: dict) -> None:
+        if ev.get("kind") == "instructions" and ev.get("role") == "system":
+            return  # the agent's boilerplate system prompt would match everywhere
         if ev.get("kind") == "branch":
             for group in ev.get("groups", []) or []:
                 for ge in group:

@@ -45,10 +45,78 @@ _IGNORED_RECORD_TYPES = frozenset({
     "queue-operation",      # queued-prompt bookkeeping; content re-enters as
                             # attachments/user turns when dequeued
     "summary",              # legacy compact-summary title pointers
+    # A log of each raw API request: per-call params plus the hash list of
+    # the messages sent, and those messages as content-addressed blobs. The
+    # messages duplicate the user/assistant records, and the useful params
+    # (model, effort, speed) are on assistant records too. Only the system
+    # prompt (shape records) and the environment block (a system-role blob)
+    # are read from it, by _system_prompt_events().
+    "api-request", "api-request-blob", "api-request-shape",
     # consumed earlier in the loop:
     "agent-name", "ai-title", "custom-title", "last-prompt",
     "permission-mode", "pr-link", "file-history-snapshot",
 })
+
+_API_REQUEST_LINE = '{"type":"api-request"'
+_API_BLOB_LINE = '{"type":"api-request-blob"'
+
+
+def _skip_line(line: str) -> bool:
+    """Drop api-request params and non-system message blobs before json.loads.
+
+    They can be a third or more of a transcript's bytes. Claude Code writes
+    `type` first and the blob's role within its first ~200 characters; a line
+    laid out differently still parses and is ignored by type.
+    """
+    if line.startswith(_API_REQUEST_LINE):
+        return True
+    return line.startswith(_API_BLOB_LINE) and '"role":"system"' not in line[:400]
+
+
+def _iter_records(path: Path):
+    return common.iter_jsonl(path, skip_line=_skip_line)
+
+
+def _system_prompt_events(records: list) -> list[dict]:
+    """The system prompt Claude Code sent, as `instructions` events.
+
+    Read from its API-request log, so transcripts written before Claude Code
+    logged requests have none. One event per distinct prompt version (text
+    plus tool list), and one for the environment block (cwd, platform, …),
+    which is the first `# Environment` system message sent.
+    """
+    versions: list[dict] = []
+    environment = None
+    last = None
+    for rec in records:
+        t = rec.get("type")
+        if t == "api-request-shape":
+            shape = rec.get("shape") or {}
+            system = shape.get("system")
+            text = system if isinstance(system, str) else common.content_text(system)
+            tools = [
+                tool["name"] for tool in shape.get("tools") or []
+                if isinstance(tool, dict) and isinstance(tool.get("name"), str)
+            ]
+            if (text, tools) == last or not (text or tools):
+                continue
+            last = (text, tools)
+            if tools:
+                text += f"\n\n— Tools ({len(tools)}): " + ", ".join(tools)
+            label = "System prompt" if not versions else "System prompt (updated)"
+            versions.append({"kind": "instructions", "ts": rec.get("timestamp"),
+                             "role": "system", "label": label, "text": text})
+        elif t == "api-request-blob" and environment is None:
+            message = rec.get("message") or {}
+            text = common.content_text(message.get("content")) if message.get("role") == "system" else ""
+            if text.startswith("# Environment\n"):
+                environment = {"kind": "instructions", "ts": None,
+                               "role": "system", "label": "Environment", "text": text}
+    if environment:
+        if versions:
+            environment["ts"] = versions[0]["ts"]
+        versions.insert(1, environment)
+    return versions
 
 
 def configure(projects_dir: Path) -> None:
@@ -201,7 +269,7 @@ def _agent_calls(parent_path: Path) -> list[dict]:
     if cached and cached[0] == mtime:
         return cached[1]
     calls = []
-    for rec in common.iter_jsonl(parent_path):
+    for rec in _iter_records(parent_path):
         content = (rec.get("message") or {}).get("content")
         if not isinstance(content, list):
             continue
@@ -296,7 +364,7 @@ def session_summary(path: Path) -> dict:
 
 
 def _session_summary_uncached(path: Path) -> dict:
-    records = list(common.iter_jsonl(path))
+    records = list(_iter_records(path))
     is_subagent = path.parent.name == "subagents"
     ai_title = ""
     claude_title = ""
@@ -674,7 +742,7 @@ def _fold_branches(records: list[dict], events: list[dict], active_leaf) -> list
 
 def parse_session(path: Path) -> dict:
     """Full structured parse of one Claude Code session, ready for rendering."""
-    records = list(common.iter_jsonl(path))
+    records = list(_iter_records(path))
 
     results_by_id: dict[str, dict] = {}
     tool_uses_by_id: dict[str, dict] = {}
@@ -961,6 +1029,8 @@ def parse_session(path: Path) -> dict:
             continue
 
     events = _fold_branches(records, events, active_leaf)
+    # Pinned to the top, as Codex shows its base instructions.
+    events[:0] = _system_prompt_events(records)
 
     # Cross-session fork: branching into a new "section" spawns a fresh session
     # file whose copied-over records each carry a `forkedFrom` pointer into the
