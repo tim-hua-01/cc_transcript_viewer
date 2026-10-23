@@ -765,7 +765,6 @@ def parse_session(path: Path) -> dict:
                         "is_error": bool(b.get("is_error")),
                         "text": norm["text"],
                         "images": norm["images"],
-                        "structured": rec.get("toolUseResult"),
                     }
                     if rec.get("uuid"):
                         tool_id_by_result_uuid[rec["uuid"]] = tid

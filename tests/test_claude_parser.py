@@ -342,6 +342,7 @@ class SyntheticUserNoticeTests(unittest.TestCase):
                                 }
                             ],
                         },
+                        "toolUseResult": {"stdout": "file.txt", "stderr": ""},
                     },
                 ],
             )
@@ -356,6 +357,9 @@ class SyntheticUserNoticeTests(unittest.TestCase):
         self.assertEqual(len(tools), 1)
         self.assertEqual(tools[0]["result"]["text"], "file.txt")
         self.assertFalse(tools[0]["result"]["is_error"])
+        # The raw toolUseResult is never rendered, and for an image Read it
+        # repeats the whole image, so it stays out of the payload.
+        self.assertEqual(set(tools[0]["result"]), {"is_error", "text", "images"})
 
 
 class SkillInstructionTests(unittest.TestCase):
