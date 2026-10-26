@@ -376,9 +376,15 @@ let AGENT_FILTER = "all";
 let MICA_STATUS = { enabled: false }; // mica heartbeat, from /api/sessions
 let FLAGGED_ONLY = false;             // sidebar shows only mica-flagged sessions
 let MICA_COMPARE = null;             // { file, sig, result } of the open transcript
-// ---------- live auto-refresh (always on) ----------
+// ---------- live auto-refresh (paused while the tab is hidden) ----------
 const SIDEBAR_POLL_MS = 1000;    // heavier scan across every transcript source
 const TRANSCRIPT_POLL_MS = 300;  // cheap stat of the open on-disk transcript
+// After a minute with no input and no change to the open transcript, poll
+// less often to spare the battery; either one restores the fast intervals.
+// Other sessions changing doesn't count: some agent is nearly always busy.
+const IDLE_AFTER_MS = 60000;
+const SIDEBAR_IDLE_POLL_MS = 5000;
+const TRANSCRIPT_IDLE_POLL_MS = 2000;
 let LAST_RENDERED_MTIME = 0;     // mtime of the open transcript as last rendered
 let LAST_RENDERED_TITLE = "";    // detects custom-name changes without transcript writes
 let LAST_SIG = "";               // cheap fingerprint of the session list
@@ -2648,7 +2654,7 @@ function fillMicaBanner(box, lock, r, data) {
   box.replaceChildren(...kids.filter(Boolean));
 }
 
-// ---------- live polling (always on) ----------
+// ---------- live polling ----------
 // Real transcript files get a fast, tiny stat request. The full session list
 // remains on a slower loop for sidebar changes and synthetic Cursor sessions.
 function supportsFastTranscriptPoll(file) {
@@ -2666,9 +2672,13 @@ async function pollOpenTranscript() {
     if (
       CURRENT_FILE === file && state.supported &&
       (state.mtime || 0) > LAST_RENDERED_MTIME
-    ) await refreshOpenTranscript(state.mtime);
+    ) {
+      await refreshOpenTranscript(state.mtime);
+      return true;
+    }
   } catch (e) { /* transient; try again next poll */ }
   finally { transcriptStatePolling = false; }
+  return false;
 }
 
 let sidebarPolling = false;
@@ -2683,7 +2693,7 @@ async function pollSidebar() {
       next = body.sessions || [];
       MICA_STATUS = body.mica || { enabled: false };
       renderSetupBanner(body.setup);
-    } catch (e) { return; } // server momentarily unreachable; retry next tick
+    } catch (e) { return false; } // server momentarily unreachable; retry next tick
     const sig = sessionsSignature(next);
     if (sig !== LAST_SIG) {
       LAST_SIG = sig;
@@ -2705,15 +2715,58 @@ async function pollSidebar() {
         (!supportsFastTranscriptPoll(CURRENT_FILE) &&
           (cur.mtime || 0) > LAST_RENDERED_MTIME) ||
         (cur.title || "") !== LAST_RENDERED_TITLE
-      )) await refreshOpenTranscript();
+      )) {
+        await refreshOpenTranscript();
+        return true;
+      }
     }
+    return false;
   } finally {
     sidebarPolling = false;
   }
 }
+
+// A poll returns true when it refreshed the open transcript, which counts as
+// activity. Each poller is a setTimeout chain rather than a setInterval, so
+// its next delay can follow the idle state and a hidden tab stops polling
+// entirely (background tabs otherwise keep polling, only throttled).
+let LAST_ACTIVITY = Date.now();
+const POLLERS = [];
+const isIdle = () => Date.now() - LAST_ACTIVITY > IDLE_AFTER_MS;
+
+function startPoller(poll, activeMs, idleMs) {
+  let timer = 0;
+  const schedule = () => {
+    clearTimeout(timer);
+    timer = document.hidden ? 0 : setTimeout(run, isIdle() ? idleMs : activeMs);
+  };
+  async function run() {
+    clearTimeout(timer);
+    if (await poll()) LAST_ACTIVITY = Date.now();
+    schedule();
+  }
+  POLLERS.push(run);
+  schedule();
+}
+
+function noteActivity() {
+  const wasIdle = isIdle();
+  LAST_ACTIVITY = Date.now();
+  if (wasIdle) POLLERS.forEach((run) => run()); // catch up right away
+}
+
+function onVisibilityChange() {
+  if (document.hidden) return; // each poller stops at its next tick
+  LAST_ACTIVITY = Date.now();
+  POLLERS.forEach((run) => run()); // restart, and show what changed meanwhile
+}
+
 if (!STANDALONE) {
-  setInterval(pollOpenTranscript, TRANSCRIPT_POLL_MS);
-  setInterval(pollSidebar, SIDEBAR_POLL_MS);
+  startPoller(pollOpenTranscript, TRANSCRIPT_POLL_MS, TRANSCRIPT_IDLE_POLL_MS);
+  startPoller(pollSidebar, SIDEBAR_POLL_MS, SIDEBAR_IDLE_POLL_MS);
+  for (const type of ["pointerdown", "pointermove", "keydown", "wheel", "focus"])
+    window.addEventListener(type, noteActivity, { passive: true, capture: true });
+  document.addEventListener("visibilitychange", onVisibilityChange);
 }
 
 document.addEventListener("keydown", (e) => {

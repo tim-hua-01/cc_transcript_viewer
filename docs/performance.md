@@ -241,8 +241,10 @@ so today a forgotten tab keeps polling. This doesn't cost any responsiveness.
 ### B2. Slow down when idle
 
 Both pollers keep their current intervals while the viewer is active. "Active"
-means the last user input (pointer, keyboard, wheel, focus) or the last detected
-change was within 60 s. After that the sidebar polls every 5 s and the open
+means the last user input (pointer, keyboard, wheel, focus) or the last change
+to the open transcript was within 60 s. Changes to other sessions don't count:
+some agent is nearly always writing a transcript somewhere, so counting them
+would keep the viewer fast almost all the time. After that the sidebar polls every 5 s and the open
 transcript every 2 s. Any input or change switches back to the fast intervals
 immediately, and input after an idle period also triggers an immediate poll.
 
