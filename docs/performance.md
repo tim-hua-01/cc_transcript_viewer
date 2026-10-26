@@ -231,14 +231,17 @@ background. Measured with one tab open and idle:
 The Mica daemon is separate: it runs whether or not the viewer is open, polls
 every second, and has averaged about 0.2% CPU (31 CPU-minutes over 10 days).
 
-### B1. Don't poll while the tab is hidden
+### B1. Don't poll while the tab is hidden — done, `662f3c6`
 
 Stop both pollers while `document.hidden` is true, and poll at once when the tab
 becomes visible again, so what you see is never stale. Chrome only slows timers
 in background tabs to once a second, and to once a minute after five minutes,
 so today a forgotten tab keeps polling. This doesn't cost any responsiveness.
 
-### B2. Slow down when idle
+### B2. Slow down when idle — done, `662f3c6`
+
+Result (B1 + B2): with one idle tab, server CPU went from 1.8% to 0.7%, and
+requests from 4.3 a second to 0.7; a hidden tab makes none.
 
 Both pollers keep their current intervals while the viewer is active. "Active"
 means the last user input (pointer, keyboard, wheel, focus) or the last change
@@ -256,7 +259,10 @@ stays fast and tailing works as it does today.
 One scheduler (a `setTimeout` chain per poller) replaces the two
 `setInterval`s. Each poll function returns whether it saw a change.
 
-### B3. Check Mica's index at most every 250 ms
+### B3. Check Mica's index at most every 250 ms — done, `eceb33d`
+
+Result: smaller than estimated. A poll went from 12.4 ms to 11.5 ms; the
+remaining Mica cost is in the per-session lookups, not the `stat`.
 
 `StoreReader.index()` re-`stat`s `index.json` on every call to see whether it
 changed, and a sidebar poll calls it once per session. Skip the `stat` when the
