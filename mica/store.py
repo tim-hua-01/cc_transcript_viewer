@@ -301,6 +301,11 @@ def first_difference(a_path: Path, b_path: Path, length: int, chunk: int = 1 << 
 # ---------------------------------------------------------------------------
 # Read-only access for the viewer
 # ---------------------------------------------------------------------------
+# How long StoreReader trusts its last look at index.json. A sidebar poll asks
+# about every session, and each question would otherwise stat the file again.
+INDEX_RECHECK_SECONDS = 0.25
+
+
 class StoreReader:
     """Read-only view of a store directory. Never writes anything."""
 
@@ -308,6 +313,7 @@ class StoreReader:
         self.root = Path(root).expanduser()
         self.files_dir = self.root / FILES_DIR
         self._index_fp = None
+        self._index_checked = float("-inf")
         self._index: dict = {}
         self._by_path: dict = {}
         self._realpaths: dict = {}
@@ -364,7 +370,12 @@ class StoreReader:
         return self._store_events
 
     def index(self) -> dict:
-        """key -> summary, reloaded only when index.json changes."""
+        """key -> summary, reloaded only when index.json changes (checked at
+        most every INDEX_RECHECK_SECONDS)."""
+        now = time.monotonic()
+        if now - self._index_checked < INDEX_RECHECK_SECONDS:
+            return self._index
+        self._index_checked = now
         path = self.root / INDEX_FILE
         try:
             st = path.stat()

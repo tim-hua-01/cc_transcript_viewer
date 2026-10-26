@@ -583,6 +583,21 @@ class CaptureScenarios(CaptureTestCase):
         with mock.patch.object(v.time, "time", return_value=self.now + 3600):
             self.assertFalse(self.reader.status()["running"])
 
+    def test_a_long_lived_reader_rereads_the_index_after_the_recheck_interval(self):
+        path = self.session()
+        self.capturer.start()
+        reader = self.reader  # one reader for the whole test, as the viewer holds
+        clock = [1000.0]
+        with mock.patch.object(v.time, "monotonic", side_effect=lambda: clock[0]):
+            key = reader.key_for_path(str(path))
+            self.assertEqual(reader.badge(key)["flags"], [])
+            self.capturer._flag(key, "some_future_flag", {})
+            self.capturer._write_index()
+            # Within the interval the last look at the index still answers.
+            self.assertEqual(reader.badge(key)["flags"], [])
+            clock[0] += v.INDEX_RECHECK_SECONDS
+            self.assertEqual(reader.badge(key)["flags"], ["some_future_flag"])
+
     def test_reader_reports_what_the_daemon_recorded(self):
         path = self.session()
         self.capturer.start()
