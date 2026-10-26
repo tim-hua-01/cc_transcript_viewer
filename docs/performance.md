@@ -213,3 +213,61 @@ Once step 3 makes the index cheap to keep:
   the response further, but the export needs them inline, and Claude's inline
   base64 images have no file to serve. Only worth doing if browser timings
   call for it.
+
+## Battery: idle cost
+
+With nothing happening, an open viewer tab still polls `/api/sessions` every
+second and `/api/session-state` every 300 ms, in the foreground and in the
+background. Measured with one tab open and idle:
+
+| Cost | Measurement |
+|---|---|
+| Server CPU | 1.6–1.9% of one core, continuously |
+| One sidebar poll | 14 ms on the server: about 1,600 `stat` calls, 200 directory listings, and Mica's `index()` called about 560 times, each with its own `stat` of `index.json`; then a 312 KB JSON response that the browser parses |
+| One transcript poll | about 1 ms; cheap, but it wakes the browser and server 3.3 times a second |
+| Wakeups | about 4.3 a second, which keeps the CPU out of its deeper idle states |
+| Browser | no endless CSS animations or timers apart from the polls, and a DOM re-render only when the list changes (headless Chrome's own overhead hides the page's share, so it wasn't measurable that way) |
+
+The Mica daemon is separate: it runs whether or not the viewer is open, polls
+every second, and has averaged about 0.2% CPU (31 CPU-minutes over 10 days).
+
+### B1. Don't poll while the tab is hidden
+
+Stop both pollers while `document.hidden` is true, and poll at once when the tab
+becomes visible again, so what you see is never stale. Chrome only slows timers
+in background tabs to once a second, and to once a minute after five minutes,
+so today a forgotten tab keeps polling. This doesn't cost any responsiveness.
+
+### B2. Slow down when idle
+
+Both pollers keep their current intervals while the viewer is active. "Active"
+means the last user input (pointer, keyboard, wheel, focus) or the last detected
+change was within 60 s. After that the sidebar polls every 5 s and the open
+transcript every 2 s. Any input or change switches back to the fast intervals
+immediately, and input after an idle period also triggers an immediate poll.
+
+The cost: while idle, a new session takes up to 5 s to appear in the sidebar,
+and the first new line of a live transcript up to 2 s. A transcript Claude is
+actively writing changes often, so once that first change arrives the poll
+stays fast and tailing works as it does today.
+
+One scheduler (a `setTimeout` chain per poller) replaces the two
+`setInterval`s. Each poll function returns whether it saw a change.
+
+### B3. Check Mica's index at most every 250 ms
+
+`StoreReader.index()` re-`stat`s `index.json` on every call to see whether it
+changed, and a sidebar poll calls it once per session. Skip the `stat` when the
+last check was under 250 ms ago. Mica rewrites the index at most once a second,
+and a quarter-second delay can't be seen in the UI. Expected: about 30% less
+server time per poll.
+
+### Considered, not planned
+
+- **A `304 Not Modified` response for an unchanged session list.** It would
+  save sending and parsing 312 KB per poll. But the response includes Mica's
+  heartbeat age, which changes every second, so it would almost never match
+  unless the status moved to its own endpoint. Revisit if B1–B2 aren't enough.
+- **Slowing Mica's own 1 s poll.** That interval is how long a transcript
+  rewrite can go uncaptured, which is a deliberate choice for a
+  tamper-evidence tool. It's the user's call, not a performance fix.
