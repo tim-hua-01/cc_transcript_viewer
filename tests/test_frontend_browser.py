@@ -196,6 +196,110 @@ class StandaloneBrowserJourneyTests(unittest.TestCase):
         self.assertEqual(result["normalized"], [expected for _, expected in cases])
         self.assertEqual(result["counts"], [1, 1])
 
+    def test_polling_recovers_and_handles_visibility_and_idle_transitions(self):
+        rendered = export_html.build_standalone_html(codex.parse_session(FIXTURE))
+        rendered = re.sub(r'<script\b[^>]*\bsrc="https://[^"]+"[^>]*></script>', "", rendered)
+        rendered = re.sub(r'<link\b[^>]*\bhref="https://[^"]+"[^>]*>', "", rendered)
+        probe = """<script>
+          (async () => {
+            const result = {};
+            const realSetTimeout = window.setTimeout;
+            const realClearTimeout = window.clearTimeout;
+            const realNow = Date.now;
+            const realWarn = console.warn;
+            const timers = new Map();
+            let now = 0, nextId = 0, hidden = false, warnings = 0;
+            window.setTimeout = (fn, delay) => {
+              const id = ++nextId;
+              timers.set(id, {fn, delay});
+              return id;
+            };
+            window.clearTimeout = (id) => timers.delete(id);
+            Date.now = () => now;
+            console.warn = () => warnings++;
+            Object.defineProperty(document, 'hidden', {configurable: true, get: () => hidden});
+            const tick = async () => {
+              const [id, {fn}] = timers.entries().next().value;
+              timers.delete(id);
+              await fn();
+            };
+            const delay = () => [...timers.values()][0]?.delay;
+            const reset = () => {
+              POLLERS.length = 0;
+              timers.clear();
+              LAST_ACTIVITY = now;
+            };
+            try {
+              reset();
+              let calls = 0;
+              startPoller(async () => {
+                calls++;
+                if (calls === 1) throw new Error('temporary render failure');
+                return false;
+              }, 300, 2000);
+              await tick();
+              result.errorRescheduled = timers.size === 1 && delay() === 300 && warnings === 1;
+              await tick();
+              result.recovered = calls === 2 && timers.size === 1;
+
+              hidden = true;
+              await tick();
+              result.hiddenStops = calls === 2 && timers.size === 0;
+              hidden = false;
+              onVisibilityChange();
+              await Promise.resolve();
+              result.visibleRestarts = calls === 3 && timers.size === 1;
+
+              reset();
+              let finish;
+              calls = 0;
+              startPoller(() => {
+                calls++;
+                return new Promise((resolve) => { finish = resolve; });
+              }, 300, 2000);
+              const pending = tick();
+              hidden = true;
+              onVisibilityChange();
+              hidden = false;
+              onVisibilityChange();
+              result.noOverlap = calls === 1 && timers.size === 0;
+              finish(false);
+              await pending;
+              result.oneTimerAfterWake = timers.size === 1;
+
+              reset();
+              let changed = false;
+              startPoller(async () => changed, 300, 2000);
+              now += IDLE_AFTER_MS + 1;
+              await tick();
+              result.idleSlows = delay() === 2000;
+              noteActivity();
+              await Promise.resolve();
+              result.inputSpeedsUp = delay() === 300;
+              now += IDLE_AFTER_MS + 1;
+              changed = true;
+              await tick();
+              result.changeSpeedsUp = delay() === 300 && LAST_ACTIVITY === now;
+            } catch (error) {
+              result.error = String(error);
+            } finally {
+              reset();
+              window.setTimeout = realSetTimeout;
+              window.clearTimeout = realClearTimeout;
+              Date.now = realNow;
+              console.warn = realWarn;
+              delete document.hidden;
+            }
+            document.body.setAttribute('data-test-probe', encodeURIComponent(JSON.stringify(result)));
+          })();
+        </script>"""
+        rendered = rendered.replace("</body>", probe + "\n</body>", 1)
+        result = self.probe_page(rendered)
+        self.assertEqual(result, dict.fromkeys((
+            "errorRescheduled", "recovered", "hiddenStops", "visibleRestarts", "noOverlap",
+            "oneTimerAfterWake", "idleSlows", "inputSpeedsUp", "changeSpeedsUp",
+        ), True))
+
     def probe_page(self, rendered, budget_ms=1000):
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)

@@ -2,8 +2,9 @@
 """Measure the viewer's hot paths against the transcripts on this machine.
 
 Read-only: the summary cache is copied into a temp dir (or started empty for
---cold), so the real ~/.cache file is never written. Each scenario runs in a
-fresh interpreter so in-process caches don't leak between them.
+the cold list scenario), so the real ~/.cache file is never written. Each
+scenario runs in a fresh interpreter so in-process caches don't leak between
+them.
 
     python3 scripts/bench.py                  # every scenario
     python3 scripts/bench.py list search      # just these
@@ -54,20 +55,29 @@ def _server(cache_dir: Path, cold: bool):
 def scenario_list(cache_dir: Path, cold: bool) -> dict:
     server = _server(cache_dir, cold)
     base = rss_mb()
-    per_parser = {}
-    for name, parser in server.PARSERS.items():
-        server.load_summary_caches()
-        rows, secs = timed(parser.list_sessions)
-        per_parser[name] = {"sessions": len(rows), "secs": round(secs, 3)}
     sessions, first = timed(server.list_sessions)
     _, again = timed(server.list_sessions)
-    body, dump = timed(lambda: json.dumps({"sessions": server.list_sessions()}).encode())
-    return {
-        "cold": cold, "sessions": len(sessions), "per_parser_first_call": per_parser,
+    body, dump = timed(lambda: json.dumps({"sessions": sessions}).encode())
+    result = {
+        "cold": cold, "sessions": len(sessions),
         "list_sessions_secs": round(first, 3), "list_sessions_repeat_secs": round(again, 3),
         "payload_mb": round(len(body) / 1e6, 2), "json_dumps_secs": round(dump, 3),
         "rss_mb": round(rss_mb() - base, 1),
     }
+    # Per-parser first calls need fresh caches too. Keep them in a separate
+    # interpreter so they cannot warm the unified list's cold measurement.
+    result["per_parser_first_call"] = run_child(["list-parsers", "cold" if cold else "warm"])
+    return result
+
+
+def scenario_list_parsers(cache_dir: Path, cold: bool) -> dict:
+    server = _server(cache_dir, cold)
+    server.load_summary_caches()
+    per_parser = {}
+    for name, parser in server.PARSERS.items():
+        rows, secs = timed(parser.list_sessions)
+        per_parser[name] = {"sessions": len(rows), "secs": round(secs, 3)}
+    return per_parser
 
 
 def scenario_open(cache_dir: Path, path: str) -> dict:
@@ -132,6 +142,8 @@ def main():
             kind, *rest = args.child
             if kind == "list":
                 result = scenario_list(Path(td), cold=rest == ["cold"])
+            elif kind == "list-parsers":
+                result = scenario_list_parsers(Path(td), cold=rest == ["cold"])
             elif kind == "open":
                 result = scenario_open(Path(td), rest[0])
             else:

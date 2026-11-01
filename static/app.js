@@ -2736,14 +2736,23 @@ const isIdle = () => Date.now() - LAST_ACTIVITY > IDLE_AFTER_MS;
 
 function startPoller(poll, activeMs, idleMs) {
   let timer = 0;
+  let running = false;
   const schedule = () => {
     clearTimeout(timer);
     timer = document.hidden ? 0 : setTimeout(run, isIdle() ? idleMs : activeMs);
   };
   async function run() {
     clearTimeout(timer);
-    if (await poll()) LAST_ACTIVITY = Date.now();
-    schedule();
+    if (document.hidden || running) return;
+    running = true;
+    try {
+      if (await poll()) LAST_ACTIVITY = Date.now();
+    } catch (e) {
+      console.warn("Live refresh failed; retrying on the next poll.", e);
+    } finally {
+      running = false;
+      schedule();
+    }
   }
   POLLERS.push(run);
   schedule();
@@ -2756,7 +2765,7 @@ function noteActivity() {
 }
 
 function onVisibilityChange() {
-  if (document.hidden) return; // each poller stops at its next tick
+  if (document.hidden) return; // the next tick stops without making a request
   LAST_ACTIVITY = Date.now();
   POLLERS.forEach((run) => run()); // restart, and show what changed meanwhile
 }

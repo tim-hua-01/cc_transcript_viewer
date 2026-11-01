@@ -58,19 +58,22 @@ _IGNORED_RECORD_TYPES = frozenset({
 })
 
 _API_REQUEST_LINE = '{"type":"api-request"'
-_API_BLOB_LINE = '{"type":"api-request-blob"'
+_API_NON_SYSTEM_BLOB = re.compile(
+    r'^\{"type":"api-request-blob","hash":"[^"\\]*",'
+    r'"message":\{"role":"(?:user|assistant|tool)"[,}]'
+)
 
 
 def _skip_line(line: str) -> bool:
     """Drop api-request params and non-system message blobs before json.loads.
 
-    They can be a third or more of a transcript's bytes. Claude Code writes
-    `type` first and the blob's role within its first ~200 characters; a line
-    laid out differently still parses and is ignored by type.
+    They can be a third or more of a transcript's bytes. Recognize only the
+    non-system message prefix Claude Code writes. An unfamiliar layout must
+    reach json.loads so a system message can never be lost to this fast path.
     """
     if line.startswith(_API_REQUEST_LINE):
         return True
-    return line.startswith(_API_BLOB_LINE) and '"role":"system"' not in line[:400]
+    return _API_NON_SYSTEM_BLOB.match(line) is not None
 
 
 def _iter_records(path: Path):

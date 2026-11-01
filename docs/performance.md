@@ -35,7 +35,9 @@ including 133 MB, 121 MB and 104 MB single transcripts.
 the summary cache (never the real file):
 
 - `list`: `list_sessions()` with no summary cache (cold) and with the real one
-  (warm), per source.
+  (warm). Per-source first calls run in a separate interpreter so they do not
+  warm the unified list measurement. JSON serialization is timed on the
+  already-fetched session list, without another scan.
 - `open`: `load_session()` plus `json.dumps` for the N largest transcripts.
 - `search`: three queries twice each, after a warm session list, and the
   resulting size of the search text cache.

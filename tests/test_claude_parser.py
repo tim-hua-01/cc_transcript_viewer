@@ -532,5 +532,31 @@ class RawFallbackTests(unittest.TestCase):
             ("api-request-shape", None), ("api-request-shape", None),
         ])
 
+    def test_environment_survives_unfamiliar_blob_layouts(self):
+        text = "# Environment\n" + "workspace details " * 40
+        records = [
+            {"type": "api-request-blob", "hash": "b0",
+             "message": {"content": text, "role": "system"}},
+            {"type": "api-request-blob", "hash": "b0", "padding": "x" * 500,
+             "message": {"role": "system", "content": text}},
+            {"type": "api-request-blob", "hash": "b0",
+             "metadata": {"message": {"role": "user"}},
+             "message": {"content": text, "role": "system"}},
+        ]
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "session.jsonl"
+            for record in records:
+                for separators in ((",", ":"), (", ", ": ")):
+                    line = json.dumps(record, separators=separators)
+                    # Mixed spacing still matches the compact type prefix.
+                    line = line.replace('"type": "api-request-blob"',
+                                        '"type":"api-request-blob"', 1)
+                    with self.subTest(record=record, separators=separators):
+                        path.write_text(line + "\n", encoding="utf-8")
+                        self.assertEqual(list(claude._iter_records(path)), [record])
+                        events = claude.parse_session(path)["events"]
+                        self.assertEqual([(e["label"], e["text"]) for e in events],
+                                         [("Environment", text)])
+
 if __name__ == "__main__":
     unittest.main()
