@@ -493,9 +493,10 @@ class RawFallbackTests(unittest.TestCase):
         {"type": "api-request-shape", "shapeHash": "s1", "timestamp": "2026-01-01T00:00:00Z",
          "shape": {"system": [{"type": "text", "text": "You are Claude Code."}],
                    "tools": [{"name": "Read", "input_schema": {}}]}},
-        {"type": "api-request-blob", "hash": "b0",
+        # Field order as Claude Code writes it: sessionId comes before hash.
+        {"type": "api-request-blob", "sessionId": "s-1", "hash": "b0",
          "message": {"role": "system", "content": "# Environment\n - Platform: darwin"}},
-        {"type": "api-request-blob", "hash": "b1",
+        {"type": "api-request-blob", "sessionId": "s-1", "hash": "b1",
          "message": {"role": "user", "content": [{"type": "text", "text": "hi"}]}},
         {"type": "api-request", "id": "r1", "shapeHash": "s1", "tail": ["b0", "b1"],
          "params": {"model": "claude-opus-5-5"}},

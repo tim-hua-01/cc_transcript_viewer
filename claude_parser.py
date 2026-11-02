@@ -58,8 +58,10 @@ _IGNORED_RECORD_TYPES = frozenset({
 })
 
 _API_REQUEST_LINE = '{"type":"api-request"'
+# Only flat string fields (sessionId, hash, …) may come before "message", so
+# the role matched is the blob's own and never text nested inside it.
 _API_NON_SYSTEM_BLOB = re.compile(
-    r'^\{"type":"api-request-blob","hash":"[^"\\]*",'
+    r'^\{"type":"api-request-blob"(?:,"\w+":"[^"\\]*")*,'
     r'"message":\{"role":"(?:user|assistant|tool)"[,}]'
 )
 
