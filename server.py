@@ -11,9 +11,10 @@ sidebar. Run it and open the printed URL.
 Parsing lives in claude_parser.py / codex_parser.py / cursor_parser.py /
 opencode_parser.py (one module per transcript source, all emitting the same
 event shapes); this module is the HTTP layer plus what spans sources: the
-unified session list, full-text search, viewer-owned custom names, and
-summary-cache persistence. Bundling a session into a shareable single-file
-HTML export lives in export_html.py.
+unified session list, viewer-owned custom names, summary-cache persistence,
+and wiring for the full-text search index (search_index.py, built from
+search_text.py). Bundling a session into a shareable single-file HTML export
+lives in export_html.py.
 
 Optional Mica: when the Mica daemon is capturing transcripts (see mica/),
 the viewer reads its store (never writes it) to flag transcripts
@@ -27,6 +28,7 @@ Usage:
                      [--cursor-chats-dir PATH] [--opencode-db PATH]
                      [--custom-names-file PATH]
                      [--mica PATH | --no-mica]
+                     [--search-index PATH] [--reset-cache]
 """
 
 from __future__ import annotations
@@ -49,6 +51,7 @@ import common
 import cursor_parser as cursor
 import export_html
 import opencode_parser as opencode
+import search_index
 import settings_check
 from mica import store as micastore
 
@@ -99,6 +102,10 @@ MICA_ERROR: str | None = None  # last failure attaching store state to the list
 # Full-session parsers for Mica's copies, by the parser name the store records.
 MICA_PARSERS = {"claude": claude, "codex": codex}
 CACHE_FILE = Path.home() / ".cache" / "transcript_viewer" / "summaries.json"
+DEFAULT_SEARCH_INDEX_FILE = CACHE_FILE.with_name("search-index.sqlite3")
+# The full-text search index, set by configure_search(); None leaves search
+# off (tests that don't configure one never touch the real cache).
+SEARCH: search_index.SearchIndex | None = None
 
 # File types that macOS may execute or install when opened. Local-file links
 # are for source/documents, never for launching transcript-supplied programs.
@@ -284,6 +291,8 @@ def list_sessions() -> list[dict]:
             continue
         grouped.append(s)
         grouped.extend(subs_by_parent.get(s["file"], []))
+    if SEARCH is not None:
+        SEARCH.notify(grouped)
     return grouped
 
 
@@ -548,237 +557,61 @@ def open_local_file(file_id: str, path_value: str) -> Path:
 
 
 # ---------------------------------------------------------------------------
-# Full-text search across transcript content
+# Full-text search (the index itself lives in search_index.py)
 # ---------------------------------------------------------------------------
-# Cache: session file id -> (mtime, user text, rest, normalized user, normalized rest).
-# Ids are transcript paths or synthetic database schemes, matching /api/session.
-_TEXT_CACHE: dict[str, tuple[float, str, str, str, str]] = {}
-
-# User prompts should outrank generated/tool output without overwhelming a
-# custom title selected specifically to identify the transcript.
-USER_MSG_WEIGHT = 50
-CUSTOM_TITLE_WEIGHT = 10_000
-NATIVE_TITLE_WEIGHT = CUSTOM_TITLE_WEIGHT // 2
-
-
-# Input text from all tool shapes, including file edits and nested exec calls.
-_TOOL_INPUT_SEARCH_KEYS = (
-    "cmd", "command", "file_path", "pattern", "query", "prompt", "description", "content", "url",
-    "old_string", "new_string", "old_str", "new_str", "old_text", "new_text",
-    "patch", "patch_text", "diff",
-)
+def source_settings() -> dict:
+    """Where this process reads transcripts from, for configure_sources() in
+    a search worker process (a spawned process doesn't inherit it)."""
+    return {
+        "projects_dir": str(claude.PROJECTS_DIR),
+        "codex_home": str(codex.CODEX_HOME),
+        "cursor_db": str(cursor.DB_PATH),
+        "cursor_projects": str(cursor.PROJECTS_DIR),
+        "cursor_chats": str(cursor.CHATS_DIR),
+        "opencode_db": str(opencode.DB_PATH),
+        "mica": str(MICA.root) if MICA is not None else None,
+        "custom_names": str(CUSTOM_NAMES_FILE),
+    }
 
 
-def _event_text(ev: dict) -> list[str]:
-    """All searchable text from a single event (both agent shapes)."""
-    parts: list[str] = []
-
-    def add(x):
-        if x and isinstance(x, str):
-            parts.append(x)
-
-    def add_input(inp):
-        if isinstance(inp, str):
-            add(inp)
-        elif isinstance(inp, dict):
-            for k in _TOOL_INPUT_SEARCH_KEYS:
-                add(inp.get(k))
-            for call in inp.get("calls") or []:
-                if isinstance(call, dict):
-                    add_input(call.get("input"))
-            for edit in inp.get("edits") or []:
-                add_input(edit)
-
-    if ev.get("blocks"):  # block shape (Claude Code / Cursor / opencode)
-        for b in ev["blocks"]:
-            add(b.get("text"))
-            if b.get("type") == "tool_use":
-                add_input(b.get("input"))
-                res = b.get("result") or {}
-                if isinstance(res, dict):
-                    add(res.get("text"))
-    else:  # Codex shape
-        add(ev.get("text"))
-        add(ev.get("summary"))
-        add(ev.get("query"))
-        add_input(ev.get("input"))
-        res = ev.get("result")
-        if isinstance(res, dict):
-            add(res.get("output"))
-        act = ev.get("action")
-        if isinstance(act, dict):
-            for q in act.get("queries") or []:
-                add(q)
-        request = ev.get("request")
-        if isinstance(request, dict):
-            add(request.get("tool"))
-            add(request.get("cwd"))
-            add(request.get("justification"))
-            command = request.get("command")
-            if isinstance(command, str):
-                add(command)
-            elif isinstance(command, list):
-                for part in command:
-                    add(part)
-    return parts
+def configure_sources(settings: dict) -> None:
+    """Point every parser (and Mica and the custom-names file) at ``settings``."""
+    global CUSTOM_NAMES_FILE
+    CUSTOM_NAMES_FILE = Path(settings["custom_names"]).expanduser()
+    claude.configure(Path(settings["projects_dir"]))
+    codex.configure(Path(settings["codex_home"]))
+    cursor.configure(
+        Path(settings["cursor_db"]),
+        projects_dir=Path(settings["cursor_projects"]),
+        chats_dir=Path(settings["cursor_chats"]),
+    )
+    opencode.configure(Path(settings["opencode_db"]))
+    mica = settings.get("mica")
+    configure_mica(Path(mica).expanduser() if mica else None, enabled=bool(mica))
 
 
-def _session_segments(data: dict) -> tuple[str, str]:
-    """Split a parsed session into (all user messages, everything else).
-
-    User messages are scored above generated/tool content. Image blobs are
-    skipped throughout.
-    """
-    user: list[str] = []
-    rest: list[str] = []
-    cwd = (data.get("meta") or {}).get("cwd")
-    if cwd:
-        rest.append(cwd)
-
-    def add_event(ev: dict) -> None:
-        if ev.get("kind") == "instructions" and ev.get("role") == "system":
-            return  # the agent's boilerplate system prompt would match everywhere
-        if ev.get("kind") == "branch":
-            for group in ev.get("groups", []) or []:
-                for ge in group:
-                    add_event(ge)
-        elif ev.get("kind") == "user":
-            user.extend(_event_text(ev))
-        else:
-            rest.extend(_event_text(ev))
-
-    for ev in data.get("events", []) or []:
-        add_event(ev)
-    return "\n".join(user), "\n".join(rest)
+def configure_search(path, workers: int = search_index.DEFAULT_WORKERS) -> None:
+    """Use the search index at ``path`` (closing any previous one)."""
+    global SEARCH
+    if SEARCH is not None:
+        SEARCH.close()
+    SEARCH = search_index.SearchIndex(
+        path, load_session, workers=workers,
+        worker_setup=lambda: (configure_sources, (source_settings(),)),
+    )
 
 
-def session_segments(s: dict, *, normalized: bool = False) -> tuple[str, str]:
-    """(user messages, rest) for one session, cached by its mtime.
-
-    Works for both real transcript files and synthetic-id sessions (the
-    `cursordb:` / `cursorcli:` / `opencode:` schemes); the session summary
-    already carries a stable mtime.
-    """
-    key = s.get("file", "")
-    mtime = s.get("mtime") or 0
-    cached = _TEXT_CACHE.get(key)
-    if not cached or cached[0] != mtime:
-        try:
-            data = load_session(key)
-        except Exception:  # noqa: BLE001
-            data = None
-        user, rest = _session_segments(data) if data else ("", "")
-        cached = (mtime, user, rest, common.normalize_search_text(user), common.normalize_search_text(rest))
-        _TEXT_CACHE[key] = cached
-    return (cached[3], cached[4]) if normalized else (cached[1], cached[2])
+def search_status() -> dict | None:
+    return SEARCH.status() if SEARCH is not None else None
 
 
-def _search_title_segments(session: dict) -> tuple[str, str]:
-    """Return viewer-custom and native-title text as distinct score tiers."""
-    custom = session.get("custom_title") or ""
-    native_titles = []
-    # Sources with stored AI- or user-authored names. Codex's legacy `title`
-    # is usually the first prompt, but newer versions also expose `ai_title`.
-    if session.get("agent") in {"claude", "codex", "cursor", "opencode"}:
-        for title in (
-            session.get("original_title"),
-            session.get("claude_title"),
-            session.get("ai_title"),
-        ):
-            if title and title != custom and title not in native_titles:
-                native_titles.append(title)
-    return custom, "\n".join(native_titles)
-
-
-def _search_snippet(text: str, normalized: str, index: int, length: int) -> tuple[str, int]:
-    """Map a normalized match back to the original text, including length changes.
-
-    Line boundaries are safe normalization boundaries: locating the line first
-    avoids repeatedly normalizing huge transcript prefixes. Only the matching
-    lines need a character-level boundary search. No per-character maps are cached.
-    """
-    same_offsets = len(text) == len(normalized) and text.lower() == normalized
-
-    def source_offset(line, offset):
-        lo, hi = 0, len(line)
-        while lo < hi:
-            mid = (lo + hi) // 2
-            if len(common.normalize_search_text(line[:mid])) < offset:
-                lo = mid + 1
-            else:
-                hi = mid
-        return lo
-
-    if same_offsets:
-        idx, end = index, index + length
-    else:
-        idx = end = None
-        source_cursor = normalized_cursor = 0
-        for line in text.splitlines(keepends=True):
-            folded = common.normalize_search_text(line)
-            if folded:
-                line_end = normalized_cursor + len(folded)
-                if idx is None and normalized_cursor <= index < line_end:
-                    idx = source_cursor + source_offset(line, index - normalized_cursor + 1) - 1
-                last = index + length - 1
-                if normalized_cursor <= last < line_end:
-                    end = source_cursor + source_offset(line, last - normalized_cursor + 1)
-                    break
-                normalized_cursor = line_end + 1  # collapsed line separator
-            source_cursor += len(line)
-        # Defensive fallback for unusual Unicode line-separator behavior.
-        if idx is None or end is None:
-            idx = source_offset(text, index + 1) - 1
-            end = source_offset(text, index + length)
-    start = max(0, idx - 50)
-    snippet = " ".join(text[start:end + 70].split())
-    if start > 0:
-        snippet = "…" + snippet
-    return snippet, idx
-
-
-def search_sessions(query: str) -> list[dict]:
-    """Return [{file, snippet, score}] for sessions whose content matches `query`.
-
-    Viewer custom-title hits rank first. Claude/Cursor native titles receive
-    half that weight, followed by user messages and ordinary transcript text.
-    Among equal scores, an earlier first occurrence wins.
-    """
-    q = common.normalize_search_text(query)
-    if not q:
+def search_sessions(query: str, *, wait: bool = False) -> list[dict] | None:
+    """[{file, snippet, score, pos}] for sessions matching ``query``, best
+    first, or None when a newer search replaced this one. Answers from what is
+    indexed unless ``wait`` brings the index up to date first."""
+    if SEARCH is None or not common.normalize_search_text(query):
         return []
-    out = []
-    for s in list_sessions():
-        user, rest = session_segments(s)
-        custom, native = _search_title_segments(s)
-        custom_low = common.normalize_search_text(custom)
-        native_low = common.normalize_search_text(native)
-        user_low, rest_low = session_segments(s, normalized=True)
-        c_custom = custom_low.count(q)
-        c_native = native_low.count(q)
-        c_user = user_low.count(q)
-        c_rest = rest_low.count(q)
-        if not c_custom and not c_native and not c_user and not c_rest:
-            continue
-        score = (
-            c_custom * CUSTOM_TITLE_WEIGHT
-            + c_native * NATIVE_TITLE_WEIGHT
-            + c_user * USER_MSG_WEIGHT
-            + c_rest
-        )
-        if c_custom:
-            combined, normalized, offset = custom, custom_low, 0
-        elif c_native:
-            combined, normalized, offset = native, native_low, len(custom)
-        elif c_user:
-            combined, normalized, offset = user, user_low, len(custom) + len(native)
-        else:
-            combined, normalized, offset = rest, rest_low, len(custom) + len(native) + len(user)
-        snippet, idx = _search_snippet(combined, normalized, normalized.find(q), len(q))
-        pos = offset + idx
-        out.append({"file": s["file"], "snippet": snippet, "score": score, "pos": pos})
-    out.sort(key=lambda m: (-m["score"], m["pos"]))
-    return out
+    return SEARCH.search(query, list_sessions(), wait=wait)
 
 
 # ---------------------------------------------------------------------------
@@ -1058,6 +891,7 @@ class Handler(BaseHTTPRequestHandler):
         if route == "/api/sessions":
             try:
                 self._send_json({"sessions": list_sessions(), "mica": mica_status(),
+                                 "search": search_status(),
                                  "setup": settings_check.check_settings(claude.PROJECTS_DIR.parent, codex.CODEX_HOME)})
             except Exception as e:  # noqa: BLE001
                 self._send_json({"error": str(e)}, status=500)
@@ -1101,7 +935,11 @@ class Handler(BaseHTTPRequestHandler):
             qs = parse_qs(parsed.query)
             q = qs.get("q", [""])[0]
             try:
-                self._send_json({"matches": search_sessions(q)})
+                matches = search_sessions(q)
+                body = {"matches": matches or [], "search": search_status()}
+                if matches is None:
+                    body["superseded"] = True  # a newer search is running
+                self._send_json(body)
             except Exception as e:  # noqa: BLE001
                 self._send_json({"error": str(e)}, status=500)
             return
@@ -1271,7 +1109,7 @@ def configure_mica(path, enabled: bool = True) -> None:
 
 
 def main():
-    global CUSTOM_NAMES_FILE, HOST_CHECK
+    global HOST_CHECK
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--port", type=int, default=3132)
     ap.add_argument("--host", default=DEFAULT_HOST)
@@ -1314,18 +1152,41 @@ def main():
         help="Mica to check transcripts against (used when it exists)",
     )
     ap.add_argument("--no-mica", action="store_true", help="ignore any Mica")
+    ap.add_argument(
+        "--search-index",
+        type=Path,
+        default=DEFAULT_SEARCH_INDEX_FILE,
+        help="full-text search index (an SQLite file; rebuilt if deleted)",
+    )
+    ap.add_argument(
+        "--reset-cache",
+        action="store_true",
+        help="delete the search index and sidebar summary cache, then exit",
+    )
     args = ap.parse_args()
 
-    CUSTOM_NAMES_FILE = args.custom_names_file.expanduser()
-    claude.configure(args.projects_dir)
-    codex.configure(args.codex_home)
-    cursor.configure(
-        args.cursor_db,
-        projects_dir=args.cursor_projects_dir,
-        chats_dir=args.cursor_chats_dir,
-    )
-    opencode.configure(args.opencode_db)
-    configure_mica(args.mica.expanduser(), enabled=not args.no_mica)
+    if args.reset_cache:
+        removed = search_index.remove_index_files(args.search_index.expanduser())
+        if CACHE_FILE.exists():
+            CACHE_FILE.unlink()
+            removed.append(CACHE_FILE)
+        for path in removed:
+            print(f"removed {path}")
+        print("caches reset; they rebuild the next time the viewer runs" if removed
+              else "no caches to reset")
+        return
+
+    configure_sources({
+        "projects_dir": args.projects_dir,
+        "codex_home": args.codex_home,
+        "cursor_db": args.cursor_db,
+        "cursor_projects": args.cursor_projects_dir,
+        "cursor_chats": args.cursor_chats_dir,
+        "opencode_db": args.opencode_db,
+        "mica": None if args.no_mica else args.mica,
+        "custom_names": args.custom_names_file,
+    })
+    configure_search(args.search_index)
     # Enforce the Host allowlist only on the safe loopback default; if the user
     # deliberately binds elsewhere for LAN access, step aside so it still works.
     HOST_CHECK = args.host in LOOPBACK_HOSTS
@@ -1341,12 +1202,15 @@ def main():
     print(f"  opencode db:     {opencode.DB_PATH}")
     if MICA is not None:
         print(f"  Mica:     {MICA.root}")
+    print(f"  search index:    {SEARCH.path}")
     print(f"  serving at:      {url}")
     print("  (Ctrl-C to stop)")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         print("\nbye")
+    finally:
+        SEARCH.close()
 
 
 if __name__ == "__main__":

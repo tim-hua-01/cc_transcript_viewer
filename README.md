@@ -97,6 +97,8 @@ python3 server.py --cursor-chats-dir PATH     # different ~/.cursor/chats (CLI s
 python3 server.py --cursor-projects-dir PATH  # different ~/.cursor/projects (CLI JSONL fallback)
 python3 server.py --opencode-db PATH     # different opencode.db (or the opencode data dir holding it)
 python3 server.py --custom-names-file PATH # different custom transcript names file
+python3 server.py --search-index PATH    # different search index file
+python3 server.py --reset-cache          # delete the search index and sidebar cache, then exit
 ```
 
 By default the server binds **127.0.0.1** (loopback only), so it isn't reachable from other machines
@@ -104,10 +106,14 @@ unless you deliberately pass `--host 0.0.0.0`.
 
 The viewer **auto-refreshes**: it checks the open on-disk transcript about three times a second and
 scans for sidebar changes once a second, preserving your scroll position and which
-thinking/tool blocks you've expanded. So an active session you're watching tails live. Reload the
-page if you ever need a full reset. Session metadata is cached by file mtime, so each poll only
-re-reads the files that actually changed — the cost doesn't grow with how many transcripts you've
-accumulated.
+thinking/tool blocks you've expanded. So an active session you're watching tails live. To save
+battery it stops polling while the tab is hidden, and after a minute without input or changes to
+the open transcript it slows to every 2 s and 5 s until you're back. Reload the page if you ever
+need a full reset. Session metadata is cached by file mtime, so each poll only re-reads the files
+that actually changed — the cost doesn't grow with how many transcripts you've accumulated.
+
+Both caches rebuild themselves, but if one ever seems wrong, `python3 server.py --reset-cache`
+deletes them (stop the viewer first).
 
 ## Features
 
@@ -132,8 +138,11 @@ accumulated.
   smart quotes, Unicode dashes/ellipsis, compatibility characters (such as full-width letters
   and ligatures), repeated whitespace/line breaks, and common invisible formatting characters.
   The same rules apply to sidebar metadata; snippets retain the original text. File-edit
-  replacements and patch bodies are searchable too. Powered by `/api/search` with an
-  mtime-keyed cache.
+  replacements and patch bodies are searchable too. Search reads a persistent on-disk index
+  (`~/.cache/transcript_viewer/search-index.sqlite3`) that the server keeps current in the
+  background with up to four worker processes, so it survives restarts and searches stay well
+  under a second without holding transcripts in memory. A line under the search box shows
+  indexing progress (results appear as sessions are indexed) and how many sessions match.
 - **Filters that compose.**
   - **All / Claude / Codex / Cursor / opencode** chips, each showing a live session count under the
     current search and filters; chips whose count is zero hide themselves.
@@ -275,6 +284,11 @@ This app reads your private transcripts, so it's built to keep them on your mach
   already referenced (image-typed only, as with `/api/local-image`). Nothing is uploaded — the file
   lands in your downloads folder. But a saved transcript *is* the whole session in one shareable
   file, so sharing one is on you: read it before you send it.
+- **The search index is a private, local copy.** To search quickly, the viewer keeps the searchable
+  text of your transcripts in `~/.cache/transcript_viewer/search-index.sqlite3` (or `--search-index`),
+  created owner-readable only (`0600`). It holds the same text as the transcripts it indexes, never
+  leaves your machine, and is pruned when a transcript disappears from every source. Delete it any
+  time with `python3 server.py --reset-cache`.
 - **Mica is read-only to the viewer.** When the optional [Mica](#optional-tamper-resistant-backups-mica)
   is installed, the viewer reads its captures and flags; it never writes to it, and serves only
   files Mica's own records name as captured transcripts.
@@ -492,7 +506,7 @@ reported.
 
 | File | Role |
 |------|------|
-| `server.py` | The unified stdlib HTTP layer plus everything that spans sources: merges the parsers' session lists into one time-sorted sidebar list, dispatches `/api/session` to the right parser by transcript root / `cursordb:`/`cursorcli:`/`opencode:` scheme, runs full-text search, owns custom names and summary-cache persistence, and serves the JSON API (`/api/sessions`, `/api/session?file=...`, `/api/mica-compare?file=...`, `/api/session-state?file=...`, `/api/session-name`, `/api/search?q=...`, `/api/local-image`, `/api/export?file=...`, `/api/open-local`, `/api/reveal-transcript`) plus the static frontend. `/api/session` only serves files under the allowed roots; `/api/session-name` only updates the viewer-owned names file; `/api/local-image` serves only image-typed files; and a `Host`-header allowlist guards the loopback server against DNS rebinding. |
+| `server.py` | The unified stdlib HTTP layer plus everything that spans sources: merges the parsers' session lists into one time-sorted sidebar list, dispatches `/api/session` to the right parser by transcript root / `cursordb:`/`cursorcli:`/`opencode:` scheme, wires up the full-text search index, owns custom names and summary-cache persistence, and serves the JSON API (`/api/sessions`, `/api/session?file=...`, `/api/mica-compare?file=...`, `/api/session-state?file=...`, `/api/session-name`, `/api/search?q=...`, `/api/local-image`, `/api/export?file=...`, `/api/open-local`, `/api/reveal-transcript`) plus the static frontend. `/api/session` only serves files under the allowed roots; `/api/session-name` only updates the viewer-owned names file; `/api/local-image` serves only image-typed files; and a `Host`-header allowlist guards the loopback server against DNS rebinding. |
 | `claude_parser.py` | Claude Code parsing library (imported by `server.py`): parses session JSONL into a clean event stream (pairing tool results to calls), detects system-injected "user" records, folds rewound/edited branches into collapsible markers, labels sub-agents from their spawning `Task`/`Agent` calls, and builds sidebar summaries (cold scans use a process pool). Call `configure(projects_dir)` to point it elsewhere. |
 | `codex_parser.py` | Codex parsing library: parses rollout JSONL, reads `state_5.sqlite` metadata, pairs tool calls with outputs, unpacks orchestration-style `exec` calls, correlates local and embedded prompt images, consolidates per-turn bookkeeping, recognizes guardian/sub-agent relationships, and renders `apply_patch` diffs. Call `configure(codex_home)` to point it elsewhere. |
 | `cursor_parser.py` | Cursor parsing library: reads IDE `state.vscdb`; reads CLI `~/.cursor/chats/.../store.db` (with JSONL fallback under `agent-transcripts`); normalizes tool names/inputs; reconstructs IDE `edit_file` diffs; decodes grep/glob results out of Cursor's binary protobuf tool records (`toolCallBinary`) since newer Cursor versions no longer store them as JSON; emits Claude-shaped events. IDE uses `cursordb:<id>`; CLI store uses `cursorcli:<id>`. Call `configure(db_path, projects_dir=…, chats_dir=…)` to retarget. |
@@ -503,6 +517,8 @@ reported.
 | `codex_export/codex_rollout.py` | The parts of writing a Codex rollout that aren't specific to any source — record shape, `rollout-<time>-<id>.jsonl` naming, dated output layout — shared by both exporters so they can't drift. |
 | `export_html.py` | Bundles one parsed session into a self-contained HTML file for `/api/export`: inlines `static/style.css` and `static/app.js` into `static/index.html`, embeds the session as a JSON literal, and re-embeds locally-referenced images as `data:` URIs under a per-image and whole-file size budget. Deliberately has no renderer of its own — the saved page runs the same `app.js`, which detects the embedded payload and switches to standalone mode. |
 | `mica/` | The optional [Mica](#optional-tamper-resistant-backups-mica): `capture.py` (the polling daemon that copies appends into append-only, hash-chained generations and records tamper events), `store.py` (the on-disk format and the read-only `StoreReader` the viewer uses to badge sessions, list deleted ones, and compare a live file with its capture), `install.py` (macOS `_mica` user, root-owned install, ACLs, LaunchDaemon), and `__main__.py` (`python3 -m mica daemon/status/flagged/verify/install/uninstall`). Standard library only, Python 3.9-compatible so it runs on Apple's root-owned interpreter. |
+| `search_index.py` | The persistent full-text search index: one SQLite file of per-session search documents, kept current by a coordinator thread that has up to four worker processes parse and store changed sessions (live transcripts at most every 30 s), plus scoring, snippets, and the progress status the search box shows. Never imports `server.py`; the server passes in `load_session` and its source settings. |
+| `search_text.py` | Pure functions for what a session contributes to search: text extraction from parsed events, normalized text plus line-aligned source chunks, and mapping a match back to a source snippet. |
 | `common.py` | Everything the four parsers share: JSONL iteration, JSON/SQLite access, title truncation, timestamp conversion, the sidebar-summary shape (`make_summary`), and the thread-safe fingerprint-keyed `SummaryCache` (plus its `cached_summary` wrapper) all of them use. |
 | `event_schema.py` | The written-down (and machine-checked) event contract between the parsers and the frontend: every event kind, both message shapes, and validators the test suite runs over every parser's output. |
 | `static/index.html`, `static/style.css`, `static/app.js` | The single frontend (vanilla JS, no build step). `app.js` dispatches on event kind and renders the Claude Code / Cursor / opencode (block-based) and Codex (flat) shapes, and runs the always-on live-refresh poll loop. When `window.__TRANSCRIPT_EXPORT__` is present (a saved single-file transcript) it renders that session directly and disables everything that needs the server. CDN assets (marked, DOMPurify, KaTeX) are version-pinned with SRI integrity hashes. |
@@ -514,6 +530,7 @@ reported.
 | `tests/test_claude_parser.py`, `tests/test_codex_parser.py`, `tests/test_cursor_parser.py`, `tests/test_opencode_parser.py` | Characterization tests for each parser's internals — branch folding and queued prompts (Claude), the JS-literal orchestration parser (Codex), blob/JSON extraction and diff reconstruction (Cursor), and the part→event mapping (opencode). |
 | `tests/test_event_schema.py` | Conformance tests: every parser's summaries and full parses must satisfy `event_schema.py`, and `app.js` must dispatch on every declared kind. |
 | `tests/test_golden_transcripts.py`, `tests/fixtures/` | Regression tests over checked-in, fictional transcript files whose field shapes were compared with current local stores. The fixture README records the sanitization and review rules. |
+| `tests/test_search.py`, `tests/test_search_text.py`, `tests/test_search_index.py` | Search ranking and snippet regressions through a real index; chunked normalization and snippets checked against the whole-text versions on random Unicode; and the index's persistence, invalidation, privacy, corruption recovery, background progress, and worker processes. |
 | `tests/test_summary_cache.py`, `tests/test_common.py` | Unit tests for the shared layer: summary-cache round-trip persistence, fingerprint invalidation and dirty-flag races, plus the small helpers in `common.py`. |
 | `tests/test_mica.py` | Mica tests with a fake clock: appends, truncation, emptied files, near-end and deep rewrites, atomic replacements, deletions (flagged regardless of age or retention settings), delete-then-recreate, Codex archive moves, forks and in-file branches (not flagged), offline changes, lost access (flagged with a recorded start and end, not a deletion), symlinks, crash recovery, hash-chain verification, the viewer's badges/copies/compare endpoint (and that it never writes to the store), and the installer's plan (which stops a running daemon before re-granting access). |
 | `tests/fixture_builders.py` | Shared fixture builders that write temporary minimal-but-valid transcripts and databases for each source, and `ViewerServerTestCase`, a live loopback server over those fixtures. |

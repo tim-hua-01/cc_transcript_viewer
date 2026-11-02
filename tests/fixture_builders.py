@@ -26,26 +26,32 @@ import server
 
 
 def patch_server_files(server_module, tmp: Path):
-    """Point the viewer-owned files (custom names, summary cache) into tmp so
-    tests never touch the user's real ones. Return all replaced state so the
-    caller can restore it even when test modules run in a different order."""
+    """Point the viewer-owned files (custom names, summary cache, search
+    index) into tmp so tests never touch the user's real ones. Return all
+    replaced state so the caller can restore it even when test modules run in
+    a different order. The search index extracts in-process (no workers)."""
     old_state = (
         server_module.CUSTOM_NAMES_FILE,
         server_module._CUSTOM_NAMES_CACHE,
         server_module.CACHE_FILE,
+        server_module.SEARCH,
     )
     server_module.CUSTOM_NAMES_FILE = tmp / "viewer" / "names.json"
     server_module._CUSTOM_NAMES_CACHE = None
     server_module.CACHE_FILE = tmp / "cache" / "summaries.json"
+    server_module.SEARCH = None  # the previous index stays open for restore
+    server_module.configure_search(tmp / "cache" / "search-index.sqlite3", workers=0)
     return old_state
 
 
 def restore_server_files(server_module, old_state) -> None:
     """Undo ``patch_server_files`` without retaining a deleted temp path."""
+    server_module.SEARCH.close()
     (
         server_module.CUSTOM_NAMES_FILE,
         server_module._CUSTOM_NAMES_CACHE,
         server_module.CACHE_FILE,
+        server_module.SEARCH,
     ) = old_state
 
 

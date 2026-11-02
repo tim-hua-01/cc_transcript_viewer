@@ -173,6 +173,87 @@ class StandaloneBrowserJourneyTests(unittest.TestCase):
             "regressionVisible", "sourceFailureVisible", "rowTagged", "gapExplained", "cleanLockHidden",
         ), True))
 
+    def test_search_status_shows_indexing_progress_and_refreshes_only_when_needed(self):
+        """The line under the search box reports indexing progress and match
+        counts; an open search re-runs when the index moves on, but not when
+        only a transcript's mtime changes."""
+        base = codex.session_summary(FIXTURE)
+        alpha = dict(base, file="/fixture/alpha.jsonl", id="alpha", title="Alpha")
+        beta = dict(base, file="/fixture/beta.jsonl", id="beta", title="Beta")
+
+        rendered = (export_html.STATIC_DIR / "index.html").read_text()
+        rendered = re.sub(r'<script\b[^>]*\bsrc="https://[^"]+"[^>]*></script>', "", rendered)
+        rendered = re.sub(r'<link\b[^>]*\bhref="https://[^"]+"[^>]*>', "", rendered)
+        rendered = rendered.replace(export_html.STYLE_LINK,
+                                    "<style>" + (export_html.STATIC_DIR / "style.css").read_text() + "</style>")
+        mocked_api = """<script>
+          localStorage.clear();
+          window.__api = {
+            sessions: [__ALPHA__, __BETA__],
+            search: {state: 'building', indexed: 1, total: 2, generation: 1, error: null},
+            matches: [{file: '/fixture/alpha.jsonl', snippet: 'needle in alpha', score: 1}],
+            searches: 0,
+          };
+          const reply = (body) => ({json: async () => body});
+          window.fetch = async (url) => {
+            const api = window.__api;
+            if (url.startsWith('/api/sessions')) return reply({sessions: api.sessions, search: api.search,
+              mica: {enabled: false}, setup: {issues: []}});
+            if (url.startsWith('/api/search')) {
+              api.searches++;
+              return reply({matches: api.matches, search: api.search});
+            }
+            return reply({});
+          };
+        </script>""".replace("__ALPHA__", json.dumps(alpha)).replace("__BETA__", json.dumps(beta))
+        rendered = rendered.replace(export_html.APP_SCRIPT, mocked_api + "<script>\n" +
+                                    (export_html.STATIC_DIR / "app.js").read_text() + "\n</script>")
+        probe = """<script>
+          const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+          const poll = () => sleep(1100);
+          const status = () => {
+            const box = document.querySelector('#search-status');
+            return box.hidden ? '' : box.textContent;
+          };
+          (async () => {
+            const result = {};
+            const api = window.__api;
+            await sleep(100);
+            result.idle = status();
+            result.progressBar = !!document.querySelector('#search-status .search-progress');
+            const box = document.querySelector('#search');
+            box.value = 'needle';
+            box.dispatchEvent(new Event('input'));
+            await sleep(400);
+            result.partial = status();
+            result.searchesAfterTyping = api.searches;
+            api.search = {state: 'ready', indexed: 2, total: 2, generation: 2, error: null};
+            api.matches = [...api.matches, {file: '/fixture/beta.jsonl', snippet: 'needle in beta', score: 1}];
+            await poll();
+            result.complete = status();
+            result.searchesAfterIndexing = api.searches;
+            api.sessions = api.sessions.map((s) => ({...s, mtime: s.mtime + 10}));
+            await poll();
+            result.searchesAfterMtimeOnly = api.searches;
+            api.sessions = api.sessions.map((s) => s.id === 'beta' ? {...s, custom_title: 'Renamed'} : s);
+            await poll();
+            result.searchesAfterRename = api.searches;
+            document.body.setAttribute('data-test-probe', encodeURIComponent(JSON.stringify(result)));
+          })();
+        </script>"""
+        rendered = rendered.replace("</body>", probe + "\n</body>", 1)
+        result = self.probe_page(rendered, budget_ms=8000)
+        self.assertEqual(result, {
+            "idle": "Indexing transcripts for search: 1 of 2",
+            "progressBar": True,
+            "partial": "1 matching session · indexing transcripts for search: 1 of 2, more may appear",
+            "searchesAfterTyping": 1,
+            "complete": "2 matching sessions",
+            "searchesAfterIndexing": 2,
+            "searchesAfterMtimeOnly": 2,
+            "searchesAfterRename": 3,
+        })
+
     def test_search_normalization_and_sidebar_metadata(self):
         cases = json.loads((Path(__file__).parent / "fixtures/search_normalization.json").read_text())
         rendered = export_html.build_standalone_html(codex.parse_session(FIXTURE))

@@ -136,7 +136,28 @@ still a single source of truth. Output must be identical:
 
 Expected: cold search roughly 15 s to 9 s.
 
-### 3. A persistent search index (Findings 3–7)
+### 3. A persistent search index (Findings 3–7) — done
+
+Result, on 333 sessions (about 1.6 GB of transcripts):
+
+| | Before | After |
+|---|---|---|
+| First search after a server start | 15 s to over a minute, nothing on screen | answers at once from the index; a status line shows progress while it is built |
+| Building the index from nothing | (rebuilt in every server process) | 6–8 s with 4 workers, once; a restart reopens it in 0.02 s |
+| Repeat searches | 0.05–0.4 s | 0.07–0.3 s, snippets included |
+| Server memory for search | 472 MB cache, +870 MB RSS | +23 MB during a full build, about 100 MB total after searches |
+| Disk | — | 275 MB (`search-index.sqlite3`, mode `0600`) |
+
+Two adjustments from the design after measuring. Workers store their own
+documents instead of sending them back to the coordinator; sending them back
+left the server 186 MB larger, because the allocator holds on to memory
+freed in pieces the size of a 64 KB chunk. And filtering rows with SQLite's
+`instr()` before they reach Python was slower than Python's `bytes.count`, so
+search reads every row.
+
+Still open: a cold *session list* (summary cache lost) parses Codex
+transcripts inside the server process and leaves it a few hundred MB larger.
+That is the "cold session list" item under Later.
 
 This replaces the earlier plan of a compact in-memory store plus background
 warm-up. The in-memory cache was never designed: it is a dict in `server.py`

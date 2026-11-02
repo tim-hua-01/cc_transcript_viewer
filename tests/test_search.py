@@ -2,28 +2,40 @@
 from __future__ import annotations
 
 import json
+import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 from urllib.parse import urlencode
 
+import search_index
+import search_text
 import server
-import common
 from tests.fixture_builders import ViewerServerTestCase, _write_fixture_session
+
+
+def search_in_index(query, sessions):
+    """Search ``sessions`` ({file, user?, rest?, titles…}) through a real,
+    temporary index; user/rest become that session's two text segments."""
+    by_file = {s["file"]: s for s in sessions}
+
+    def load(file_id):
+        s = by_file[file_id]
+        return {"events": [{"kind": "user", "text": s.get("user", "")},
+                           {"kind": "assistant", "text": s.get("rest", "")}]}
+
+    summaries = [dict(s, agent="claude", mtime=1) for s in sessions]
+    with tempfile.TemporaryDirectory() as td:
+        index = search_index.SearchIndex(Path(td) / "index.sqlite3", load, workers=0)
+        try:
+            return index.search(query, summaries, wait=True)
+        finally:
+            index.close()
 
 
 class NormalizedSearchTests(unittest.TestCase):
     def search(self, query, sessions):
-        summaries = [dict(s, agent="claude") for s in sessions]
-
-        def segments(s, *, normalized=False):
-            pair = s.get("user", ""), s.get("rest", "")
-            return tuple(common.normalize_search_text(t) for t in pair) if normalized else pair
-
-        with (
-            mock.patch.object(server, "list_sessions", return_value=summaries),
-            mock.patch.object(server, "session_segments", side_effect=segments),
-        ):
-            return server.search_sessions(query)
+        return search_in_index(query, sessions)
 
     def test_normalizes_both_query_and_content_in_all_ranked_segments(self):
         sessions = [
@@ -63,9 +75,13 @@ class NormalizedSearchTests(unittest.TestCase):
         self.assertIn("Ａｄａ’s oﬃce end", hit["snippet"])
 
     def test_empty_normalized_query_does_not_scan_sessions(self):
-        with mock.patch.object(server, "list_sessions") as listing:
+        with (
+            mock.patch.object(server, "SEARCH", mock.Mock()),
+            mock.patch.object(server, "list_sessions") as listing,
+        ):
             self.assertEqual(server.search_sessions(" \u200b\ufeff\t"), [])
             listing.assert_not_called()
+            server.SEARCH.search.assert_not_called()
 
 
 class ToolInputSearchTests(unittest.TestCase):
@@ -82,38 +98,19 @@ class ToolInputSearchTests(unittest.TestCase):
                 with self.subTest(inp=inp, shape=shape):
                     event = {"input": inp} if shape == "flat" else {
                         "blocks": [{"type": "tool_use", "name": "Edit", "input": inp}]}
-                    text = "\n".join(server._event_text(event))
+                    text = "\n".join(search_text.event_text(event))
                     self.assertIn("old wording", text)
                     self.assertIn("new wording", text)
 
 
 class SystemPromptSearchTests(unittest.TestCase):
     def test_system_instructions_are_not_indexed_but_others_are(self):
-        user, rest = server._session_segments({"events": [
+        user, rest = search_text.session_segments({"events": [
             {"kind": "instructions", "role": "system", "label": "System prompt", "text": "boilerplate"},
             {"kind": "instructions", "role": "developer", "label": "AGENTS.md", "text": "project rules"},
         ]})
         self.assertNotIn("boilerplate", user + rest)
         self.assertIn("project rules", rest)
-
-
-class SearchCacheTests(unittest.TestCase):
-    def test_normalized_cache_is_reused_and_invalidated_with_source(self):
-        session = {"file": "fixture", "mtime": 1}
-        first = {"events": [{"kind": "user", "text": "Ada’s example"}]}
-        second = {"events": [{"kind": "user", "text": "changed example"}]}
-        with (
-            mock.patch.object(server, "_TEXT_CACHE", {}),
-            mock.patch.object(server, "load_session", side_effect=[first, second]) as load,
-            mock.patch.object(common, "normalize_search_text", wraps=common.normalize_search_text) as normalize,
-        ):
-            self.assertEqual(server.session_segments(session), ("Ada’s example", ""))
-            calls = normalize.call_count
-            self.assertEqual(server.session_segments(session, normalized=True), ("ada's example", ""))
-            self.assertEqual(normalize.call_count, calls)
-            session["mtime"] = 2
-            self.assertEqual(server.session_segments(session, normalized=True), ("changed example", ""))
-            self.assertEqual(load.call_count, 2)
 
 
 class SearchEndpointTests(ViewerServerTestCase):
@@ -130,9 +127,12 @@ class SearchEndpointTests(ViewerServerTestCase):
                 }]},
             },),
         )
+        server.SEARCH.sync(server.list_sessions())
         status, _, body = self.get("/api/search?" + urlencode({"q": "author’s own example works"}))
         self.assertEqual(status, 200)
-        hit, = json.loads(body)["matches"]
+        payload = json.loads(body)
+        self.assertEqual(payload["search"]["state"], "ready")
+        hit, = payload["matches"]
         self.assertEqual(hit["file"], str(path))
         self.assertIn("author's own example works", hit["snippet"])
 

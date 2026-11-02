@@ -390,6 +390,11 @@ let LAST_RENDERED_TITLE = "";    // detects custom-name changes without transcri
 let LAST_SIG = "";               // cheap fingerprint of the session list
 // file -> snippet for the active content search, or null when no search is active
 let CONTENT_MATCHES = null;
+// The server's search index: {state: building|ready|error, indexed, total,
+// generation, error}, from /api/sessions and /api/search.
+let SEARCH_STATUS = null;
+let SEARCH_IN_FLIGHT = false;    // a typed search is waiting for the server
+let LAST_SEARCH_KEY = "";        // searchKey() when CONTENT_MATCHES was fetched
 // Selected values for the dropdown filters; empty set = no constraint (all).
 const SELECTED_MODELS = new Set();
 const SELECTED_DIRS = new Set();
@@ -409,6 +414,7 @@ async function loadSessions() {
   SESSIONS = data.sessions || [];
   SESSIONS_LOADED = true;
   MICA_STATUS = data.mica || { enabled: false };
+  SEARCH_STATUS = data.search || null;
   renderSetupBanner(data.setup);
   LAST_SIG = sessionsSignature(SESSIONS);
   buildFilters();
@@ -738,6 +744,7 @@ function renderSidebar(query) {
   }
 
   VISIBLE_SESSIONS = matches;
+  renderSearchStatus();
   const matchedByFile = new Map(matches.map((s) => [s.file, s]));
   const subagentCounts = new Map();
   for (const s of matches) {
@@ -2283,26 +2290,85 @@ function oneLineJson(obj) {
 // ---------- search / filter wiring ----------
 // Fetch content matches from the server, then re-render. Title/cwd/id matching
 // still happens instantly client-side in renderSidebar; this adds full-text.
+// `quiet` refreshes (the index moved on) don't flash "Searching…".
 let searchSeq = 0;
-async function runSearch(query) {
+let searchFailed = false;
+async function runSearch(query, { quiet = false } = {}) {
   const q = (query || "").trim();
   if (!q) {
     CONTENT_MATCHES = null;
+    SEARCH_IN_FLIGHT = false;
     renderSidebar(query);
     return;
   }
   const seq = ++searchSeq;
+  if (!quiet) SEARCH_IN_FLIGHT = true;
   renderSidebar(query); // instant feedback on title/cwd while content search is in flight
   try {
     const res = await fetch("/api/search?q=" + encodeURIComponent(q));
     const data = await res.json();
     if (seq !== searchSeq) return; // a newer search superseded this one
+    if (data.search) SEARCH_STATUS = data.search;
+    // Another tab's search replaced this one on the server: keep the current
+    // results; the key mismatch makes the next poll search again.
+    if (data.superseded) return;
     CONTENT_MATCHES = new Map((data.matches || []).map((m) => [m.file, { snippet: m.snippet, score: m.score }]));
+    LAST_SEARCH_KEY = searchKey();
+    searchFailed = false;
   } catch (e) {
     if (seq !== searchSeq) return;
     CONTENT_MATCHES = new Map();
+    searchFailed = true;
+  } finally {
+    if (seq === searchSeq) SEARCH_IN_FLIGHT = false;
   }
   renderSidebar(query);
+}
+
+// What content results depend on besides the query: the indexed content
+// (its generation) and every session's titles, which are scored too.
+function searchKey() {
+  let key = String(SEARCH_STATUS ? SEARCH_STATUS.generation : "") + "|";
+  for (const s of SESSIONS) {
+    key += s.file + ":" + (s.custom_title || "") + ":" + (s.original_title || "") + ":" +
+      (s.claude_title || "") + ":" + (s.ai_title || "") + ";";
+  }
+  return key;
+}
+
+// The line under the search box: indexing progress, a search in flight, or
+// how many sessions match. Hidden when there's nothing to say.
+function renderSearchStatus() {
+  const box = $("#search-status");
+  if (!box || STANDALONE) return;
+  const st = SEARCH_STATUS;
+  const q = $("#search").value.trim();
+  const building = st && st.state === "building";
+  const parts = [];
+  if (st && st.state === "error") parts.push("Search index error: " + (st.error || "unknown"));
+  if (q) {
+    if (SEARCH_IN_FLIGHT) parts.push("Searching…");
+    else if (searchFailed) parts.push("Search failed; showing title matches only");
+    else if (CONTENT_MATCHES) {
+      const n = VISIBLE_SESSIONS.length;
+      parts.push(`${n} matching session${n === 1 ? "" : "s"}`);
+    }
+  }
+  if (building) {
+    parts.push(`indexing transcripts for search: ${st.indexed} of ${st.total}` +
+      (q ? ", more may appear" : ""));
+  }
+  const text = parts.join(" · ");
+  box.hidden = !text;
+  box.classList.toggle("search-status-error", !!(st && st.state === "error") || searchFailed);
+  if (!text) return;
+  const fill = el("div", { class: "search-progress-fill" });
+  if (building) fill.style.width = (st.total ? (100 * st.indexed) / st.total : 0) + "%";
+  // replaceChildren (unlike el) would render a null child as the text "null".
+  box.replaceChildren(...[
+    el("span", {}, text.charAt(0).toUpperCase() + text.slice(1)),
+    building ? el("div", { class: "search-progress", "aria-hidden": "true" }, fill) : null,
+  ].filter(Boolean));
 }
 
 let searchTimer;
@@ -2328,10 +2394,14 @@ function markActive() {
 
 // Rebuild the sidebar from a fresh SESSIONS list without disturbing the
 // reader: keep the sidebar's own scroll offset and re-mark the active session.
+// An open search runs again only when its results could differ; transcripts
+// being written change the list every poll, but not the index that often.
 async function refreshSidebar() {
   const listEl = $("#session-list");
   const sTop = listEl.scrollTop;
-  await runSearch($("#search").value); // re-run content search against the fresh set
+  const query = $("#search").value;
+  if (query.trim() && searchKey() !== LAST_SEARCH_KEY) await runSearch(query, { quiet: true });
+  else renderSidebar(query);
   listEl.scrollTop = sTop;
   markActive();
 }
@@ -2692,10 +2762,13 @@ async function pollSidebar() {
       const body = await res.json();
       next = body.sessions || [];
       MICA_STATUS = body.mica || { enabled: false };
+      SEARCH_STATUS = body.search || null;
       renderSetupBanner(body.setup);
     } catch (e) { return false; } // server momentarily unreachable; retry next tick
     const sig = sessionsSignature(next);
-    if (sig !== LAST_SIG) {
+    if (sig === LAST_SIG && $("#search").value.trim() && searchKey() !== LAST_SEARCH_KEY) {
+      await refreshSidebar(); // the index caught up: newly indexed content may match
+    } else if (sig !== LAST_SIG) {
       LAST_SIG = sig;
       SESSIONS = next;
       // A session in a new project or on a new model must show up in the
@@ -2707,6 +2780,7 @@ async function pollSidebar() {
           MICA_COMPARE.sig !== micaSig(CURRENT_FILE)) refreshMicaBanner();
     }
     renderMicaStatus();
+    renderSearchStatus(); // indexing progress moves even when the list doesn't
     // Synthetic Cursor sessions have no standalone file to stat, so retain
     // mtime detection here. Title changes for every source also flow here.
     if (CURRENT_FILE) {

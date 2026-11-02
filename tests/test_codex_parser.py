@@ -12,6 +12,7 @@ from unittest import mock
 from urllib.parse import quote
 
 import codex_parser as codex
+import search_text
 import server
 from tests.fixture_builders import ViewerServerTestCase, _write_jsonl
 
@@ -284,7 +285,7 @@ class CodexOrchestrationTests(unittest.TestCase):
         command = codex._normalize_tool_input("exec", command_source)
         self.assertEqual(command["calls"][0]["name"], "exec_command")
         self.assertEqual(command["calls"][0]["input"]["cmd"], "git status --short")
-        self.assertIn("git status --short", server._event_text({"input": command}))
+        self.assertIn("git status --short", search_text.event_text({"input": command}))
 
         patch_source = (
             'const patch = "*** Begin Patch\\n*** Update File: a\\n@@\\n-x\\n+y\\n*** End Patch";'

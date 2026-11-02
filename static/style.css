@@ -463,6 +463,11 @@ body.standalone.sidebar-collapsed .edge-toggle-left { display: none; }
   transition: border-color var(--ease), box-shadow var(--ease);
 }
 #search:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--focus-ring); }
+.search-status { margin: 6px 2px 0; font-size: 11px; color: var(--muted); }
+.search-status[hidden] { display: none; }
+.search-status-error { color: var(--tool-err); }
+.search-progress { margin-top: 4px; height: 2px; border-radius: 1px; background: var(--border); overflow: hidden; }
+.search-progress-fill { width: 0; height: 100%; background: var(--accent); transition: width .3s ease; }
 #filter-row { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
 .filter-chip {
   font-size: 11px; padding: 3px 10px; border-radius: 999px;
