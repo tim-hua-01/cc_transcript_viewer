@@ -254,6 +254,97 @@ class StandaloneBrowserJourneyTests(unittest.TestCase):
             "searchesAfterRename": 3,
         })
 
+    def test_search_retries_when_the_index_finishes_during_a_request(self):
+        result = self.probe_search_script("""
+          let searches = 0;
+          SEARCH_STATUS = {...ready, state: 'building', indexed: 1, generation: 1};
+          window.fetch = async (url) => {
+            if (url.startsWith('/api/sessions')) return reply({sessions: SESSIONS, search: ready});
+            // The scan saw only one document, but indexing finished before
+            // the response status was collected. The next scan sees both.
+            searches++;
+            return reply({matches: searches === 1 ? [hit(one)] : [hit(one), hit(two)], search: ready});
+          };
+          input.value = 'needle';
+          await runSearch(input.value);
+          const partial = VISIBLE_SESSIONS.map(s => s.id);
+          await pollSidebar();
+          const complete = VISIBLE_SESSIONS.map(s => s.id);
+          await pollSidebar();
+          return {partial, complete, searches};
+        """)
+        self.assertEqual(result, {"partial": ["one"], "complete": ["one", "two"], "searches": 2})
+
+    def test_a_superseded_query_is_retried_and_clearing_discards_pending_results(self):
+        result = self.probe_search_script("""
+          let searches = 0;
+          window.fetch = async (url) => {
+            if (url.startsWith('/api/sessions')) return reply({sessions: SESSIONS, search: ready});
+            searches++;
+            if (searches === 2) return reply({superseded: true, matches: [], search: ready});
+            return reply({matches: [hit(searches === 1 ? one : two)], search: ready});
+          };
+          input.value = 'oldword';
+          await runSearch(input.value);
+          const old = VISIBLE_SESSIONS.map(s => s.id);
+          input.value = 'newword';
+          await runSearch(input.value);
+          const canceled = VISIBLE_SESSIONS.map(s => s.id);
+          const inFlightAfterCancel = SEARCH_IN_FLIGHT;
+          await pollSidebar();
+          const retried = VISIBLE_SESSIONS.map(s => s.id);
+
+          let finish;
+          window.fetch = () => new Promise(resolve => { finish = resolve; });
+          const pending = runSearch('anotherword');
+          input.value = '';
+          await runSearch(input.value);
+          finish(reply({matches: [hit(two)], search: ready}));
+          await pending;
+          return {old, canceled, retried, searches, inFlightAfterCancel,
+                  cleared: CONTENT_MATCHES === null, visibleAfterClear: VISIBLE_SESSIONS.length};
+        """)
+        self.assertEqual(result, {
+            "old": ["one"], "canceled": [], "retried": ["two"], "searches": 3,
+            "inFlightAfterCancel": False, "cleared": True, "visibleAfterClear": 2,
+        })
+
+    def probe_search_script(self, script):
+        """Exercise the real search and polling code with scripted responses.
+
+        Standalone mode keeps automatic timers out of these tests; the probe
+        calls the same poll functions explicitly to control response ordering.
+        """
+        rendered = export_html.build_standalone_html(codex.parse_session(FIXTURE))
+        rendered = re.sub(r'<script\b[^>]*\bsrc="https://[^"]+"[^>]*></script>', "", rendered)
+        rendered = re.sub(r'<link\b[^>]*\bhref="https://[^"]+"[^>]*>', "", rendered)
+        base = codex.session_summary(FIXTURE)
+        one = dict(base, file="/fixture/one.jsonl", id="one", title="First session")
+        two = dict(base, file="/fixture/two.jsonl", id="two", title="Second session")
+        probe = """<script>
+          (async () => {
+            const one = __ONE__, two = __TWO__;
+            SESSIONS = [one, two];
+            CURRENT_FILE = null;
+            LAST_SIG = sessionsSignature(SESSIONS);
+            const ready = {state: 'ready', indexed: 2, total: 2, generation: 2, error: null};
+            SEARCH_STATUS = ready;
+            const input = document.querySelector('#search');
+            const hit = s => ({file: s.file, snippet: 'content match', score: 1});
+            const reply = body => ({json: async () => body});
+            let result;
+            try {
+              result = await (async () => { __SCRIPT__ })();
+            } catch (error) {
+              result = {error: String(error)};
+            }
+            document.body.setAttribute('data-test-probe', encodeURIComponent(JSON.stringify(result)));
+          })();
+        </script>""".replace("__ONE__", json.dumps(one)).replace("__TWO__", json.dumps(two))
+        probe = probe.replace("__SCRIPT__", script)
+        rendered = rendered.replace("</body>", probe + "\n</body>", 1)
+        return self.probe_page(rendered)
+
     def test_search_normalization_and_sidebar_metadata(self):
         cases = json.loads((Path(__file__).parent / "fixtures/search_normalization.json").read_text())
         rendered = export_html.build_standalone_html(codex.parse_session(FIXTURE))

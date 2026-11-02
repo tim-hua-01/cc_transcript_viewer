@@ -394,7 +394,7 @@ let CONTENT_MATCHES = null;
 // generation, error}, from /api/sessions and /api/search.
 let SEARCH_STATUS = null;
 let SEARCH_IN_FLIGHT = false;    // a typed search is waiting for the server
-let LAST_SEARCH_KEY = "";        // searchKey() when CONTENT_MATCHES was fetched
+let LAST_SEARCH_KEY = "";        // query, index revision and titles when the request started
 // Selected values for the dropdown filters; empty set = no constraint (all).
 const SELECTED_MODELS = new Set();
 const SELECTED_DIRS = new Set();
@@ -2294,14 +2294,20 @@ function oneLineJson(obj) {
 let searchSeq = 0;
 let searchFailed = false;
 async function runSearch(query, { quiet = false } = {}) {
+  const seq = ++searchSeq;
   const q = (query || "").trim();
   if (!q) {
     CONTENT_MATCHES = null;
     SEARCH_IN_FLIGHT = false;
+    LAST_SEARCH_KEY = "";
+    searchFailed = false;
     renderSidebar(query);
     return;
   }
-  const seq = ++searchSeq;
+  // This revision predates the scan. The response's status can describe a
+  // newer index than its results saw; retaining this key makes polling catch
+  // up even when that response arrives just after the final indexing write.
+  const key = searchKey(q);
   if (!quiet) SEARCH_IN_FLIGHT = true;
   renderSidebar(query); // instant feedback on title/cwd while content search is in flight
   try {
@@ -2309,31 +2315,37 @@ async function runSearch(query, { quiet = false } = {}) {
     const data = await res.json();
     if (seq !== searchSeq) return; // a newer search superseded this one
     if (data.search) SEARCH_STATUS = data.search;
-    // Another tab's search replaced this one on the server: keep the current
-    // results; the key mismatch makes the next poll search again.
-    if (data.superseded) return;
+    // Another tab canceled this request. Its results must be retried even if
+    // the index has not changed, and the previous query's matches cannot stay.
+    if (data.superseded) {
+      CONTENT_MATCHES = null;
+      LAST_SEARCH_KEY = "";
+      return;
+    }
     CONTENT_MATCHES = new Map((data.matches || []).map((m) => [m.file, { snippet: m.snippet, score: m.score }]));
-    LAST_SEARCH_KEY = searchKey();
+    LAST_SEARCH_KEY = key;
     searchFailed = false;
   } catch (e) {
     if (seq !== searchSeq) return;
     CONTENT_MATCHES = new Map();
+    LAST_SEARCH_KEY = "";
     searchFailed = true;
   } finally {
-    if (seq === searchSeq) SEARCH_IN_FLIGHT = false;
+    if (seq === searchSeq) {
+      SEARCH_IN_FLIGHT = false;
+      renderSidebar(query);
+    }
   }
-  renderSidebar(query);
 }
 
-// What content results depend on besides the query: the indexed content
-// (its generation) and every session's titles, which are scored too.
-function searchKey() {
-  let key = String(SEARCH_STATUS ? SEARCH_STATUS.generation : "") + "|";
-  for (const s of SESSIONS) {
-    key += s.file + ":" + (s.custom_title || "") + ":" + (s.original_title || "") + ":" +
-      (s.claude_title || "") + ":" + (s.ai_title || "") + ";";
-  }
-  return key;
+// Everything content results depend on: the query, the indexed content's
+// generation, and every session's titles, which are scored too.
+function searchKey(query = $("#search").value) {
+  return JSON.stringify([
+    normalizeSearchText(query), SEARCH_STATUS ? SEARCH_STATUS.generation : "",
+    SESSIONS.map(s => [s.file, s.custom_title || "", s.original_title || "",
+                      s.claude_title || "", s.ai_title || ""]),
+  ]);
 }
 
 // The line under the search box: indexing progress, a search in flight, or
