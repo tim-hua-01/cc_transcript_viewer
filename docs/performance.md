@@ -105,8 +105,8 @@ already in place).
 
 ## Plan
 
-One small, separately tested commit per step, with a `bench.py` run before
-and after. Steps 1–3 are independent; 4 depends on 3.
+Each step is a separately tested commit (step 3 is one larger commit), with a
+`bench.py` run before and after.
 
 ### 1. Stop shipping `result.structured` (Finding 1) — done, `fa0bf28`
 
@@ -136,72 +136,132 @@ still a single source of truth. Output must be identical:
 
 Expected: cold search roughly 15 s to 9 s.
 
-### 3. A compact search-text store (Findings 3, 4, 6)
+### 3. A persistent search index (Findings 3–7)
 
-A new module `search_text.py` with one immutable type and no server imports,
-so it can be unit-tested on its own:
+This replaces the earlier plan of a compact in-memory store plus background
+warm-up. The in-memory cache was never designed: it is a dict in `server.py`
+that fills up during the first search in each server process. As a result:
 
-```python
-class SearchText:
-    """One segment of a session's searchable text, stored compactly."""
-    @classmethod
-    def build(cls, source: str) -> "SearchText": ...
-    def count(self, needle: bytes) -> int: ...       # needle = normalized query, UTF-8
-    def find(self, needle: bytes) -> int: ...
-    def snippet(self, offset: int, length: int) -> tuple[str, int]: ...
+- every restart throws it away;
+- the rebuild (10 s to over a minute) runs inside the user's search request,
+  with nothing on screen to say so;
+- each search typed while it's cold starts its own rebuild, and they compete;
+- it holds hundreds of MB, and parsing in the server process leaves Python's
+  memory pools grown even after the text is freed;
+- while there's a query in the box, every sidebar change re-runs the search,
+  which re-parses any live transcript inside the request.
+
+A prototype answers the memory question. With every session's normalized text
+in SQLite and nothing kept in memory, a search that reads all rows takes
+0.03–0.06 s on this corpus (faster than today's in-memory path), and the
+process peaks under 80 MB. The OS file cache keeps the file warm, and that
+memory belongs to the OS, which reclaims it when other apps need it.
+
+#### Modules
+
+```
+server.py ──(sessions, load_session, source settings)──► search_index.py ──► search_text.py
+ HTTP + wiring                                           storage, indexer,      pure: extract,
+                                                         status, scoring        normalize, chunk, snippet
 ```
 
-Storage:
-
-- **Normalized text as UTF-8 `bytes`.** Substring search on UTF-8 bytes gives
-  the same matches as on `str`, because UTF-8 is self-synchronizing.
-  `bytes.count` and `bytes.find` are as fast as the `str` versions. This
-  removes the 4-bytes-per-character problem: ASCII-heavy text costs 1 byte per
-  character.
-- **Source text in zlib-compressed chunks** of about 256 KB, split at line
-  boundaries. Each chunk records the normalized offset where it starts.
+- **`search_text.py`**: pure functions, no I/O. It extracts the searchable
+  text from a parsed session (moved from `server.py`). It builds a
+  `SearchDoc` per segment: the normalized text as UTF-8 bytes, plus the
+  source text split at line boundaries into chunks of about 256 KB, each
+  recording the byte offset in the normalized text where it starts.
   Normalizing chunk by chunk and joining with a space gives exactly the
-  whole-text normalization. The current snippet code already relies on this
-  property (line boundaries are safe normalization boundaries). Building this
-  way also lowers peak memory, since no full-size temporary copies are made.
-- **Snippets** find the chunk by binary search on its normalized start offset,
-  decompress only that chunk (plus the next one if the snippet crosses into
-  it), and run the existing line walk inside it. The cost depends on chunk
-  size, not on where the match is.
+  whole-text normalization, because line boundaries are safe normalization
+  boundaries (the existing snippet code already relies on this). It also
+  maps a normalized match to a snippet using a single chunk, so the cost
+  doesn't depend on where in a 50 MB session the match is.
+- **`search_index.py`**: the `SearchIndex` class, which owns storage,
+  indexing, status and scoring. It never imports `server`; the server passes
+  in a `load_session` function and its source settings.
+- **`server.py`**: creates the index, tells it about each fresh session list,
+  and routes `/api/search` to it.
 
-`server.session_segments` keeps its role and its mtime-keyed cache, but stores
-two `SearchText` values per session. `search_sessions` keeps its scoring and
-calls `count`, `find` and `snippet`. Titles stay as plain strings; they're
-tiny. Cache entries for sessions no longer listed are dropped at the end of
-each search.
+#### Storage
 
-Expected memory, from the measured 220 M characters (half source, half
-normalized): about 115 MB of normalized bytes plus about 25 MB of compressed
-source, roughly **140 MB instead of 472 MB**. RSS after a cold search will
-still be higher, because Python keeps freed memory from the parse in its pools.
+One SQLite file, `~/.cache/transcript_viewer/search-index.sqlite3` (set with
+`--search-index`), next to the summary cache:
 
-Tests: the existing `test_search.py` suite unchanged; `SearchText` unit tests
-for count and find against the `str` behaviour; and a snippet-equivalence test
-against the current `_search_snippet` across chunk boundaries,
-length-changing normalizations, and matches in the first and last chunk.
+- `docs(file, fingerprint, user_norm, rest_norm)`: the normalized text a
+  search scans;
+- `chunks(file, segment, norm_start, source)`: source text, read only to
+  build snippets for matching sessions;
+- `meta`: schema and extractor versions.
 
-### 4. Background warm-up and superseded-search cancellation (Finding 7)
+It uses write-ahead logging, so searches read while the indexer writes. The
+file is created with mode `0600` (it holds transcript text). A session's
+fingerprint is the summary's `mtime`, the same key the old cache used.
+Changing what gets extracted bumps `EXTRACTOR_VERSION`, which clears the
+index. A database that can't be opened is deleted and rebuilt rather than
+breaking search. The source text is stored uncompressed: disk is cheap here,
+and it keeps the code simple. Expected size: about 250 MB for this corpus.
 
-Once step 3 makes the index cheap to keep:
+`python3 server.py --reset-cache` deletes the search index and the summary
+cache, then exits; both rebuild on the next start.
 
-- After the first `/api/sessions`, a daemon thread fills the search cache one
-  session at a time, so the first search usually finds it warm.
-- Each `/api/search` takes a sequence number. The scan loop checks it between
-  sessions and returns early when a newer search has started (the frontend
-  already discards that response). Warm-up and search share the cache. The
-  existing per-session mtime check keeps them consistent, and a lock around
-  filling each entry stops two threads from building the same session twice.
+#### Indexing
+
+- One coordinator thread in the server is the only writer. It sleeps until
+  `notify(sessions)` reports sessions whose fingerprint doesn't match the
+  index, so there's no timer and no cost while nothing changes.
+- Parsing and extraction run in worker processes (up to 4, using the spawn
+  start method), so neither the parse's CPU time nor its memory lands in the
+  server process. The pool exists only while there's work. Workers get the
+  server's source settings (`--projects-dir`, `--codex-home`, Cursor,
+  opencode, Mica), because a spawned process doesn't inherit them. If the pool
+  can't start, the coordinator extracts in-process instead.
+- Most recently active sessions go first. A transcript that is still being
+  written is re-indexed at most every 30 s, unless a search is waiting.
+  Sessions no longer listed are removed from the index.
+
+#### Searching and status
+
+- `search(query, sessions)` streams `docs` rows, scores them with the existing
+  tiers (custom title, native title, user text, everything else), and builds
+  snippets from `chunks`. It answers from whatever is indexed, never waiting
+  for the indexer. `search(…, wait=True)` brings the index up to date
+  first; tests and scripts use it.
+- A search that a newer search has replaced stops early.
+- `status()` returns `{state, indexed, total, pending, generation, error}`.
+  `generation` changes whenever indexed content changes. The status rides on
+  both `/api/search` and the existing `/api/sessions` poll, so it adds no
+  requests.
+
+#### UI
+
+A status line under the search box (`aria-live="polite"`):
+
+- while indexing, with or without a query: "Indexing transcripts for search:
+  140 of 263", with a thin progress bar;
+- "Searching…" while a request is running;
+- "12 sessions match", plus "· still indexing, more may appear" while the
+  index is incomplete;
+- "Search index error: …".
+
+The frontend re-runs an active search only when the index `generation` or the
+session titles change, not on every sidebar change, so a query left in the box
+costs nothing while transcripts are being written.
+
+#### Tests
+
+- `search_text`: extraction (moved tests), normalization of the chunks equals
+  normalization of the whole text, and snippets match the old `_search_snippet`
+  across chunk boundaries and length-changing normalization.
+- `search_index`: survives a reopen; fingerprint and extractor-version
+  invalidation; pruning; status counts; partial results while indexing;
+  superseded searches; file mode; recovery from a corrupt file; in-process
+  fallback when no worker can start.
+- Existing search and server tests keep their assertions and use
+  `wait=True`. Test servers point the index at a temp file, like the summary
+  cache.
+- A browser test for the status line.
 
 ### Later, decided after the steps above are measured
 
-- **Persist the search store** under `~/.cache/transcript_viewer/search/`, one
-  file per session keyed by its fingerprint, so a restart doesn't re-parse
-  everything. This is the stepping stone to a disk-backed index or FTS5.
 - **A text-only extraction path** shared with the parsers (Finding 5), for
   example a per-parser `iter_search_text()` generator.
 - **Cheaper live refresh** for large active transcripts. Today every change
