@@ -94,24 +94,29 @@ def scenario_open(cache_dir: Path, path: str) -> dict:
 
 
 def scenario_search(cache_dir: Path) -> dict:
+    """Build a fresh search index in cache_dir (never the real one) with the
+    default worker count, then time queries against it."""
     server = _server(cache_dir, cold=False)
-    server.list_sessions()
+    index_path = cache_dir / "search-index.sqlite3"
+    server.configure_search(index_path)
     base = rss_mb()
-    out = {"queries": []}
+    start = time.perf_counter()
+    server.list_sessions()  # starts the background build
+    while server.search_status()["state"] == "building":
+        time.sleep(0.1)
+    build = time.perf_counter() - start
+    status = server.search_status()
+    out = {"index": {
+        "sessions": status["indexed"], "state": status["state"], "error": status["error"],
+        "build_secs": round(build, 1), "file_mb": round(index_path.stat().st_size / 1e6, 1),
+        "server_rss_mb_growth": round(rss_mb() - base, 1),
+    }, "queries": []}
     for i, q in enumerate(SEARCH_QUERIES * 2):
         matches, secs = timed(server.search_sessions, q)
         out["queries"].append({"q": q, "pass": 1 + i // len(SEARCH_QUERIES),
-                               "matches": len(matches), "secs": round(secs, 2)})
-    texts = [s for entry in server._TEXT_CACHE.values() for s in entry[1:]]
-    out["text_cache"] = {
-        "sessions": len(server._TEXT_CACHE),
-        "chars_m": round(sum(map(len, texts)) / 1e6, 1),
-        "bytes_mb": round(sum(map(sys.getsizeof, texts)) / 1e6, 1),
-        "wide_strings": sum(1 for s in texts if s and max(s) > "￿"),
-        "rss_mb_growth": round(rss_mb() - base, 1),
-    }
-    _, list_secs = timed(server.list_sessions)
-    out["list_sessions_inside_search_secs"] = round(list_secs, 3)
+                               "matches": len(matches or []), "secs": round(secs, 2)})
+    out["server_rss_mb_growth_after_queries"] = round(rss_mb() - base, 1)
+    server.SEARCH.close()
     return out
 
 
