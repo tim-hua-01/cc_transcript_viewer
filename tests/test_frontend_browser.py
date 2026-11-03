@@ -257,7 +257,7 @@ class StandaloneBrowserJourneyTests(unittest.TestCase):
     def test_search_retries_when_the_index_finishes_during_a_request(self):
         result = self.probe_search_script("""
           let searches = 0;
-          SEARCH_STATUS = {...ready, state: 'building', indexed: 1, generation: 1};
+          contentSearch.setStatus({...ready, state: 'building', indexed: 1, generation: 1});
           window.fetch = async (url) => {
             if (url.startsWith('/api/sessions')) return reply({sessions: SESSIONS, search: ready});
             // The scan saw only one document, but indexing finished before
@@ -266,7 +266,7 @@ class StandaloneBrowserJourneyTests(unittest.TestCase):
             return reply({matches: searches === 1 ? [hit(one)] : [hit(one), hit(two)], search: ready});
           };
           input.value = 'needle';
-          await runSearch(input.value);
+          await contentSearch.run(input.value);
           const partial = VISIBLE_SESSIONS.map(s => s.id);
           await pollSidebar();
           const complete = VISIBLE_SESSIONS.map(s => s.id);
@@ -285,28 +285,65 @@ class StandaloneBrowserJourneyTests(unittest.TestCase):
             return reply({matches: [hit(searches === 1 ? one : two)], search: ready});
           };
           input.value = 'oldword';
-          await runSearch(input.value);
+          await contentSearch.run(input.value);
           const old = VISIBLE_SESSIONS.map(s => s.id);
           input.value = 'newword';
-          await runSearch(input.value);
+          await contentSearch.run(input.value);
           const canceled = VISIBLE_SESSIONS.map(s => s.id);
-          const inFlightAfterCancel = SEARCH_IN_FLIGHT;
+          const inFlightAfterCancel = contentSearch.inFlight;
           await pollSidebar();
           const retried = VISIBLE_SESSIONS.map(s => s.id);
 
           let finish;
           window.fetch = () => new Promise(resolve => { finish = resolve; });
-          const pending = runSearch('anotherword');
+          const pending = contentSearch.run('anotherword');
           input.value = '';
-          await runSearch(input.value);
+          await contentSearch.run(input.value);
           finish(reply({matches: [hit(two)], search: ready}));
           await pending;
           return {old, canceled, retried, searches, inFlightAfterCancel,
-                  cleared: CONTENT_MATCHES === null, visibleAfterClear: VISIBLE_SESSIONS.length};
+                  cleared: contentSearch.matches === null, visibleAfterClear: VISIBLE_SESSIONS.length};
         """)
         self.assertEqual(result, {
             "old": ["one"], "canceled": [], "retried": ["two"], "searches": 3,
             "inFlightAfterCancel": False, "cleared": True, "visibleAfterClear": 2,
+        })
+
+    def test_a_search_controller_keeps_only_the_latest_response(self):
+        """createContentSearch on its own, with a scripted server: an older
+        response that arrives last is dropped, and statusText follows."""
+        result = self.probe_search_script("""
+          const pending = [];
+          const changes = [];
+          const search = createContentSearch({
+            request: () => new Promise((resolve) => pending.push(resolve)),
+            sessions: () => SESSIONS,
+            onChange: (q) => changes.push(q),
+          });
+          search.setStatus({...ready, state: 'building', indexed: 1});
+          const first = search.run('first');
+          const second = search.run('second');
+          const whileWaiting = search.statusText('second', 0).text;
+          pending[1]({matches: [hit(two)], search: ready});
+          await second;
+          pending[0]({matches: [hit(one)], search: ready});
+          await first;
+          return {
+            whileWaiting,
+            kept: [...search.matches.keys()],
+            fresh: !search.isStale('second'),
+            staleForAnotherQuery: search.isStale('third'),
+            done: search.statusText('second', 1),
+            changes,
+          };
+        """)
+        self.assertEqual(result, {
+            "whileWaiting": "Searching… · indexing transcripts for search: 1 of 2, more may appear",
+            "kept": ["/fixture/two.jsonl"],
+            "fresh": True,
+            "staleForAnotherQuery": True,
+            "done": {"text": "1 matching session", "progress": None, "error": False},
+            "changes": ["first", "second", "second"],
         })
 
     def probe_search_script(self, script):
@@ -328,7 +365,7 @@ class StandaloneBrowserJourneyTests(unittest.TestCase):
             CURRENT_FILE = null;
             LAST_SIG = sessionsSignature(SESSIONS);
             const ready = {state: 'ready', indexed: 2, total: 2, generation: 2, error: null};
-            SEARCH_STATUS = ready;
+            contentSearch.setStatus(ready);
             const input = document.querySelector('#search');
             const hit = s => ({file: s.file, snippet: 'content match', score: 1});
             const reply = body => ({json: async () => body});
@@ -353,7 +390,6 @@ class StandaloneBrowserJourneyTests(unittest.TestCase):
         summary = dict(codex.session_summary(FIXTURE), title="Ada's oﬃce", cwd="/tmp/Ｆｏｌｄｅｒ")
         probe = """<script>
           SESSIONS = [__SUMMARY__];
-          CONTENT_MATCHES = null;
           const counts = ["Ada’s office", "/tmp/Folder"].map((query) => {
             renderSidebar(query);
             return VISIBLE_SESSIONS.length;

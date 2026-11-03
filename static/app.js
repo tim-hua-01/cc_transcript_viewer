@@ -388,13 +388,12 @@ const TRANSCRIPT_IDLE_POLL_MS = 2000;
 let LAST_RENDERED_MTIME = 0;     // mtime of the open transcript as last rendered
 let LAST_RENDERED_TITLE = "";    // detects custom-name changes without transcript writes
 let LAST_SIG = "";               // cheap fingerprint of the session list
-// file -> snippet for the active content search, or null when no search is active
-let CONTENT_MATCHES = null;
-// The server's search index: {state: building|ready|error, indexed, total,
-// generation, error}, from /api/sessions and /api/search.
-let SEARCH_STATUS = null;
-let SEARCH_IN_FLIGHT = false;    // a typed search is waiting for the server
-let LAST_SEARCH_KEY = "";        // query, index revision and titles when the request started
+// Full-text search: its query, results, and the server index's status.
+const contentSearch = createContentSearch({
+  request: (q) => fetch("/api/search?q=" + encodeURIComponent(q)).then((res) => res.json()),
+  sessions: () => SESSIONS,
+  onChange: (query) => renderSidebar(query),
+});
 // Selected values for the dropdown filters; empty set = no constraint (all).
 const SELECTED_MODELS = new Set();
 const SELECTED_DIRS = new Set();
@@ -414,7 +413,7 @@ async function loadSessions() {
   SESSIONS = data.sessions || [];
   SESSIONS_LOADED = true;
   MICA_STATUS = data.mica || { enabled: false };
-  SEARCH_STATUS = data.search || null;
+  contentSearch.setStatus(data.search);
   renderSetupBanner(data.setup);
   LAST_SIG = sessionsSignature(SESSIONS);
   buildFilters();
@@ -709,7 +708,7 @@ function renderSidebar(query) {
       s.title + " " + (s.original_title || "") + " " + (s.ai_title || "") + " " +
       (s.cwd || "") + " " + s.id + " " + s.agent
     ).includes(q);
-    const contentHit = CONTENT_MATCHES && CONTENT_MATCHES.has(s.file);
+    const contentHit = contentSearch.has(s.file);
     return metaHit || contentHit;
   };
   const matches = SESSIONS.filter(
@@ -720,7 +719,7 @@ function renderSidebar(query) {
   // server's newest-first ordering.
   if (q) {
     const scoreOf = (s) => {
-      const cm = CONTENT_MATCHES && CONTENT_MATCHES.get(s.file);
+      const cm = contentSearch.get(s.file);
       return cm ? cm.score : 0.5; // metaHit-only (e.g. id match) sits below content hits
     };
     matches.sort((a, b) => (scoreOf(b) - scoreOf(a)) || ((b.mtime || 0) - (a.mtime || 0)));
@@ -818,8 +817,8 @@ function renderSidebar(query) {
           : null,
         s.model ? el("span", { class: "badge" }, shortModel(s.model)) : null
       ),
-      CONTENT_MATCHES && CONTENT_MATCHES.has(s.file)
-        ? el("div", { class: "session-snippet" }, CONTENT_MATCHES.get(s.file).snippet)
+      contentSearch.has(s.file)
+        ? el("div", { class: "session-snippet" }, contentSearch.get(s.file).snippet)
         : null,
       el(
         "div",
@@ -1007,7 +1006,7 @@ async function renameSession(data) {
     const summary = SESSIONS.find((s) => s.file === file);
     if (summary) Object.assign(summary, result);
     LAST_SIG = sessionsSignature(SESSIONS);
-    await runSearch($("#search").value);
+    await contentSearch.run($("#search").value);
     markActive();
     if (CURRENT_FILE === file) await renderTranscript(data, { live: true });
   } catch (e) {
@@ -2287,108 +2286,129 @@ function oneLineJson(obj) {
   return `${k}: ${String(v).slice(0, 120)}`;
 }
 
-// ---------- search / filter wiring ----------
-// Fetch content matches from the server, then re-render. Title/cwd/id matching
-// still happens instantly client-side in renderSidebar; this adds full-text.
-// `quiet` refreshes (the index moved on) don't flash "Searching…".
-let searchSeq = 0;
-let searchFailed = false;
-async function runSearch(query, { quiet = false } = {}) {
-  const seq = ++searchSeq;
-  const q = (query || "").trim();
-  if (!q) {
-    CONTENT_MATCHES = null;
-    SEARCH_IN_FLIGHT = false;
-    LAST_SEARCH_KEY = "";
-    searchFailed = false;
-    renderSidebar(query);
-    return;
-  }
-  // This revision predates the scan. The response's status can describe a
-  // newer index than its results saw; retaining this key makes polling catch
-  // up even when that response arrives just after the final indexing write.
-  const key = searchKey(q);
-  if (!quiet) SEARCH_IN_FLIGHT = true;
-  renderSidebar(query); // instant feedback on title/cwd while content search is in flight
-  try {
-    const res = await fetch("/api/search?q=" + encodeURIComponent(q));
-    const data = await res.json();
-    if (seq !== searchSeq) return; // a newer search superseded this one
-    if (data.search) SEARCH_STATUS = data.search;
-    // Another tab canceled this request. Its results must be retried even if
-    // the index has not changed, and the previous query's matches cannot stay.
-    if (data.superseded) {
-      CONTENT_MATCHES = null;
-      LAST_SEARCH_KEY = "";
+// ---------- content search ----------
+// One owner for full-text search: the query and its debounce, request
+// ordering (only the latest request's response counts), the results, the
+// server index's status, and whether the results are still current.
+// Title/cwd/id matching happens instantly client-side in renderSidebar; this
+// adds content matches. The DOM stays outside: `onChange(query)` re-renders.
+function createContentSearch({ request, sessions, onChange, debounceMs = 180 }) {
+  let matches = null;  // file -> {snippet, score}; null when no content search is active
+  let status = null;   // {state: building|ready|error, indexed, total, generation, error}
+  let inFlight = false, failed = false;
+  let seq = 0, timer = 0;
+  let resultsKey = ""; // keyFor() when the request behind `matches` started
+
+  // Everything content results depend on: the query, the indexed content's
+  // generation, and every session's titles, which are scored too.
+  const keyFor = (query) => JSON.stringify([
+    normalizeSearchText(query), status ? status.generation : "",
+    sessions().map((s) => [s.file, s.custom_title || "", s.original_title || "",
+                           s.claude_title || "", s.ai_title || ""]),
+  ]);
+
+  // `quiet` refreshes (the index moved on) don't flash "Searching…".
+  async function run(query, { quiet = false } = {}) {
+    clearTimeout(timer);
+    const mine = ++seq;
+    const q = (query || "").trim();
+    if (!q) {
+      matches = null;
+      inFlight = failed = false;
+      resultsKey = "";
+      onChange(query);
       return;
     }
-    CONTENT_MATCHES = new Map((data.matches || []).map((m) => [m.file, { snippet: m.snippet, score: m.score }]));
-    LAST_SEARCH_KEY = key;
-    searchFailed = false;
-  } catch (e) {
-    if (seq !== searchSeq) return;
-    CONTENT_MATCHES = new Map();
-    LAST_SEARCH_KEY = "";
-    searchFailed = true;
-  } finally {
-    if (seq === searchSeq) {
-      SEARCH_IN_FLIGHT = false;
-      renderSidebar(query);
+    // Taken before the scan: the response's status can describe a newer
+    // index than its results saw, and an older key makes polling catch up.
+    const key = keyFor(q);
+    if (!quiet) inFlight = true;
+    onChange(query); // instant title/cwd feedback while the request runs
+    try {
+      const data = await request(q);
+      if (mine !== seq) return; // a newer search superseded this one
+      if (data.search) status = data.search;
+      // Another tab's search canceled this one on the server: drop these
+      // (possibly older) matches; the cleared key makes the next poll retry.
+      if (data.superseded) {
+        matches = null;
+        resultsKey = "";
+        return;
+      }
+      matches = new Map((data.matches || []).map((m) => [m.file, { snippet: m.snippet, score: m.score }]));
+      resultsKey = key;
+      failed = false;
+    } catch (e) {
+      if (mine !== seq) return;
+      matches = new Map();
+      resultsKey = "";
+      failed = true;
+    } finally {
+      if (mine === seq) {
+        inFlight = false;
+        onChange(query);
+      }
     }
   }
+
+  return {
+    run,
+    // Typing: search once the query has been still for a moment.
+    type(query) {
+      clearTimeout(timer);
+      timer = setTimeout(() => run(query), debounceMs);
+    },
+    setStatus(next) { status = next || null; },
+    // An open query whose results predate the index or a title change.
+    isStale(query) { return !!(query || "").trim() && keyFor(query) !== resultsKey; },
+    has(file) { return !!matches && matches.has(file); },
+    get(file) { return matches ? matches.get(file) : undefined; },
+    get matches() { return matches; },
+    get status() { return status; },
+    get inFlight() { return inFlight; },
+    // What the line under the search box says: {text, progress (0-1, or
+    // null for no bar), error}. Empty text hides the line.
+    statusText(query, visibleCount) {
+      const q = (query || "").trim();
+      const building = !!status && status.state === "building";
+      const parts = [];
+      if (status && status.state === "error") parts.push("Search index error: " + (status.error || "unknown"));
+      if (q) {
+        if (inFlight) parts.push("Searching…");
+        else if (failed) parts.push("Search failed; showing title matches only");
+        else if (matches) parts.push(`${visibleCount} matching session${visibleCount === 1 ? "" : "s"}`);
+      }
+      if (building) {
+        parts.push(`indexing transcripts for search: ${status.indexed} of ${status.total}` +
+          (q ? ", more may appear" : ""));
+      }
+      const text = parts.join(" · ");
+      return {
+        text: text.charAt(0).toUpperCase() + text.slice(1),
+        progress: building ? (status.total ? status.indexed / status.total : 0) : null,
+        error: (!!status && status.state === "error") || (!!q && failed),
+      };
+    },
+  };
 }
 
-// Everything content results depend on: the query, the indexed content's
-// generation, and every session's titles, which are scored too.
-function searchKey(query = $("#search").value) {
-  return JSON.stringify([
-    normalizeSearchText(query), SEARCH_STATUS ? SEARCH_STATUS.generation : "",
-    SESSIONS.map(s => [s.file, s.custom_title || "", s.original_title || "",
-                      s.claude_title || "", s.ai_title || ""]),
-  ]);
-}
-
-// The line under the search box: indexing progress, a search in flight, or
-// how many sessions match. Hidden when there's nothing to say.
 function renderSearchStatus() {
   const box = $("#search-status");
   if (!box || STANDALONE) return;
-  const st = SEARCH_STATUS;
-  const q = $("#search").value.trim();
-  const building = st && st.state === "building";
-  const parts = [];
-  if (st && st.state === "error") parts.push("Search index error: " + (st.error || "unknown"));
-  if (q) {
-    if (SEARCH_IN_FLIGHT) parts.push("Searching…");
-    else if (searchFailed) parts.push("Search failed; showing title matches only");
-    else if (CONTENT_MATCHES) {
-      const n = VISIBLE_SESSIONS.length;
-      parts.push(`${n} matching session${n === 1 ? "" : "s"}`);
-    }
-  }
-  if (building) {
-    parts.push(`indexing transcripts for search: ${st.indexed} of ${st.total}` +
-      (q ? ", more may appear" : ""));
-  }
-  const text = parts.join(" · ");
+  const { text, progress, error } = contentSearch.statusText($("#search").value, VISIBLE_SESSIONS.length);
   box.hidden = !text;
-  box.classList.toggle("search-status-error", !!(st && st.state === "error") || searchFailed);
+  box.classList.toggle("search-status-error", error);
   if (!text) return;
   const fill = el("div", { class: "search-progress-fill" });
-  if (building) fill.style.width = (st.total ? (100 * st.indexed) / st.total : 0) + "%";
+  if (progress !== null) fill.style.width = 100 * progress + "%";
   // replaceChildren (unlike el) would render a null child as the text "null".
   box.replaceChildren(...[
-    el("span", {}, text.charAt(0).toUpperCase() + text.slice(1)),
-    building ? el("div", { class: "search-progress", "aria-hidden": "true" }, fill) : null,
+    el("span", {}, text),
+    progress !== null ? el("div", { class: "search-progress", "aria-hidden": "true" }, fill) : null,
   ].filter(Boolean));
 }
 
-let searchTimer;
-$("#search").addEventListener("input", (e) => {
-  clearTimeout(searchTimer);
-  const v = e.target.value;
-  searchTimer = setTimeout(() => runSearch(v), 180);
-});
+$("#search").addEventListener("input", (e) => contentSearch.type(e.target.value));
 
 $$("#filter-row .filter-chip").forEach((chip) => {
   chip.addEventListener("click", () => {
@@ -2412,7 +2432,7 @@ async function refreshSidebar() {
   const listEl = $("#session-list");
   const sTop = listEl.scrollTop;
   const query = $("#search").value;
-  if (query.trim() && searchKey() !== LAST_SEARCH_KEY) await runSearch(query, { quiet: true });
+  if (contentSearch.isStale(query)) await contentSearch.run(query, { quiet: true });
   else renderSidebar(query);
   listEl.scrollTop = sTop;
   markActive();
@@ -2774,11 +2794,11 @@ async function pollSidebar() {
       const body = await res.json();
       next = body.sessions || [];
       MICA_STATUS = body.mica || { enabled: false };
-      SEARCH_STATUS = body.search || null;
+      contentSearch.setStatus(body.search);
       renderSetupBanner(body.setup);
     } catch (e) { return false; } // server momentarily unreachable; retry next tick
     const sig = sessionsSignature(next);
-    if (sig === LAST_SIG && $("#search").value.trim() && searchKey() !== LAST_SEARCH_KEY) {
+    if (sig === LAST_SIG && contentSearch.isStale($("#search").value)) {
       await refreshSidebar(); // the index caught up: newly indexed content may match
     } else if (sig !== LAST_SIG) {
       LAST_SIG = sig;
