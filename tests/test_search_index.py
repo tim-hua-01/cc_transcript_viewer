@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import multiprocessing
 import os
 import stat
 import tempfile
@@ -21,6 +22,27 @@ def load_json_session(file_id: str) -> dict:
     texts = json.loads(Path(file_id).read_text(encoding="utf-8"))
     return {"events": [{"kind": "user", "text": texts.get("user", "")},
                        {"kind": "assistant", "text": texts.get("rest", "")}]}
+
+
+def _in_worker() -> bool:
+    return multiprocessing.parent_process() is not None
+
+
+def load_crashing_once(file_id: str) -> dict:
+    """Kills the worker process the first time a session marked with a
+    ``.crash`` file is loaded there."""
+    marker = Path(file_id + ".crash")
+    if _in_worker() and marker.exists():
+        marker.unlink()
+        os._exit(1)
+    return load_json_session(file_id)
+
+
+def load_crashing_in_workers(file_id: str) -> dict:
+    """Kills every worker process that loads a session; fine in-process."""
+    if _in_worker():
+        os._exit(1)
+    return load_json_session(file_id)
 
 
 class SearchIndexTestCase(unittest.TestCase):
@@ -175,7 +197,7 @@ class BackgroundIndexingTests(SearchIndexTestCase):
         sessions = [self.session(f"s{i}", rest=f"word{i} shared") for i in range(4)]
         index.notify(sessions)
         self.wait_for(index, lambda s: s["state"] == "ready" and s["indexed"] == 4, timeout=60)
-        self.assertFalse(index._pool_broken)
+        self.assertFalse(index._in_process)
         self.assertEqual(len(index.search("shared", sessions)), 4)
 
     def test_a_loader_workers_cannot_import_falls_back_to_this_process(self):
@@ -183,8 +205,59 @@ class BackgroundIndexingTests(SearchIndexTestCase):
         sessions = [self.session("a", rest="fallback text")]
         index.notify(sessions)
         self.wait_for(index, lambda s: s["state"] == "ready" and s["indexed"] == 1, timeout=60)
-        self.assertTrue(index._pool_broken)
+        self.assertTrue(index._in_process)
         self.assertEqual(self.files(index.search("fallback", sessions)), ["a"])
+
+
+@mock.patch.object(search_index, "POOL_RETRY_SECONDS", 0.05)
+class WorkerLifecycleTests(SearchIndexTestCase):
+    def test_a_crashed_worker_is_replaced_without_parsing_in_process(self):
+        sessions = [self.session(f"s{i}", rest=f"lifecycle {i}") for i in range(3)]
+        Path(sessions[0]["file"] + ".crash").touch()
+        index = self.index(load=load_crashing_once, workers=2)
+        index.notify(sessions)
+        status = self.wait_for(index, lambda s: s["state"] == "ready" and s["indexed"] == 3, timeout=60)
+        self.assertFalse(Path(sessions[0]["file"] + ".crash").exists())  # a worker did crash
+        self.assertIsNone(status["error"])
+        self.assertFalse(index._in_process)
+        self.assertEqual(index._pool_crashes, 0)
+        self.assertEqual(len(index.search("lifecycle", sessions)), 3)
+
+    def test_workers_that_keep_crashing_fall_back_to_this_process(self):
+        sessions = [self.session("a", rest="survives crashes")]
+        index = self.index(load=load_crashing_in_workers, workers=1)
+        index.notify(sessions)
+        status = self.wait_for(index, lambda s: s["indexed"] == 1, timeout=90)
+        self.assertTrue(index._in_process)
+        self.assertEqual(index._pool_crashes, search_index.POOL_MAX_CRASHES)
+        self.assertIsNone(status["error"])  # it works, so nothing to report any more
+        self.assertEqual(self.files(index.search("survives", sessions)), ["a"])
+
+    def test_an_idle_pool_shuts_down(self):
+        with mock.patch.object(search_index, "POOL_IDLE_SECONDS", 0.2):
+            index = self.index(workers=1)
+            index.notify([self.session("a", rest="idle")])
+            self.wait_for(index, lambda s: s["state"] == "ready" and s["indexed"] == 1, timeout=60)
+            deadline = time.monotonic() + 10
+            while index._pool is not None and time.monotonic() < deadline:
+                time.sleep(0.05)
+            self.assertIsNone(index._pool)
+
+    def test_close_waits_for_the_session_being_indexed(self):
+        release, started = threading.Event(), threading.Event()
+
+        def blocking_load(file_id):
+            started.set()
+            release.wait(10)
+            return load_json_session(file_id)
+
+        index = self.index(load=blocking_load)
+        index.notify([self.session("a", rest="closing")])
+        self.assertTrue(started.wait(10))
+        threading.Timer(0.2, release.set).start()
+        index.close()
+        self.assertFalse(index._thread.is_alive())
+        self.assertIsNone(index.status()["error"])
 
 
 if __name__ == "__main__":

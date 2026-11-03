@@ -27,6 +27,7 @@ import sys
 import threading
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures.process import BrokenProcessPool
 from pathlib import Path
 
 import common
@@ -39,6 +40,10 @@ DEFAULT_WORKERS = 4
 LIVE_REINDEX_SECONDS = 30.0
 # Worker processes exit after this long without work, freeing their memory.
 POOL_IDLE_SECONDS = 60.0
+# After a worker crashes, a fresh pool is tried after this long, doubling with
+# each crash in a row; after POOL_MAX_CRASHES the server parses in-process.
+POOL_RETRY_SECONDS = 5.0
+POOL_MAX_CRASHES = 3
 # Recycle a worker after this many sessions (3.11+), so one huge parse
 # doesn't keep a worker's memory high for the life of the pool.
 _TASKS_PER_WORKER = 25
@@ -179,7 +184,9 @@ class SearchIndex:
         self._thread: threading.Thread | None = None
         self._closed = False
         self._pool: ProcessPoolExecutor | None = None
-        self._pool_broken = False
+        self._in_process = False      # workers can't run here: extract in this process
+        self._pool_crashes = 0        # worker crashes in a row
+        self._pool_retry_at = 0.0     # monotonic time a crashed pool may be retried
         self._pool_last_used = 0.0
         self._db: sqlite3.Connection | None = None
         try:
@@ -291,6 +298,10 @@ class SearchIndex:
             self._wakeup.clear()
             try:
                 work, prune, wake = self._plan(self._live_delay)
+                retry_in = self._pool_retry_at - time.monotonic()
+                if work and retry_in > 0:  # waiting out a worker crash, not parsing here
+                    work = []
+                    wake = retry_in if wake is None else min(wake, retry_in)
                 if work or prune:
                     with self._lock:
                         self._error = None
@@ -337,17 +348,32 @@ class SearchIndex:
                         self._error = f"could not store {Path(file_id).name}: {e}"
                     continue
                 self._mark_indexed(file_id, fingerprint)
+                self._pool_crashes = 0
+        except BrokenProcessPool:
+            # A worker died, perhaps on one huge transcript. Retry with a fresh
+            # pool rather than parsing in the server, unless it keeps happening.
+            self._stop_pool()
+            self._pool_crashes += 1
+            if self._pool_crashes >= POOL_MAX_CRASHES:
+                self._in_process = True
+                message = "search workers keep crashing; indexing in the viewer process instead"
+            else:
+                delay = POOL_RETRY_SECONDS * 2 ** (self._pool_crashes - 1)
+                self._pool_retry_at = time.monotonic() + delay
+                message = f"a search worker crashed; retrying in {delay:g} s"
+            with self._lock:
+                self._error = message
         except Exception:  # noqa: BLE001 - _index_session catches session errors itself
-            # So this is the pool failing (a worker died, or can't start or
-            # unpickle here): extract in-process from now on.
-            self._pool_broken = True
+            # So workers can't run here at all (e.g. the loader can't be
+            # pickled or imported by them): extract in-process from now on.
+            self._in_process = True
             self._stop_pool()
         finally:
             self._pool_last_used = time.monotonic()
         return failed
 
     def _executor(self) -> ProcessPoolExecutor | None:
-        if self._workers <= 0 or self._pool_broken:
+        if self._workers <= 0 or self._in_process:
             return None
         if self._pool is None:
             initializer, initargs = self._worker_setup() if self._worker_setup else (None, ())
@@ -359,7 +385,7 @@ class SearchIndex:
                     initializer=initializer, initargs=initargs, **kwargs,
                 )
             except (OSError, ValueError):
-                self._pool_broken = True
+                self._in_process = True
                 return None
         return self._pool
 
