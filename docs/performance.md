@@ -362,3 +362,66 @@ server time per poll.
 - **Slowing Mica's own 1 s poll.** That interval is how long a transcript
   rewrite can go uncaptured, which is a deliberate choice for a
   tamper-evidence tool. It's the user's call, not a performance fix.
+
+## Structure follow-ups (from review)
+
+Three changes to how the search work is organized. None changes what search
+returns. Each is its own commit.
+
+### S1. Worker crashes are retried, not permanent
+
+Today any failure of the worker pool sets `_pool_broken` for the life of the
+server, and every later session is parsed inside the server process. That
+brings back the memory growth the workers exist to avoid, even when the cause
+was one worker killed while parsing a huge transcript.
+
+Two kinds of failure, handled differently:
+
+- **The pool can't work here at all.** The loader can't be pickled or
+  imported by a worker, or a pool can't be created. Retrying won't help, so
+  fall back to in-process extraction for good, as today.
+- **A worker died** (`BrokenProcessPool`). Stop the pool and retry with a
+  fresh one after 5 s, then 10 s, then 20 s. Don't index in-process during the
+  wait, and say so in `status()["error"]`. A pool that completes a session
+  resets the count. After three crashes in a row, fall back to in-process
+  extraction so that search still works. That is the old behaviour, now only a
+  last resort.
+
+Lifecycle tests: a worker that crashes once (search recovers on a new pool, no
+fallback); workers that always crash (fallback after three, still indexes);
+the idle pool shutting down; and `close()` while a session is being indexed.
+
+### S2. One owner for search in the frontend
+
+Search state is spread over seven globals (`CONTENT_MATCHES`, `SEARCH_STATUS`,
+`SEARCH_IN_FLIGHT`, `LAST_SEARCH_KEY`, `searchSeq`, `searchFailed`,
+`searchTimer`) and five functions. Both race conditions fixed so far came from
+that spread. A `createContentSearch({request, sessions, onChange})` factory
+in `app.js` returns the one object that owns:
+
+- the query and the debounce;
+- request ordering (a response for anything but the latest request is
+  dropped) and cancellation by another tab;
+- the results (`matches`, `has(file)`, `get(file)`) and the index status;
+- freshness: the key (query, index generation, titles) recorded when a
+  request starts, and `refreshIfStale()`;
+- `statusText(visibleCount)`, which returns what the status line says. The
+  DOM stays in `renderSearchStatus`.
+
+It stays inside `app.js`, because the HTML export inlines that one file. The
+request function and the session list are passed in, so browser tests can
+drive a controller in isolation with a scripted server.
+
+### S3. A session catalog module
+
+`server.py` mixes the HTTP layer with source configuration, the unified
+session list, loading, custom names, the summary-cache file, and Mica
+decoration. A new `catalog.py` takes those. `server.py` keeps HTTP, the
+local-file actions, the prompt export, and search wiring. Every fresh list
+still informs the index, through a thin `list_sessions()` wrapper in the
+server.
+
+The concrete gain: search workers import `catalog` to load sessions, not the
+whole HTTP server, and the index's `worker_setup` comes from the catalog.
+This is a pure move. Behaviour and tests stay the same, with test patches
+pointed at `catalog.*` where the state now lives.
