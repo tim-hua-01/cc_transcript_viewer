@@ -23,6 +23,7 @@ from urllib.parse import quote
 from http.client import HTTPConnection
 from pathlib import Path
 
+import catalog
 import server
 
 
@@ -103,7 +104,7 @@ class SecurityTest(ViewerServerTestCase):
         session = {"meta": {"cwd": str(workspace)}}
 
         with (
-            mock.patch.object(server, "load_session", return_value=session),
+            mock.patch.object(catalog, "load_session", return_value=session),
             mock.patch.object(server.sys, "platform", "darwin"),
             mock.patch.object(server.subprocess, "run") as run,
         ):

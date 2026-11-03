@@ -27,6 +27,7 @@ import claude_parser as claude
 import codex_parser as codex
 import cursor_parser as cursor
 import opencode_parser as opencode
+import catalog
 import server
 from tests.fixture_builders import (
     _write_fixture_session,
@@ -633,7 +634,7 @@ class ViewerIntegration(CaptureTestCase):
                          chats_dir=self.tmp / "cursor-chats")
         opencode.configure(self.tmp / "opencode" / "opencode.db")
         self._old_files = patch_server_files(server, self.tmp)
-        self._old_mica = server.MICA
+        self._old_mica = catalog.MICA
         self.live = _write_fixture_session(self.projects, "aaaaaaaa-0000-4000-8000-000000000001", "live prompt")
         self.doomed = _write_fixture_session(self.projects, "aaaaaaaa-0000-4000-8000-000000000002", "doomed prompt")
         self.cut = _write_fixture_session(self.projects, "aaaaaaaa-0000-4000-8000-000000000003", "cut prompt",
@@ -642,12 +643,12 @@ class ViewerIntegration(CaptureTestCase):
         self.doomed.unlink()
         self.cut.write_text(self.cut.read_text().splitlines(True)[0])
         self.tick(n=2)
-        server.configure_mica(self.store_dir)
+        catalog.configure_mica(self.store_dir)
         self.httpd, self.port, self.thread = start_http_server(server.Handler)
 
     def tearDown(self):
         stop_http_server(self.httpd, self.thread)
-        server.MICA = self._old_mica
+        catalog.MICA = self._old_mica
         restore_server_files(server, self._old_files)
         projects, codex_home, (cursor_db, cursor_projects, cursor_chats), opencode_db = self._old_sources
         claude.configure(projects)
@@ -730,7 +731,7 @@ class ViewerIntegration(CaptureTestCase):
                              {"cleanupPeriodDays", "showThinkingSummaries", "model_reasoning_summary"})
             settings.write_text(json.dumps({"cleanupPeriodDays": 10000, "showThinkingSummaries": True}))
             config.write_text('model_reasoning_summary = "detailed"\n')
-            server.configure_mica(self.store_dir, enabled=False)
+            catalog.configure_mica(self.store_dir, enabled=False)
             status, body = self.get_json("/api/sessions")
             self.assertEqual(status, 200)
             self.assertEqual(body["setup"]["issues"], [])
@@ -783,7 +784,7 @@ class ViewerIntegration(CaptureTestCase):
         self.assertTrue(all("bad capture" in s["mica"]["error"] for s in copies))
 
     def test_store_read_failures_are_reported(self):
-        with mock.patch.object(server.MICA, "badge", side_effect=OSError("store vanished")):
+        with mock.patch.object(catalog.MICA, "badge", side_effect=OSError("store vanished")):
             status, body = self.get_json("/api/sessions")
         self.assertEqual(status, 200)
         self.assertIn("store vanished", body["mica"]["error"])
@@ -791,7 +792,7 @@ class ViewerIntegration(CaptureTestCase):
         self.assertNotIn("error", body["mica"])
 
     def test_disabled_mica_changes_nothing(self):
-        server.configure_mica(self.store_dir, enabled=False)
+        catalog.configure_mica(self.store_dir, enabled=False)
         _s, body = self.get_json("/api/sessions")
         self.assertEqual(body["mica"], {"enabled": False})
         self.assertFalse(any("mica" in s for s in body["sessions"]))
@@ -799,8 +800,8 @@ class ViewerIntegration(CaptureTestCase):
         self.assertEqual(result["state"], "disabled")
 
     def test_missing_store_directory_is_off(self):
-        server.configure_mica(self.tmp / "no-such-mica")
-        self.assertIsNone(server.MICA)
+        catalog.configure_mica(self.tmp / "no-such-mica")
+        self.assertIsNone(catalog.MICA)
 
 
 class InstallerPlan(unittest.TestCase):

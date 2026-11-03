@@ -22,6 +22,7 @@ import claude_parser as claude
 import codex_parser as codex
 import cursor_parser as cursor
 import opencode_parser as opencode
+import catalog
 import server
 
 
@@ -31,14 +32,14 @@ def patch_server_files(server_module, tmp: Path):
     replaced state so the caller can restore it even when test modules run in
     a different order. The search index extracts in-process (no workers)."""
     old_state = (
-        server_module.CUSTOM_NAMES_FILE,
-        server_module._CUSTOM_NAMES_CACHE,
-        server_module.CACHE_FILE,
+        catalog.CUSTOM_NAMES_FILE,
+        catalog._CUSTOM_NAMES_CACHE,
+        catalog.CACHE_FILE,
         server_module.SEARCH,
     )
-    server_module.CUSTOM_NAMES_FILE = tmp / "viewer" / "names.json"
-    server_module._CUSTOM_NAMES_CACHE = None
-    server_module.CACHE_FILE = tmp / "cache" / "summaries.json"
+    catalog.CUSTOM_NAMES_FILE = tmp / "viewer" / "names.json"
+    catalog._CUSTOM_NAMES_CACHE = None
+    catalog.CACHE_FILE = tmp / "cache" / "summaries.json"
     server_module.SEARCH = None  # the previous index stays open for restore
     server_module.configure_search(tmp / "cache" / "search-index.sqlite3", workers=0)
     return old_state
@@ -48,9 +49,9 @@ def restore_server_files(server_module, old_state) -> None:
     """Undo ``patch_server_files`` without retaining a deleted temp path."""
     server_module.SEARCH.close()
     (
-        server_module.CUSTOM_NAMES_FILE,
-        server_module._CUSTOM_NAMES_CACHE,
-        server_module.CACHE_FILE,
+        catalog.CUSTOM_NAMES_FILE,
+        catalog._CUSTOM_NAMES_CACHE,
+        catalog.CACHE_FILE,
         server_module.SEARCH,
     ) = old_state
 

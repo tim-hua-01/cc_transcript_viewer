@@ -43,12 +43,13 @@ def timed(fn, *args):
 
 def _server(cache_dir: Path, cold: bool):
     sys.path.insert(0, str(REPO))
+    import catalog
     import server
-    real_cache = server.CACHE_FILE
-    server.CACHE_FILE = cache_dir / "summaries.json"
+    real_cache = catalog.CACHE_FILE
+    catalog.CACHE_FILE = cache_dir / "summaries.json"
     if not cold and real_cache.exists():
-        shutil.copy(real_cache, server.CACHE_FILE)
-    server.configure_mica(server.micastore.DEFAULT_STORE_DIR)
+        shutil.copy(real_cache, catalog.CACHE_FILE)
+    catalog.configure_mica(catalog.micastore.DEFAULT_STORE_DIR)
     return server
 
 
@@ -71,19 +72,21 @@ def scenario_list(cache_dir: Path, cold: bool) -> dict:
 
 
 def scenario_list_parsers(cache_dir: Path, cold: bool) -> dict:
-    server = _server(cache_dir, cold)
-    server.load_summary_caches()
+    _server(cache_dir, cold)
+    import catalog  # importable once _server() has set up sys.path
+    catalog.load_summary_caches()
     per_parser = {}
-    for name, parser in server.PARSERS.items():
+    for name, parser in catalog.PARSERS.items():
         rows, secs = timed(parser.list_sessions)
         per_parser[name] = {"sessions": len(rows), "secs": round(secs, 3)}
     return per_parser
 
 
 def scenario_open(cache_dir: Path, path: str) -> dict:
-    server = _server(cache_dir, cold=False)
+    _server(cache_dir, cold=False)
+    import catalog  # importable once _server() has set up sys.path
     base = rss_mb()
-    data, parse = timed(server.load_session, path)
+    data, parse = timed(catalog.load_session, path)
     body, dump = timed(lambda: json.dumps(data).encode())
     return {
         "file": path, "file_mb": round(os.path.getsize(path) / 1e6, 1),

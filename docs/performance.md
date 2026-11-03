@@ -368,7 +368,7 @@ server time per poll.
 Three changes to how the search work is organized. None changes what search
 returns. Each is its own commit.
 
-### S1. Worker crashes are retried, not permanent
+### S1. Worker crashes are retried, not permanent — done, `7208044`
 
 Today any failure of the worker pool sets `_pool_broken` for the life of the
 server, and every later session is parsed inside the server process. That
@@ -391,7 +391,7 @@ Lifecycle tests: a worker that crashes once (search recovers on a new pool, no
 fallback); workers that always crash (fallback after three, still indexes);
 the idle pool shutting down; and `close()` while a session is being indexed.
 
-### S2. One owner for search in the frontend
+### S2. One owner for search in the frontend — done, `f131dda`
 
 Search state is spread over seven globals (`CONTENT_MATCHES`, `SEARCH_STATUS`,
 `SEARCH_IN_FLIGHT`, `LAST_SEARCH_KEY`, `searchSeq`, `searchFailed`,
@@ -412,7 +412,7 @@ It stays inside `app.js`, because the HTML export inlines that one file. The
 request function and the session list are passed in, so browser tests can
 drive a controller in isolation with a scripted server.
 
-### S3. A session catalog module
+### S3. A session catalog module — done
 
 `server.py` mixes the HTTP layer with source configuration, the unified
 session list, loading, custom names, the summary-cache file, and Mica

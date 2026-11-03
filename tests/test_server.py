@@ -8,6 +8,7 @@ from unittest import mock
 
 import claude_parser as claude
 import search_index
+import catalog
 import server
 from tests.fixture_builders import ViewerServerTestCase
 
@@ -45,18 +46,18 @@ class SessionOrderingTests(unittest.TestCase):
             },
         ]
         with (
-            mock.patch.object(server, "PARSERS", {"fixture": _FixtureParser(sessions)}),
-            mock.patch.object(server, "load_summary_caches"),
-            mock.patch.object(server, "save_summary_caches"),
-            mock.patch.object(server, "_apply_custom_name"),
+            mock.patch.object(catalog, "PARSERS", {"fixture": _FixtureParser(sessions)}),
+            mock.patch.object(catalog, "load_summary_caches"),
+            mock.patch.object(catalog, "save_summary_caches"),
+            mock.patch.object(catalog, "apply_custom_name"),
         ):
             ordered = server.list_sessions()
 
         self.assertEqual([session["file"] for session in ordered], ["new", "child", "old"])
 
     def test_invalid_or_missing_activity_falls_back_to_mtime(self):
-        self.assertEqual(server._recency({"last_ts": "not-a-date", "mtime": 42}), 42)
-        self.assertEqual(server._recency({"mtime": 17}), 17)
+        self.assertEqual(catalog._recency({"last_ts": "not-a-date", "mtime": 42}), 42)
+        self.assertEqual(catalog._recency({"mtime": 17}), 17)
 
 
 class CustomNameAndSearchTests(ViewerServerTestCase):
@@ -82,8 +83,8 @@ class CustomNameAndSearchTests(ViewerServerTestCase):
         self.assertEqual(restored["custom_title"], "")
 
     def test_custom_title_search_outranks_user_message(self):
-        data = server.load_session(str(self.fixture))
-        server._set_custom_name(data, "priorityword custom name")
+        data = catalog.load_session(str(self.fixture))
+        catalog.set_custom_name(data, "priorityword custom name")
         try:
             matches = server.search_sessions("priorityword", wait=True)
             self.assertEqual(matches[0]["file"], str(self.fixture))
@@ -93,7 +94,7 @@ class CustomNameAndSearchTests(ViewerServerTestCase):
             self.assertGreater(matches[0]["score"], user_message_match["score"])
             self.assertGreaterEqual(matches[0]["score"], search_index.CUSTOM_TITLE_WEIGHT)
         finally:
-            server._set_custom_name(data, "")
+            catalog.set_custom_name(data, "")
 
     def test_later_user_message_receives_user_weight(self):
         matches = server.search_sessions("laterpromptword", wait=True)
@@ -108,7 +109,7 @@ class CustomNameAndSearchTests(ViewerServerTestCase):
         self.assertEqual(summary["claude_title"], "nativepriority title")
         self.assertEqual(summary["agent_name"], "reviewer")
 
-        data = server.load_session(str(self.metadata_fixture))
+        data = catalog.load_session(str(self.metadata_fixture))
         self.assertEqual(data["title"], "nativepriority title")
         self.assertEqual(data["meta"]["pr"]["number"], 42)
         compact = next(ev for ev in data["events"] if ev.get("subtype") == "compact_boundary")

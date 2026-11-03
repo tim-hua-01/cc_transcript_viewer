@@ -11,6 +11,7 @@ from pathlib import Path
 import claude_parser as claude
 import codex_parser as codex
 import common
+import catalog
 import server
 
 
@@ -18,16 +19,16 @@ class SummaryCacheTests(unittest.TestCase):
     def setUp(self):
         self.tempdir = tempfile.TemporaryDirectory()
         self.root = Path(self.tempdir.name)
-        self.old_cache_file = server.CACHE_FILE
-        server.CACHE_FILE = self.root / "cache" / "summaries.json"
-        server._CACHE_LOADED = False
-        for cache in server._PARSER_CACHES.values():
+        self.old_cache_file = catalog.CACHE_FILE
+        catalog.CACHE_FILE = self.root / "cache" / "summaries.json"
+        catalog._CACHE_LOADED = False
+        for cache in catalog._PARSER_CACHES.values():
             cache.clear()
 
     def tearDown(self):
-        server.CACHE_FILE = self.old_cache_file
-        server._CACHE_LOADED = False
-        for cache in server._PARSER_CACHES.values():
+        catalog.CACHE_FILE = self.old_cache_file
+        catalog._CACHE_LOADED = False
+        for cache in catalog._PARSER_CACHES.values():
             cache.clear()
         self.tempdir.cleanup()
 
@@ -43,18 +44,18 @@ class SummaryCacheTests(unittest.TestCase):
     def test_cache_round_trip(self):
         path = self._claude_session()
         expected = claude.session_summary(path)
-        server.save_summary_caches()
+        catalog.save_summary_caches()
 
         claude.SUMMARY_CACHE.clear()
-        server._CACHE_LOADED = False
-        server.load_summary_caches()
+        catalog._CACHE_LOADED = False
+        catalog.load_summary_caches()
 
         # The loaded entry must be served straight from the cache (no re-parse).
         identity = common.file_identity(path)
         self.assertEqual(claude.SUMMARY_CACHE.get(str(path), identity), expected)
         self.assertEqual(claude.session_summary(path), expected)
-        payload = json.loads(server.CACHE_FILE.read_text(encoding="utf-8"))
-        self.assertEqual(payload["version"], server._CACHE_VERSION)
+        payload = json.loads(catalog.CACHE_FILE.read_text(encoding="utf-8"))
+        self.assertEqual(payload["version"], catalog._CACHE_VERSION)
 
     def test_file_size_invalidates_same_mtime_cache_entry(self):
         path = self._claude_session()
@@ -121,13 +122,13 @@ class SummaryCacheTests(unittest.TestCase):
         """Several viewer processes share the cache file; one process's save
         must not discard entries another process computed."""
         claude.SUMMARY_CACHE.put("/theirs/session.jsonl", [1, 2], {"title": "theirs"})
-        server.save_summary_caches()
+        catalog.save_summary_caches()
 
         claude.SUMMARY_CACHE.clear()
         claude.SUMMARY_CACHE.put("/ours/session.jsonl", [3, 4], {"title": "ours"})
-        server.save_summary_caches()
+        catalog.save_summary_caches()
 
-        payload = json.loads(server.CACHE_FILE.read_text(encoding="utf-8"))
+        payload = json.loads(catalog.CACHE_FILE.read_text(encoding="utf-8"))
         self.assertIn("/theirs/session.jsonl", payload["claude"])
         self.assertIn("/ours/session.jsonl", payload["claude"])
 
