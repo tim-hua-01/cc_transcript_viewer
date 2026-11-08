@@ -12,10 +12,13 @@ from __future__ import annotations
 
 import json
 import mimetypes
+import multiprocessing
+import os
 import re
 import sqlite3
 import threading
 import unicodedata
+from concurrent.futures import ProcessPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -75,6 +78,122 @@ def iter_jsonl(path: Path, skip_line=None):
                 yield json.loads(line)
             except json.JSONDecodeError:
                 continue
+
+
+class JsonlAccumulators:
+    """One accumulator per JSONL file, fed only the lines appended since the
+    last read.
+
+    Transcripts are append-only, so a file that grew needs only its new
+    lines. ``new()`` returns an empty accumulator (anything with
+    ``feed(record)``). A file that shrank, or whose already-read bytes changed
+    (checked at its start and just before where reading stopped), is read
+    again from the top. Only complete lines are fed: a half-written last line
+    waits for the next read. Lines are read one at a time, so even a full read
+    never holds a whole file's records. Memory-only: after a restart each
+    file is read in full once.
+    """
+
+    _CHECK_BYTES = 4096
+
+    def __init__(self, new, skip_line=None):
+        self._new = new
+        self._skip_line = skip_line
+        self._lock = threading.Lock()
+        # path -> [accumulator, bytes read, first bytes, bytes before the stop]
+        self._files: dict[str, list] = {}
+
+    def summarize(self, path: Path, finish):
+        """``finish(accumulator)`` after feeding it every new complete line."""
+        key = str(path)
+        with self._lock:
+            try:
+                with path.open("rb") as fh:
+                    entry = self._files.get(key)
+                    if entry is None or not self._unchanged(fh, entry):
+                        entry = [self._new(), 0, b"", b""]
+                    accumulator, offset = entry[0], entry[1]
+                    fh.seek(offset)
+                    for raw in fh:
+                        if not raw.endswith(b"\n"):
+                            break  # still being written
+                        offset += len(raw)
+                        record = self._decode(raw)
+                        if record is not None:
+                            accumulator.feed(record)
+                    entry[1] = offset
+                    fh.seek(0)
+                    entry[2] = fh.read(min(self._CHECK_BYTES, offset))
+                    start = max(0, offset - self._CHECK_BYTES)
+                    fh.seek(start)
+                    entry[3] = fh.read(offset - start)
+            except BaseException:
+                # A half-fed accumulator must not be fed the same lines again.
+                self._files.pop(key, None)
+                raise
+            self._files[key] = entry
+            return finish(accumulator)
+
+    def _unchanged(self, fh, entry) -> bool:
+        _accumulator, offset, head, tail = entry
+        if os.fstat(fh.fileno()).st_size < offset:
+            return False
+        fh.seek(0)
+        if fh.read(len(head)) != head:
+            return False
+        fh.seek(offset - len(tail))
+        return fh.read(len(tail)) == tail
+
+    def _decode(self, raw: bytes):
+        try:
+            line = raw.decode("utf-8").strip()
+        except UnicodeDecodeError:
+            return None
+        if not line or (self._skip_line and self._skip_line(line)):
+            return None
+        try:
+            return json.loads(line)
+        except json.JSONDecodeError:
+            return None
+
+    def clear(self) -> None:
+        with self._lock:
+            self._files.clear()
+
+
+def _call_summary_worker(worker, args):
+    try:
+        return worker(*args)
+    except (OSError, ValueError):
+        return None
+
+
+def prefill_summaries(cache: "SummaryCache", jobs, worker, *, threshold: int = 32,
+                      workers: int = 4) -> None:
+    """Summarize a large batch of stale files in worker processes.
+
+    ``jobs`` is ``[(key, fingerprint, args)]``; ``worker(*args)`` returns a
+    summary (or None) and must be module-level so workers can import it.
+    Parsing many files in workers keeps that memory and CPU time out of the
+    server process. Below ``threshold`` stale files, or when workers can't
+    run, this does nothing and callers summarize in-process as usual.
+    """
+    stale = [(key, fp, args) for key, fp, args in jobs
+             if fp is not None and cache.get(key, fp) is None]
+    if len(stale) < threshold or (os.cpu_count() or 1) < 2:
+        return
+    try:
+        with ProcessPoolExecutor(
+            max_workers=min(os.cpu_count() or 1, workers),
+            mp_context=multiprocessing.get_context("spawn"),
+        ) as pool:
+            summaries = pool.map(_call_summary_worker, [worker] * len(stale),
+                                 [args for _key, _fp, args in stale], chunksize=8)
+            for (key, fp, _args), summary in zip(stale, summaries):
+                if summary is not None:
+                    cache.put(key, fp, summary)
+    except Exception:  # noqa: BLE001 - in-process summarizing remains the fallback
+        return
 
 
 def short_title(text: str, n: int = 100) -> str:

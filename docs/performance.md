@@ -426,7 +426,17 @@ whole HTTP server, and the index's `worker_setup` comes from the catalog.
 This is a pure move. Behaviour and tests stay the same, with test patches
 pointed at `catalog.*` where the state now lives.
 
-## Sidebar summaries: read only what's new
+## Sidebar summaries: read only what's new — done
+
+Result, on this corpus:
+
+| | Before | After |
+|---|---|---|
+| Summary update after an append, 104 MB Codex file | 0.32 s | 0.6 ms |
+| Same, 159 MB Claude file | 0.13 s | under 0.1 ms |
+| Rebuild of every summary (cache missing): time | 1.9 s | 1.9 s (Codex part 1.3 s → 0.8 s) |
+| Same: memory added to the server | +325 MB | +13 MB |
+
 
 Each sidebar row (a session's *summary*: title, counts, timestamps, model) is
 built by reading the whole transcript, and `summaries.json` caches it by the

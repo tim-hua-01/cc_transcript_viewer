@@ -14,10 +14,7 @@ directory other than the default ~/.claude/projects.
 from __future__ import annotations
 
 import json
-import multiprocessing
-import os
 import re
-from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 import common
@@ -129,6 +126,7 @@ def configure(projects_dir: Path) -> None:
     global PROJECTS_DIR
     PROJECTS_DIR = Path(projects_dir).expanduser()
     SUMMARY_CACHE.clear()
+    _SUMMARIES.clear()
     _AGENT_CALLS_CACHE.clear()
 
 
@@ -215,19 +213,26 @@ def _synthetic_user_notice(text) -> dict | None:
     return {"label": label, "text": text.strip()}
 
 
+def _title_text(rec: dict) -> str:
+    """The session title this record would give as the first real user
+    prompt (skipping tool results and command noise), or ""."""
+    if rec.get("type") != "user" or rec.get("isSidechain") or rec.get("isMeta"):
+        return ""
+    text = _user_record_text(rec)
+    if not text or _synthetic_user_notice(text):
+        return ""
+    text = " ".join(re.sub(r"<[^>]+>", " ", text).split())
+    return common.short_title(text) if text else ""
+
+
 def _first_user_text(records: list[dict]) -> str:
     """First real user prompt text (skip tool results / command noise)."""
-    for rec in records:
-        if rec.get("type") != "user" or rec.get("isSidechain") or rec.get("isMeta"):
-            continue
-        text = _user_record_text(rec)
-        if not text or _synthetic_user_notice(text):
-            continue
-        text = re.sub(r"<[^>]+>", " ", text)
-        text = " ".join(text.split())
-        if text:
-            return common.short_title(text)
-    return ""
+    return next((t for t in map(_title_text, records) if t), "")
+
+
+def _subagent_prompt_text(rec: dict) -> str:
+    """This record's prompt if it's a user message, single-spaced, or ""."""
+    return " ".join(_user_record_text(rec).split()) if rec.get("type") == "user" else ""
 
 
 def _subagent_first_user_text(records: list[dict]) -> str:
@@ -236,13 +241,7 @@ def _subagent_first_user_text(records: list[dict]) -> str:
     Returns the full text (used both for the title and for matching the prompt
     back to its spawning Task/Agent call).
     """
-    for rec in records:
-        if rec.get("type") != "user":
-            continue
-        text = " ".join(_user_record_text(rec).split())
-        if text:
-            return text
-    return ""
+    return next((t for t in map(_subagent_prompt_text, records) if t), "")
 
 
 def _subagent_parent(path: Path):
@@ -292,7 +291,7 @@ def _agent_calls(parent_path: Path) -> list[dict]:
     return calls
 
 
-def _subagent_meta(path: Path, records: list[dict]) -> dict | None:
+def _subagent_meta(path: Path, first_text: str) -> dict | None:
     """Build the sub-agent fields (title, parent linkage) for one transcript.
 
     Returns None when `path` is not a sub-agent file. The opening prompt is
@@ -304,7 +303,6 @@ def _subagent_meta(path: Path, records: list[dict]) -> dict | None:
     if not sub:
         return None
     parent_id, parent_file = sub
-    first_text = _subagent_first_user_text(records)
     description = subagent_type = ""
     for call in _agent_calls(parent_file):
         # Normalise both sides the same way: first_text has its whitespace
@@ -326,38 +324,117 @@ def _subagent_meta(path: Path, records: list[dict]) -> dict | None:
 
 
 # ---------------------------------------------------------------------------
-# Sidebar summaries (cached by file identity; cold scans use a process pool)
+# Sidebar summaries (cached by file identity; a changed file is read only from
+# where the last read stopped; large cold batches go to worker processes)
 # ---------------------------------------------------------------------------
-def _summary_worker(path_str: str) -> tuple[str, int, int, dict | None]:
-    """Parse one Claude transcript in an isolated cold-scan worker."""
-    path = Path(path_str)
-    identity = common.file_identity(path)
-    if identity is None:
-        return path_str, 0, 0, None
-    try:
-        summary = _session_summary_uncached(path)
-    except (OSError, ValueError):
-        return path_str, identity[0], identity[1], None
-    return path_str, identity[0], identity[1], summary
+class _SummaryState:
+    """A Claude summary built one record at a time (see common.JsonlAccumulators)."""
+
+    def __init__(self):
+        self.ai_title = self.claude_title = self.agent_name = ""
+        self.cwd = self.git_branch = self.version = ""
+        self.first_ts = self.last_ts = None
+        self.n_user = self.n_assistant = self.n_tool = self.n_records = 0
+        self.sidechain_users = 0  # user prompts only a sub-agent's own count includes
+        self.models: set[str] = set()
+        self.title = ""            # first real user prompt
+        self.subagent_prompt = ""  # first user prompt, for a sub-agent transcript
+
+    def feed(self, rec: dict) -> None:
+        self.n_records += 1
+        t = rec.get("type")
+        if t == "ai-title" and rec.get("aiTitle"):
+            self.ai_title = rec["aiTitle"]
+        elif t == "custom-title" and rec.get("customTitle"):
+            self.claude_title = rec["customTitle"]
+        elif t == "agent-name" and rec.get("agentName"):
+            self.agent_name = rec["agentName"]
+        if rec.get("cwd"):
+            self.cwd = rec["cwd"]
+        if rec.get("gitBranch"):
+            self.git_branch = rec["gitBranch"]
+        if rec.get("version"):
+            self.version = rec["version"]
+        ts = rec.get("timestamp")
+        if ts:
+            self.first_ts = self.first_ts or ts
+            self.last_ts = ts
+        if t == "user" and not rec.get("isMeta"):
+            # Skip system-injected wrappers so the count matches the user outline.
+            text = _user_record_text(rec)
+            if text and not _synthetic_user_notice(text):
+                if rec.get("isSidechain"):
+                    self.sidechain_users += 1
+                else:
+                    self.n_user += 1
+        if t == "attachment" and not rec.get("isSidechain"):
+            att = rec.get("attachment", {})
+            if (
+                att.get("type") == "queued_command"
+                and att.get("prompt")
+                and not _synthetic_user_notice(att["prompt"])
+            ):
+                self.n_user += 1
+        if t == "assistant":
+            msg = rec.get("message", {})
+            if msg.get("model"):
+                self.models.add(msg["model"])
+            for b in msg.get("content", []) or []:
+                if isinstance(b, dict) and b.get("type") == "tool_use":
+                    self.n_tool += 1
+            self.n_assistant += 1
+        if not self.title:
+            self.title = _title_text(rec)
+        if not self.subagent_prompt:
+            self.subagent_prompt = _subagent_prompt_text(rec)
 
 
-def _prefill_summaries(files: list[Path]) -> None:
-    """Populate stale summaries, using processes only for a large cold batch."""
-    stale = []
-    for path in files:
-        identity = common.file_identity(path)
-        if identity is not None and SUMMARY_CACHE.get(str(path), identity) is None:
-            stale.append(str(path))
-    if len(stale) < _PARALLEL_SCAN_THRESHOLD or (os.cpu_count() or 1) < 2:
-        return
-    try:
-        context = multiprocessing.get_context("spawn")
-        with ProcessPoolExecutor(max_workers=min(os.cpu_count() or 1, 8), mp_context=context) as pool:
-            for key, mtime, size, summary in pool.map(_summary_worker, stale, chunksize=8):
-                if summary is not None:
-                    SUMMARY_CACHE.put(key, (mtime, size), summary)
-    except Exception:  # noqa: BLE001 - serial parsing in the caller remains the fallback
-        return
+def _finish_summary(path: Path, state: _SummaryState) -> dict:
+    is_subagent = path.parent.name == "subagents"
+    sub_meta = _subagent_meta(path, state.subagent_prompt) if is_subagent else None
+    if sub_meta:
+        cwd = state.cwd or decode_project_name(path.parent.parent.parent.name)
+    else:
+        cwd = state.cwd or decode_project_name(path.parent.name)
+
+    st = common.safe_stat(path)
+    summary = common.make_summary(
+        agent="claude",
+        id=path.stem,
+        file=str(path),
+        title=state.claude_title
+        or (sub_meta["title"] if sub_meta else "")
+        or state.title
+        or state.ai_title
+        or "(untitled session)",
+        cwd=cwd,
+        git_branch=state.git_branch,
+        version=state.version,
+        first_ts=state.first_ts,
+        last_ts=state.last_ts,
+        n_user=state.n_user + (state.sidechain_users if is_subagent else 0),
+        n_assistant=state.n_assistant,
+        n_tool=state.n_tool,
+        n_records=state.n_records,
+        model=sorted(state.models)[0] if state.models else "",
+        mtime=st.st_mtime if st else 0,
+        # Latest Claude Code AI-generated session title (the one its /resume
+        # picker shows); "" if none yet.
+        ai_title=state.ai_title,
+        claude_title=state.claude_title,
+        agent_name=state.agent_name,
+    )
+    if sub_meta:
+        summary.update({key: value for key, value in sub_meta.items() if key != "title"})
+    return summary
+
+
+_SUMMARIES = common.JsonlAccumulators(_SummaryState, skip_line=_skip_line)
+
+
+def _summary_worker(path_str: str) -> dict:
+    """Summarize one transcript in a cold-scan worker process."""
+    return _session_summary_uncached(Path(path_str))
 
 
 def session_summary(path: Path) -> dict:
@@ -369,99 +446,7 @@ def session_summary(path: Path) -> dict:
 
 
 def _session_summary_uncached(path: Path) -> dict:
-    records = list(_iter_records(path))
-    is_subagent = path.parent.name == "subagents"
-    ai_title = ""
-    claude_title = ""
-    agent_name = ""
-    cwd = ""
-    git_branch = ""
-    version = ""
-    first_ts = None
-    last_ts = None
-    n_user = n_assistant = n_tool = 0
-    models: set[str] = set()
-
-    for rec in records:
-        t = rec.get("type")
-        if t == "ai-title" and rec.get("aiTitle"):
-            ai_title = rec["aiTitle"]
-        elif t == "custom-title" and rec.get("customTitle"):
-            claude_title = rec["customTitle"]
-        elif t == "agent-name" and rec.get("agentName"):
-            agent_name = rec["agentName"]
-        if rec.get("cwd"):
-            cwd = rec["cwd"]
-        if rec.get("gitBranch"):
-            git_branch = rec["gitBranch"]
-        if rec.get("version"):
-            version = rec["version"]
-        ts = rec.get("timestamp")
-        if ts:
-            first_ts = first_ts or ts
-            last_ts = ts
-        if (
-            t == "user"
-            and not rec.get("isMeta")
-            and (is_subagent or not rec.get("isSidechain"))
-        ):
-            # Skip system-injected wrappers so the count matches the user outline.
-            text = _user_record_text(rec)
-            if text and not _synthetic_user_notice(text):
-                n_user += 1
-        if t == "attachment" and not rec.get("isSidechain"):
-            att = rec.get("attachment", {})
-            if (
-                att.get("type") == "queued_command"
-                and att.get("prompt")
-                and not _synthetic_user_notice(att["prompt"])
-            ):
-                n_user += 1
-        if t == "assistant":
-            msg = rec.get("message", {})
-            if msg.get("model"):
-                models.add(msg["model"])
-            for b in msg.get("content", []) or []:
-                if isinstance(b, dict) and b.get("type") == "tool_use":
-                    n_tool += 1
-            n_assistant += 1
-
-    sub_meta = _subagent_meta(path, records) if is_subagent else None
-    if sub_meta:
-        cwd = cwd or decode_project_name(path.parent.parent.parent.name)
-    else:
-        cwd = cwd or decode_project_name(path.parent.name)
-
-    st = common.safe_stat(path)
-    summary = common.make_summary(
-        agent="claude",
-        id=path.stem,
-        file=str(path),
-        title=claude_title
-        or (sub_meta["title"] if sub_meta else "")
-        or _first_user_text(records)
-        or ai_title
-        or "(untitled session)",
-        cwd=cwd,
-        git_branch=git_branch,
-        version=version,
-        first_ts=first_ts,
-        last_ts=last_ts,
-        n_user=n_user,
-        n_assistant=n_assistant,
-        n_tool=n_tool,
-        n_records=len(records),
-        model=sorted(models)[0] if models else "",
-        mtime=st.st_mtime if st else 0,
-        # Latest Claude Code AI-generated session title (the one its /resume
-        # picker shows); "" if none yet.
-        ai_title=ai_title,
-        claude_title=claude_title,
-        agent_name=agent_name,
-    )
-    if sub_meta:
-        summary.update({key: value for key, value in sub_meta.items() if key != "title"})
-    return summary
+    return _SUMMARIES.summarize(path, lambda state: _finish_summary(path, state))
 
 
 def list_sessions() -> list[dict]:
@@ -475,7 +460,11 @@ def list_sessions() -> list[dict]:
         files.extend(proj_dir.glob("*.jsonl"))
         # Sub-agents live one level down: <session-id>/subagents/agent-*.jsonl
         files.extend(proj_dir.glob("*/subagents/*.jsonl"))
-    _prefill_summaries(files)
+    common.prefill_summaries(
+        SUMMARY_CACHE,
+        [(str(path), common.file_identity(path), (str(path),)) for path in files],
+        _summary_worker, threshold=_PARALLEL_SCAN_THRESHOLD,
+    )
     out: list[dict] = []
     for path in files:
         try:
@@ -1056,7 +1045,7 @@ def parse_session(path: Path) -> dict:
             "file": str(cand) if cand.exists() else "",
         }
 
-    sub_meta = _subagent_meta(path, records)
+    sub_meta = _subagent_meta(path, _subagent_first_user_text(records))
     if sub_meta:
         meta.setdefault("cwd", decode_project_name(path.parent.parent.parent.name))
     out = {

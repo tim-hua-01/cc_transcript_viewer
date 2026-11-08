@@ -41,6 +41,7 @@ def configure(codex_home: Path) -> None:
     ARCHIVED_SESSIONS_DIR = CODEX_HOME / "archived_sessions"
     STATE_DB = CODEX_HOME / "state_5.sqlite"
     SUMMARY_CACHE.clear()
+    _SUMMARIES.clear()
 
 
 def _thread_signature(thread_row: dict | None) -> str:
@@ -678,71 +679,83 @@ def _read_thread_rows() -> dict[str, dict]:
 _SUMMARY_VERSION = 4
 
 
-def session_summary(path: Path, thread_row: dict | None = None) -> dict:
-    """Lightweight metadata for a Codex session, cached by file identity plus a
-    fingerprint of the SQLite thread row (which can change without the JSONL)."""
+def _summary_fingerprint(path: Path, thread_row: dict | None) -> tuple:
+    """File identity plus a fingerprint of the SQLite thread row (which can
+    change without the JSONL)."""
     identity = common.file_identity(path) or (0, 0)
+    return identity + (_thread_signature(thread_row), _SUMMARY_VERSION)
+
+
+def session_summary(path: Path, thread_row: dict | None = None) -> dict:
+    """Lightweight metadata for a Codex session, cached by its fingerprint."""
     return common.cached_summary(
         SUMMARY_CACHE,
         str(path),
-        identity + (_thread_signature(thread_row), _SUMMARY_VERSION),
+        _summary_fingerprint(path, thread_row),
         lambda: _session_summary_uncached(path, thread_row),
     )
 
 
-def _session_summary_uncached(path: Path, thread_row: dict | None = None) -> dict:
-    records = list(common.iter_jsonl(path))
-    meta = {}
-    first_ts = None
-    last_ts = None
-    n_user = n_assistant = n_tool = n_reasoning = n_web = 0
-    model = ""
-    mirror_users, mirror_agents = _mirror_message_counts(records)
+class _SummaryState:
+    """A Codex summary built one record at a time (see common.JsonlAccumulators)."""
 
-    for rec in records:
+    def __init__(self):
+        self.meta: dict = {}
+        self.first_ts = self.last_ts = None
+        self.n_records = self.n_tool = self.n_reasoning = self.n_web = 0
+        self.model = ""
+        self.first_user = ""
+        # A message can be written both as a pre-0.147 mirror and inside an
+        # item_completed envelope (a session resumed across the upgrade mixes
+        # both). Counting each kind by hashed text, and settling the overlap
+        # in message_count(), counts it once whichever copy comes first.
+        self.mirrors = {"user": Counter(), "assistant": Counter()}
+        self.envelopes = {"user": Counter(), "assistant": Counter()}
+
+    def feed(self, rec: dict) -> None:
+        self.n_records += 1
         ts = rec.get("timestamp")
         if ts:
-            first_ts = first_ts or ts
-            last_ts = ts
+            self.first_ts = self.first_ts or ts
+            self.last_ts = ts
         typ = rec.get("type")
         payload = rec.get("payload") or {}
         if typ == "session_meta":
-            _merge_session_meta(meta, payload)
+            _merge_session_meta(self.meta, payload)
         elif typ == "turn_context":
-            model = model or payload.get("model", "")
+            self.model = self.model or payload.get("model", "")
         elif typ == "event_msg":
             pt = payload.get("type")
             if (msg := _record_message(rec)) is not None:
                 role, text, source, _data = msg
-                counted = True
-                if source == "envelope":
-                    # Skip an envelope message that repeats a mirror, so a
-                    # hybrid file counts each message once.
-                    dups = mirror_users if role == "user" else mirror_agents
-                    key = _normalized_message_key(text)
-                    if dups.get(key):
-                        dups[key] -= 1
-                        counted = False
-                if counted and role == "user":
-                    n_user += 1
-                elif counted:
-                    n_assistant += 1
+                if role == "user" and text and not self.first_user:
+                    self.first_user = common.short_title(str(text))
+                kind = self.mirrors if source == "mirror" else self.envelopes
+                kind[role][hash(_normalized_message_key(text))] += 1
             elif pt == "agent_reasoning":
-                n_reasoning += 1
+                self.n_reasoning += 1
             elif pt == "web_search_end":
-                n_web += 1
+                self.n_web += 1
         elif typ == "response_item":
             pt = payload.get("type")
             if pt in {"function_call", "custom_tool_call"}:
-                n_tool += 1
+                self.n_tool += 1
             elif pt == "reasoning":
-                n_reasoning += 1
+                self.n_reasoning += 1
             elif pt == "web_search_call":
-                n_web += 1
+                self.n_web += 1
 
+    def message_count(self, role: str) -> int:
+        mirrors, envelopes = self.mirrors[role], self.envelopes[role]
+        repeated = sum(min(n, mirrors[key]) for key, n in envelopes.items())
+        return sum(mirrors.values()) + sum(envelopes.values()) - repeated
+
+
+def _finish_summary(path: Path, state: _SummaryState, thread_row: dict | None) -> dict:
+    meta = state.meta
     st = common.safe_stat(path)
     row = thread_row or {}
-    title = _first_user_message(records) or row.get("title") or row.get("preview") or "(untitled session)"
+    title = state.first_user or row.get("title") or row.get("preview") or "(untitled session)"
     cwd = row.get("cwd") or meta.get("cwd") or ""
     updated_ms = row.get("updated_at_ms") or (row.get("updated_at") * 1000 if row.get("updated_at") else None)
     created_ms = row.get("created_at_ms") or (row.get("created_at") * 1000 if row.get("created_at") else None)
@@ -760,21 +773,21 @@ def _session_summary_uncached(path: Path, thread_row: dict | None = None) -> dic
         title=title,
         cwd=cwd,
         version=row.get("cli_version") or meta.get("cli_version") or "",
-        first_ts=first_ts or common.iso_from_ms(created_ms),
-        last_ts=last_ts or common.iso_from_ms(updated_ms),
-        n_user=n_user,
-        n_assistant=n_assistant,
-        n_tool=n_tool,
-        n_web=n_web,
-        n_records=len(records),
-        model=row.get("model") or model,
+        first_ts=state.first_ts or common.iso_from_ms(created_ms),
+        last_ts=state.last_ts or common.iso_from_ms(updated_ms),
+        n_user=state.message_count("user"),
+        n_assistant=state.message_count("assistant"),
+        n_tool=state.n_tool,
+        n_web=state.n_web,
+        n_records=state.n_records,
+        model=row.get("model") or state.model,
         mtime=st.st_mtime if st else 0,
         source=row.get("source") or meta.get("source") or meta.get("originator") or "",
         thread_source=row.get("thread_source") or meta.get("thread_source") or "",
         model_provider=row.get("model_provider") or meta.get("model_provider") or "",
         reasoning_effort=row.get("reasoning_effort") or "",
         tokens_used=row.get("tokens_used") or 0,
-        n_reasoning=n_reasoning,
+        n_reasoning=state.n_reasoning,
         archived=bool(row.get("archived", 0)),
         # Newer Codex versions generate a short thread name independently of
         # the legacy title/first prompt, analogous to Claude Code's ai-title.
@@ -782,6 +795,21 @@ def _session_summary_uncached(path: Path, thread_row: dict | None = None) -> dic
     )
     summary.update(subagent_fields)
     return summary
+
+
+# A changed rollout is read only from where the last read stopped.
+_SUMMARIES = common.JsonlAccumulators(_SummaryState)
+# Stale summaries at or above this many are built in worker processes.
+_PARALLEL_SCAN_THRESHOLD = 32
+
+
+def _summary_worker(path_str: str, thread_row: dict | None) -> dict:
+    """Summarize one rollout in a cold-scan worker process."""
+    return _session_summary_uncached(Path(path_str), thread_row)
+
+
+def _session_summary_uncached(path: Path, thread_row: dict | None = None) -> dict:
+    return _SUMMARIES.summarize(path, lambda state: _finish_summary(path, state, thread_row))
 
 
 def list_sessions() -> list[dict]:
@@ -798,12 +826,22 @@ def list_sessions() -> list[dict]:
         if path.exists():
             paths.add(path)
 
-    out: list[dict] = []
+    targets = []
     for path in sorted(paths):
         try:
             resolved = path.resolve()
-            row = rows_by_path.get(str(resolved)) or rows_by_path.get(str(path))
-            out.append(session_summary(resolved, row))
+        except OSError:
+            continue
+        targets.append((resolved, rows_by_path.get(str(resolved)) or rows_by_path.get(str(path))))
+    common.prefill_summaries(
+        SUMMARY_CACHE,
+        [(str(path), _summary_fingerprint(path, row), (str(path), row)) for path, row in targets],
+        _summary_worker, threshold=_PARALLEL_SCAN_THRESHOLD,
+    )
+    out: list[dict] = []
+    for path, row in targets:
+        try:
+            out.append(session_summary(path, row))
         except (OSError, ValueError):
             continue
     return out

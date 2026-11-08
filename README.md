@@ -109,8 +109,9 @@ scans for sidebar changes once a second, preserving your scroll position and whi
 thinking/tool blocks you've expanded. So an active session you're watching tails live. To save
 battery it stops polling while the tab is hidden, and after a minute without input or changes to
 the open transcript it slows to every 2 s and 5 s until you're back. Reload the page if you ever
-need a full reset. Session metadata is cached by file mtime, so each poll only re-reads the files
-that actually changed — the cost doesn't grow with how many transcripts you've accumulated.
+need a full reset. Session metadata is cached by file mtime and size, and when a transcript grows
+only its new lines are read, so a poll costs about the same however many transcripts you have and
+however large they get.
 
 Both caches rebuild themselves, but if one ever seems wrong, `python3 server.py --reset-cache`
 deletes them (stop the viewer first).
@@ -520,7 +521,7 @@ reported.
 | `mica/` | The optional [Mica](#optional-tamper-resistant-backups-mica): `capture.py` (the polling daemon that copies appends into append-only, hash-chained generations and records tamper events), `store.py` (the on-disk format and the read-only `StoreReader` the viewer uses to badge sessions, list deleted ones, and compare a live file with its capture), `install.py` (macOS `_mica` user, root-owned install, ACLs, LaunchDaemon), and `__main__.py` (`python3 -m mica daemon/status/flagged/verify/install/uninstall`). Standard library only, Python 3.9-compatible so it runs on Apple's root-owned interpreter. |
 | `search_index.py` | The persistent full-text search index: one SQLite file of per-session search documents, kept current by a coordinator thread that has up to four worker processes parse and store changed sessions (live transcripts at most every 30 s), plus scoring, snippets, and the progress status the search box shows. Never imports `server.py`; the server passes in `load_session` and its source settings. |
 | `search_text.py` | Pure functions for what a session contributes to search: text extraction from parsed events, normalized text plus line-aligned source chunks, and mapping a match back to a source snippet. |
-| `common.py` | Everything the four parsers share: JSONL iteration, JSON/SQLite access, title truncation, timestamp conversion, the sidebar-summary shape (`make_summary`), and the thread-safe fingerprint-keyed `SummaryCache` (plus its `cached_summary` wrapper) all of them use. |
+| `common.py` | Everything the four parsers share: JSONL iteration, JSON/SQLite access, title truncation, timestamp conversion, the sidebar-summary shape (`make_summary`), the thread-safe fingerprint-keyed `SummaryCache` (plus its `cached_summary` wrapper) all of them use, `JsonlAccumulators` (which feeds a growing transcript's summary only its new lines), and `prefill_summaries` (which rebuilds a large batch of summaries in worker processes). |
 | `event_schema.py` | The written-down (and machine-checked) event contract between the parsers and the frontend: every event kind, both message shapes, and validators the test suite runs over every parser's output. |
 | `static/index.html`, `static/style.css`, `static/app.js` | The single frontend (vanilla JS, no build step). `app.js` dispatches on event kind and renders the Claude Code / Cursor / opencode (block-based) and Codex (flat) shapes, and runs the always-on live-refresh poll loop. When `window.__TRANSCRIPT_EXPORT__` is present (a saved single-file transcript) it renders that session directly and disables everything that needs the server. CDN assets (marked, DOMPurify, KaTeX) are version-pinned with SRI integrity hashes. |
 | `tests/test_security.py` | Zero-dependency security tests (`python3 -m unittest tests.test_security`): asserts no outbound connections at runtime, no network-client imports, loopback default bind, the `Host`-header rebinding guard, that `/api/session` is confined to the transcript roots while `/api/local-image` serves images only, and that every CDN asset is version-pinned and SRI-hashed. |
