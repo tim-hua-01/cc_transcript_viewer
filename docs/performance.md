@@ -425,3 +425,63 @@ The concrete gain: search workers import `catalog` to load sessions, not the
 whole HTTP server, and the index's `worker_setup` comes from the catalog.
 This is a pure move. Behaviour and tests stay the same, with test patches
 pointed at `catalog.*` where the state now lives.
+
+## Sidebar summaries: read only what's new
+
+Each sidebar row (a session's *summary*: title, counts, timestamps, model) is
+built by reading the whole transcript, and `summaries.json` caches it by the
+file's size and modification time. Two cases still cost a lot:
+
+- **A transcript being written.** Each append changes the file, so every
+  sidebar poll (once a second while you're active) re-reads the whole file
+  in the server process: 0.32 s for a 104 MB Codex rollout, 0.13 s for a
+  159 MB Claude transcript. That's about a third of a core for one row while
+  a big session runs.
+- **A missing cache** (first run, `--reset-cache`, a format change). Codex
+  summaries are rebuilt one by one inside the server, holding each file's
+  parsed records at once. The server stayed at 531 MB after one rebuild
+  (about 50 MB normally).
+
+### R1. Feed summaries only the appended lines
+
+Both summaries can be built one record at a time. Every field is the latest
+value seen, a running count, or the first match (the title). The one
+exception is Codex's de-duplication of messages written in both the old and
+the new format, which today pre-scans the whole file. Done record by record,
+it keeps counters of both copies' message keys (hashed) and subtracts the
+overlap at the end, which gives the same count regardless of order.
+
+`common.JsonlAccumulators` keeps one accumulator per file, plus how far into
+the file it has read:
+
+- it reads from that point on, and only complete lines (a half-written last
+  line waits for the next read);
+- it starts again from the top if the file shrank, or if its first 4 KB or the
+  4 KB just before the stopping point changed (a rewrite);
+- it reads line by line, so even a full read never holds a whole file's
+  records in memory.
+
+Each parser supplies an accumulator class with `feed(record)` and a function
+that turns the result into a summary. The existing `SummaryCache` (and
+`summaries.json`) stays in front of it unchanged: an unchanged file never
+reaches the accumulator. Accumulators are memory-only. After a restart, a
+changed file is read in full once.
+
+### R2. Rebuild many summaries in worker processes, for every source
+
+Claude already hands 32 or more stale summaries to worker processes. A shared
+`common.prefill_summaries(cache, jobs, worker)` does that for Claude and
+Codex. Codex passes each file's SQLite thread row along, because the summary
+depends on it. It uses up to 4 workers (Claude used up to 8), matching the
+search index. Fewer stale files are summarized in-process, which R1 makes
+cheap.
+
+### Tests
+
+- The accumulator: only appended lines are fed, a partial last line waits,
+  and a truncated or rewritten file is read again from the top.
+- For both parsers, a summary built from appends after every step equals one
+  built by reading the whole file, on the checked-in fixture transcripts.
+- Codex's de-duplication when a message's two copies arrive in different
+  appends.
+- A cold Codex rebuild goes through worker processes.
