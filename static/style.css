@@ -1035,3 +1035,19 @@ pre.payload.diff { padding: 0; }
 .mica-diff-no { color: var(--muted); font-family: var(--mono); }
 .mica-diff-meta { color: var(--muted); }
 .mica-diff-text { color: var(--text); }
+
+/* ---------- Narrow windows: stack the session list above the transcript ---------- */
+@media (max-width: 760px) {
+  #app { flex-direction: column; }
+  #sidebar {
+    width: auto; min-width: 0; max-height: 40vh; flex: none;
+    border-right: 0; border-bottom: 1px solid var(--border);
+  }
+  #main { flex: 1; min-height: 0; }
+  /* Collapse/show arrows point up/down to match the stacked direction. */
+  #collapse-sidebar, #show-sidebar { transform: rotate(90deg); }
+  /* No room for a third column; the ↑ ↓ ⤓ buttons still step through prompts. */
+  #outline, body.has-outline.outline-collapsed .edge-toggle-right { display: none; }
+  #nav-buttons, body.outline-collapsed #nav-buttons { right: 16px; }
+  #transcript { padding: 16px 14px 120px; }
+}

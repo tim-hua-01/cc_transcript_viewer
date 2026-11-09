@@ -173,6 +173,71 @@ class StandaloneBrowserJourneyTests(unittest.TestCase):
             "regressionVisible", "sourceFailureVisible", "rowTagged", "gapExplained", "cleanLockHidden",
         ), True))
 
+    def test_narrow_window_stacks_the_session_list_above_the_transcript(self):
+        """Below the breakpoint the sidebar sits above a full-width transcript,
+        the outline column gives way, and collapsing still works; wide windows
+        keep the three-column layout."""
+        file = str(FIXTURE)
+        summary = dict(codex.session_summary(FIXTURE), file=file)
+        session = dict(codex.parse_session(FIXTURE), file=file)
+
+        rendered = (export_html.STATIC_DIR / "index.html").read_text()
+        rendered = re.sub(r'<script\b[^>]*\bsrc="https://[^"]+"[^>]*></script>', "", rendered)
+        rendered = re.sub(r'<link\b[^>]*\bhref="https://[^"]+"[^>]*>', "", rendered)
+        rendered = rendered.replace(export_html.STYLE_LINK,
+                                    "<style>" + (export_html.STATIC_DIR / "style.css").read_text() + "</style>")
+        mocked_api = """<script>
+          localStorage.clear();
+          const API = %s;
+          const reply = (body) => ({json: async () => body});
+          window.fetch = async (url) => {
+            if (url.startsWith('/api/sessions')) return reply({sessions: [API.summary],
+              mica: {enabled: false}, setup: {issues: []}});
+            if (url.startsWith('/api/session?')) return reply(API.session);
+            return reply({});
+          };
+        </script>""" % json.dumps({"summary": summary, "session": session})
+        rendered = rendered.replace(export_html.APP_SCRIPT, mocked_api + "<script>\n" +
+                                    (export_html.STATIC_DIR / "app.js").read_text() + "\n</script>")
+        probe = """<script>
+          const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+          const $q = (s) => document.querySelector(s);
+          const shown = (s) => getComputedStyle($q(s)).display !== 'none';
+          (async () => {
+            await sleep(100);
+            $q('.session-item').click();
+            await sleep(300);
+            const side = $q('#sidebar').getBoundingClientRect();
+            const main = $q('#main').getBoundingClientRect();
+            const result = {
+              stacked: side.bottom <= main.top + 1,
+              mainFullWidth: Math.abs(main.width - innerWidth) <= 1,
+              fitsViewport: $q('#app').getBoundingClientRect().bottom <= innerHeight + 1,
+              noPageScroll: document.documentElement.scrollWidth <= innerWidth,
+              transcriptShown: !$q('#transcript').hidden,
+              outlineShown: shown('#outline'),
+            };
+            $q('#collapse-sidebar').click();
+            result.collapsedHidesSidebar = !shown('#sidebar') && shown('#show-sidebar');
+            $q('#show-sidebar').click();
+            result.showRestoresSidebar = shown('#sidebar');
+            document.body.setAttribute('data-test-probe', encodeURIComponent(JSON.stringify(result)));
+          })();
+        </script>"""
+        rendered = rendered.replace("</body>", probe + "\n</body>", 1)
+
+        narrow = self.probe_page(rendered, budget_ms=3000, window_size=(500, 800))
+        self.assertEqual(narrow, {
+            "stacked": True, "mainFullWidth": True, "fitsViewport": True, "noPageScroll": True,
+            "transcriptShown": True, "outlineShown": False,
+            "collapsedHidesSidebar": True, "showRestoresSidebar": True,
+        })
+        wide = self.probe_page(rendered, budget_ms=3000, window_size=(1280, 800))
+        self.assertEqual(
+            {key: wide[key] for key in ("stacked", "mainFullWidth", "outlineShown")},
+            {"stacked": False, "mainFullWidth": False, "outlineShown": True},
+        )
+
     def test_search_status_shows_indexing_progress_and_refreshes_only_when_needed(self):
         """The line under the search box reports indexing progress and match
         counts; an open search re-runs when the index moves on, but not when
@@ -508,7 +573,7 @@ class StandaloneBrowserJourneyTests(unittest.TestCase):
             "oneTimerAfterWake", "idleSlows", "inputSpeedsUp", "changeSpeedsUp",
         ), True))
 
-    def probe_page(self, rendered, budget_ms=1000):
+    def probe_page(self, rendered, budget_ms=1000, window_size=(1280, 800)):
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)
             page = tmp / "transcript.html"
@@ -532,6 +597,7 @@ class StandaloneBrowserJourneyTests(unittest.TestCase):
                         "--no-first-run",
                         "--no-default-browser-check",
                         "--virtual-time-budget=%d" % budget_ms,
+                        "--window-size=%d,%d" % window_size,
                         "--user-data-dir=" + str(tmp / "chrome-profile"),
                         "--dump-dom",
                         page.as_uri(),
