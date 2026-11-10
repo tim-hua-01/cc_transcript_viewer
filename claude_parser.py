@@ -41,7 +41,10 @@ _IGNORED_RECORD_TYPES = frozenset({
     "mode",                 # mode-change notices (plan/normal/…)
     "queue-operation",      # queued-prompt bookkeeping; content re-enters as
                             # attachments/user turns when dequeued
+    "session-owner",        # account/org UUIDs stamped on the session
     "summary",              # legacy compact-summary title pointers
+    "tools-used",           # list of tool names used so far; the tool_use
+                            # blocks already render each call
     # A log of each raw API request: per-call params plus the hash list of
     # the messages sent, and those messages as content-addressed blobs. The
     # messages duplicate the user/assistant records, and the useful params
