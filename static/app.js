@@ -1966,8 +1966,18 @@ function renderTool(b) {
     bodyKids.push(el("div", { class: "tool-section-label muted" }, "No result recorded"));
   }
 
+  // Claude's Bash (and a few other tools) carry a human-written `description`.
+  // Show it beside the raw command so a collapsed call reads as both intent and
+  // action. Task/Agent already use the description as their summary.
+  const desc = b.input && typeof b.input.description === "string" ? b.input.description.trim() : "";
+  const showDesc = desc && !fmt.summary.includes(desc);
+
   return toolShell(name, isErr, [
-    el("span", { class: "tool-summary", title: fmt.summary }, fmt.summary),
+    showDesc
+      ? el("span", { class: "tool-stack" },
+          el("span", { class: "tool-desc", title: desc }, desc),
+          el("span", { class: "tool-summary", title: fmt.summary }, fmt.summary))
+      : el("span", { class: "tool-summary", title: fmt.summary }, fmt.summary),
     callerLabel(b.caller) ? el("span", { class: "tool-caller" }, callerLabel(b.caller)) : null,
   ], bodyKids);
 }

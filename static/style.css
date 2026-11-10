@@ -875,6 +875,12 @@ pre.guardian-review-context { max-height: 640px; margin: 8px 0 12px; }
 .tool-block.error .tool-icon { color: var(--tool-err); }
 .tool-name { font-weight: 600; font-family: var(--mono); }
 .tool-summary { color: var(--muted); font-family: var(--mono); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
+.tool-stack { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.tool-desc {
+  color: var(--text); font-size: 12.5px; line-height: 1.35;
+  display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden;
+}
+.tool-stack .tool-summary { flex: none; opacity: .8; }
 .tool-caller { font-size: 10px; padding: 1px 6px; border-radius: 4px; background: var(--bg-elev); color: var(--muted); }
 .tool-body { padding: 10px 12px; border-top: 1px solid var(--border); }
 .tool-section-label { font-size: 10px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 8px 0 4px; }
